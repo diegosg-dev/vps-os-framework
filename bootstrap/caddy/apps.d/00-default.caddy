@@ -1,0 +1,1 @@
+# Placeholder so Caddy's glob import succeeds before any custom app routes exist.

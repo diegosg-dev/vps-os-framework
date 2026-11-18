@@ -1,0 +1,32 @@
+# Locked Apartment Template: Isolated Personal Life Agent
+# Full terminal power inside /workspace, hard walls outside.
+
+services:
+  personal-agent:
+    image: node:24-bookworm-slim
+    container_name: vps-os-app-${APP_SLUG}
+    restart: unless-stopped
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./workspace:/workspace
+    cpus: "1.0"
+    mem_limit: 1024m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD", "test", "-d", "/workspace"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  app_net:
+    driver: bridge

@@ -4,7 +4,7 @@
 
 **A plug-and-play, non-Linux-style "VPS OS" framework running on top of Ubuntu Linux VPSs—designed for non-coding and non-Linux users.**
 
-> **Status:** Initial Architecture & Documentation Phase (Greenfield — tech stack intentionally undecided per [AGENTS.md](AGENTS.md)).
+> **Status:** Architecture Foundation Initialized (TypeScript + pnpm monorepo: React/Vite/Tailwind UI, Hono Control API, Vercel AI SDK Agent, SQLite Registry, Caddy Auto-TLS, Bash + Docker Compose v2).
 >
 > **Interactive FigJam Board:** [VPS OS Framework — Architecture & Detailed Model Breakdown](https://www.figma.com/board/ZjpthWRSjpjHnu490klMjP)
 

@@ -1,0 +1,16 @@
+{
+  "name": "vps-os-framework",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Plug-and-play, non-Linux-style VPS OS framework on Ubuntu Linux",
+  "packageManager": "pnpm@10.0.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "typecheck": "corepack pnpm -r --if-present typecheck",
+    "build": "corepack pnpm -r --if-present build",
+    "test": "corepack pnpm --filter @vps-os/tests test",
+    "verify": "corepack pnpm build && corepack pnpm typecheck && corepack pnpm test"
+  }
+}
