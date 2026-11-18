@@ -12,7 +12,7 @@ This guide explains how all components of the **VPS OS Framework** work together
 
 1. **Bare Ubuntu VPS Entry (`0`):** An operator runs the one-shot installer from `bootstrap/` on a fresh Ubuntu LTS VPS.
 2. **Host & Docker Setup (`10`):** The bootstrapper configures the firewall (exposing only required web ports `80`/`443` and hardened SSH), installs Docker Engine, and creates isolated Docker bridge networks.
-3. **Core Stack Bring-Up (`3`, `4`, `5`, `8`):** The installer launches the **Auto-TLS Reverse Proxy (`3`)**, **Dashboard Control API (`4`)**, **Autonomous AI Agent (`5`)**, and **System & App Registry (`8`)**.
+3. **Core Stack Bring-Up (`3`, `4`, `5`, `8`):** The installer launches the **Auto-TLS Reverse Proxy (`3`)**, **Dashboard Control API (`4`)**, **VPS OS MCP Agent (`5`)**, and **System & App Registry (`8`)**, then installs **Hermes Agent** with the pre-seeded CTO pack (`SOUL.md`, `memories/`, `skills/vps-os-*`) and `vps-os-hermes-cto.service` (see [Hermes CTO Architecture & Onboarding](hermes-cto-onboarding.md)).
 4. **Ready for Non-Linux Users (`1`, `2`):** You open `https://os.yourdomain.com` in a browser with valid HTTPS certificates already active—no more SSH or manual Linux setup required.
 
 ---

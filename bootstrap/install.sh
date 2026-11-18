@@ -6,7 +6,9 @@ set -euo pipefail
 
 VPS_OS_ROOT="${VPS_OS_ROOT:-/vps-os}"
 APPS_ROOT="${APPS_ROOT:-/apps}"
+HERMES_HOME="${HERMES_HOME:-${VPS_OS_ROOT}/hermes}"
 CORE_NETWORK="${CORE_NETWORK:-vps-os-core}"
+INSTALL_HERMES="${INSTALL_HERMES:-true}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 FORCE_OVERWRITE="${1:-}"
@@ -112,23 +114,164 @@ copy_if_needed() {
 }
 
 prepare_directories() {
-  log "Preparing ${VPS_OS_ROOT} and ${APPS_ROOT}..."
-  mkdir -p "${VPS_OS_ROOT}/data" "${VPS_OS_ROOT}/caddy/apps.d" "${APPS_ROOT}"
-  chmod 750 "${VPS_OS_ROOT}" "${APPS_ROOT}"
+  log "Preparing ${VPS_OS_ROOT}, ${APPS_ROOT}, and ${HERMES_HOME}..."
+  mkdir -p "${VPS_OS_ROOT}/data" "${VPS_OS_ROOT}/caddy/apps.d" "${APPS_ROOT}" \
+    "${HERMES_HOME}/memories" "${HERMES_HOME}/skills"
+  chmod 750 "${VPS_OS_ROOT}" "${APPS_ROOT}" "${HERMES_HOME}"
   chown 1000:1000 "${VPS_OS_ROOT}/data" "${APPS_ROOT}"
 
   if [[ ! -f "${VPS_OS_ROOT}/.env" ]]; then
-    local generated_token
+    local generated_token generated_hermes_key
     generated_token="$(openssl rand -hex 32)"
-    sed "s|^VPS_OS_ADMIN_TOKEN=.*$|VPS_OS_ADMIN_TOKEN=${generated_token}|" \
+    generated_hermes_key="$(openssl rand -hex 32)"
+    sed \
+      -e "s|^VPS_OS_ADMIN_TOKEN=.*$|VPS_OS_ADMIN_TOKEN=${generated_token}|" \
+      -e "s|^HERMES_API_SERVER_KEY=.*$|HERMES_API_SERVER_KEY=${generated_hermes_key}|" \
+      -e "s|^HERMES_HOME=.*$|HERMES_HOME=${HERMES_HOME}|" \
       "${SCRIPT_DIR}/.env.example" > "${VPS_OS_ROOT}/.env"
     chmod 600 "${VPS_OS_ROOT}/.env"
-    log "Created ${VPS_OS_ROOT}/.env with a generated VPS_OS_ADMIN_TOKEN."
+    log "Created ${VPS_OS_ROOT}/.env with generated VPS_OS_ADMIN_TOKEN and HERMES_API_SERVER_KEY."
   fi
 
   copy_if_needed "${SCRIPT_DIR}/Caddyfile" "${VPS_OS_ROOT}/Caddyfile"
   copy_if_needed "${SCRIPT_DIR}/docker-compose.core.yml" "${VPS_OS_ROOT}/docker-compose.yml"
   copy_if_needed "${SCRIPT_DIR}/caddy/apps.d/00-default.caddy" "${VPS_OS_ROOT}/caddy/apps.d/00-default.caddy"
+}
+
+render_hermes_config() {
+  local src_cfg="$1"
+  local dst_cfg="$2"
+  # Invoke the MCP stdio server inside the hardened vps-os-agent container so
+  # the Ubuntu host does not need its own Node.js toolchain installed.
+  local mcp_args_block
+  mcp_args_block=$'exec\n      - -i\n      - vps-os-agent\n      - node\n      - /srv/vps-os/agent/dist/mcp-server.js'
+
+  awk \
+    -v cmd="docker" \
+    -v entry="${mcp_args_block}" \
+    -v db="/data/registry.db" \
+    -v apps="/apps" \
+    -v tpl="/srv/vps-os/templates" \
+    '{
+      gsub(/__VPS_OS_MCP_COMMAND__/, cmd);
+      gsub(/__VPS_OS_MCP_ENTRY__/, entry);
+      gsub(/__VPS_OS_REGISTRY_DB__/, db);
+      gsub(/__VPS_OS_APPS_ROOT__/, apps);
+      gsub(/__VPS_OS_TEMPLATES_ROOT__/, tpl);
+      print;
+    }' "${src_cfg}" > "${dst_cfg}"
+}
+
+sync_hermes_pack() {
+  local pack_dir="${REPO_ROOT}/agent/hermes"
+  if [[ ! -d "${pack_dir}" ]]; then
+    echo "Error: missing Hermes CTO pack at ${pack_dir}." >&2
+    exit 1
+  fi
+
+  log "Syncing Hermes CTO identity and core skills into ${HERMES_HOME}..."
+  cp "${pack_dir}/SOUL.md" "${HERMES_HOME}/SOUL.md"
+
+  local skill_dir skill_name
+  for skill_dir in "${pack_dir}/skills"/vps-os-*; do
+    [[ -d "${skill_dir}" ]] || continue
+    skill_name="$(basename "${skill_dir}")"
+    mkdir -p "${HERMES_HOME}/skills/${skill_name}"
+    cp -r "${skill_dir}/." "${HERMES_HOME}/skills/${skill_name}/"
+  done
+
+  copy_if_needed "${pack_dir}/memories/MEMORY.md" "${HERMES_HOME}/memories/MEMORY.md"
+  copy_if_needed "${pack_dir}/memories/USER.md" "${HERMES_HOME}/memories/USER.md"
+
+  if [[ ! -f "${HERMES_HOME}/config.yaml" ]] || [[ "${FORCE_OVERWRITE}" == "--force" ]]; then
+    render_hermes_config "${pack_dir}/config.yaml" "${HERMES_HOME}/config.yaml"
+    chmod 600 "${HERMES_HOME}/config.yaml"
+  else
+    log "Preserving existing ${HERMES_HOME}/config.yaml (pass --force to overwrite)."
+  fi
+}
+
+find_hermes_bin() {
+  if command -v hermes >/dev/null 2>&1; then
+    command -v hermes
+    return
+  fi
+  local candidate
+  for candidate in /usr/local/bin/hermes /root/.local/bin/hermes "${HERMES_HOME}/bin/hermes"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s' "${candidate}"
+      return
+    fi
+  done
+}
+
+ensure_hermes() {
+  if [[ "${INSTALL_HERMES}" != "true" ]]; then
+    log "Skipping Hermes Agent installation (INSTALL_HERMES=${INSTALL_HERMES})."
+    return
+  fi
+
+  if [[ -n "$(find_hermes_bin)" ]]; then
+    log "Hermes Agent CLI already installed."
+    return
+  fi
+
+  log "Installing NousResearch Hermes Agent into ${HERMES_HOME}..."
+  HERMES_HOME="${HERMES_HOME}" curl -fsSL https://hermes-agent.nousresearch.com/install.sh | HERMES_HOME="${HERMES_HOME}" bash
+}
+
+configure_hermes_service() {
+  if [[ "${INSTALL_HERMES}" != "true" ]]; then
+    return
+  fi
+
+  local hermes_bin
+  hermes_bin="$(find_hermes_bin)"
+  if [[ -z "${hermes_bin}" ]]; then
+    log "Warning: hermes CLI not found; skipping systemd service setup."
+    return
+  fi
+
+  local unit_file="/etc/systemd/system/vps-os-hermes-cto.service"
+  if [[ ! -f "${unit_file}" ]] || [[ "${FORCE_OVERWRITE}" == "--force" ]]; then
+    log "Configuring ${unit_file}..."
+    cat > "${unit_file}" <<EOF
+[Unit]
+Description=VPS OS Hermes Autonomous CTO Gateway
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=${HERMES_HOME}
+EnvironmentFile=${VPS_OS_ROOT}/.env
+Environment="HERMES_HOME=${HERMES_HOME}"
+Environment="API_SERVER_ENABLED=true"
+Environment="API_SERVER_HOST=127.0.0.1"
+Environment="API_SERVER_PORT=8642"
+ExecStart=${hermes_bin} gateway
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "${unit_file}"
+    systemctl daemon-reload
+    systemctl enable vps-os-hermes-cto.service
+  fi
+
+  # Start gateway automatically once an LLM API key is configured.
+  # shellcheck source=/dev/null
+  source "${VPS_OS_ROOT}/.env"
+  if [[ -n "${LLM_API_KEY:-}" ]] && [[ "${LLM_API_KEY}" != replace-with-* ]]; then
+    systemctl restart vps-os-hermes-cto.service
+    log "Hermes CTO gateway is running on 127.0.0.1:8642."
+  else
+    log "Hermes CTO configured at ${HERMES_HOME}; set LLM_API_KEY in ${VPS_OS_ROOT}/.env and run 'systemctl start vps-os-hermes-cto'."
+  fi
 }
 
 validate_runtime_env() {
@@ -174,6 +317,11 @@ main() {
   validate_runtime_env
   ensure_core_network
   bring_up_core
+  # Install Hermes before syncing our CTO pack so repo SOUL.md, config.yaml,
+  # and vps-os-* skills take precedence over installer defaults.
+  ensure_hermes
+  sync_hermes_pack
+  configure_hermes_service
 }
 
 main "$@"

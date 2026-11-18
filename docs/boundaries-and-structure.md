@@ -15,7 +15,7 @@ The repository root stays intentionally minimal (`README.md`, `AGENTS.md`, `CLAU
 | `bootstrap/` | Active | Ubuntu setup, host hardening, Caddy reverse proxy, and core Compose stack |
 | `dashboard/api/` | Active | Hono Control Plane backend API |
 | `dashboard/web/` | Active | React + Vite + Tailwind Management Web UI & CTO Chat |
-| `agent/` | Active | Autonomous AI CTO planner, Vercel AI SDK toolset, and isolated subagent runtime |
+| `agent/` | Active | Autonomous AI CTO planner, Hermes CTO pack (`agent/hermes/`), MCP server, and isolated subagent runtime |
 | `templates/` | Active | Isolated per-app / per-agent Docker Compose templates deployed into separate folders |
 | `tests/` | Active | Unit, isolation, API, and template/bootstrap guardrail tests |
 
@@ -28,7 +28,7 @@ The repository uses a **TypeScript + pnpm workspace** core paired with **Bash + 
 - **Ingress (`3`) & Bootstrap (`0`):** POSIX/Bash (`bootstrap/install.sh`), Caddy 2 Auto-TLS reverse proxy, and Docker Compose v2.
 - **Shared Core & Registry (`8`):** TypeScript, Zod, and Node's built-in `node:sqlite` (WAL mode).
 - **Dashboard (`1`, `4`):** React 19 + Vite + Tailwind CSS v4 (`dashboard/web/`) and Hono on Node.js LTS (`dashboard/api/`).
-- **Autonomous AI Agent (`5`, `6`):** TypeScript + Vercel AI SDK (`ai`) + Zod tools (`agent/`).
+- **Autonomous AI Agent (`5`, `6`):** Hermes Agent CTO Gateway (`systemd`, `agent/hermes/`) bridged via MCP JSON-RPC `stdio` to TypeScript + Vercel AI SDK (`ai`) + Zod tools (`agent/`). See [Hermes CTO Architecture & Onboarding](hermes-cto-onboarding.md).
 - **Isolated Workloads (`7`, `9`):** Locked-apartment Docker Compose templates (`templates/personal-agent/`, `templates/web-app/`).
 
 ---

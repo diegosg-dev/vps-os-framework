@@ -1,0 +1,36 @@
+# VPS OS Hermes CTO Configuration Template
+# Placeholders (__...__) are rendered by bootstrap/install.sh or provisionHermesHome().
+
+model:
+  provider: "${LLM_PROVIDER:-openai}"
+  name: "${LLM_MODEL:-gpt-4.1}"
+
+terminal:
+  backend: local
+
+approvals:
+  mode: smart
+
+memory:
+  memory_char_limit: 2200
+  user_char_limit: 1375
+
+compression:
+  enabled: true
+  threshold: 0.75
+
+gateway:
+  api_server:
+    enabled: true
+    host: "127.0.0.1"
+    port: 8642
+
+mcp_servers:
+  vps-os:
+    command: "__VPS_OS_MCP_COMMAND__"
+    args:
+      - "__VPS_OS_MCP_ENTRY__"
+    env:
+      VPS_OS_REGISTRY_DB: "__VPS_OS_REGISTRY_DB__"
+      VPS_OS_APPS_ROOT: "__VPS_OS_APPS_ROOT__"
+      VPS_OS_TEMPLATES_ROOT: "__VPS_OS_TEMPLATES_ROOT__"

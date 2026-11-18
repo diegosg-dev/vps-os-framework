@@ -21,7 +21,7 @@ Keep the repository root clean (`README.md`, `AGENTS.md`, `CLAUDE.md`, `assets/`
 - `bootstrap/`: Ubuntu LTS setup script (`install.sh`), Caddyfile, and core `docker-compose.core.yml`.
 - `dashboard/api/`: Hono Control API (`@vps-os/dashboard-api`).
 - `dashboard/web/`: React + Vite + Tailwind Management Web UI & CTO Chat (`@vps-os/dashboard-web`).
-- `agent/`: Core AI CTO planner, Vercel AI SDK toolset, and isolated subagent runtime (`@vps-os/agent`).
+- `agent/`: Core AI CTO planner, Hermes CTO pack (`hermes/`), MCP stdio server, Vercel AI SDK toolset, and isolated subagent runtime (`@vps-os/agent`).
 - `templates/`: Isolated per-app / per-agent Docker Compose templates deployed into separate folders.
 - `tests/`: Automated unit, isolation, API, and template/bootstrap guardrail tests (`@vps-os/tests`).
 - Update this map whenever a new top-level directory is introduced.
