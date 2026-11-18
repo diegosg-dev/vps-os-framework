@@ -225,15 +225,34 @@ export class SystemRegistryStore {
     return row ? this.mapPlanRow(row) : null;
   }
 
-  /** Records an explicit approval or rejection decision for a pending plan. */
+  /** Lists stored execution plans ordered newest-first, optionally filtered by status. */
+  listPlans(options?: { status?: PlanStatus; limit?: number }): StoredPlan[] {
+    const bounded = Math.max(1, Math.min(options?.limit ?? 25, 100));
+    if (options?.status) {
+      const stmt = this.db.prepare(
+        "SELECT * FROM execution_plans WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+      );
+      const rows = stmt.all(options.status, bounded) as unknown as PlanRow[];
+      return rows.map((row) => this.mapPlanRow(row));
+    }
+    const stmt = this.db.prepare(
+      "SELECT * FROM execution_plans ORDER BY created_at DESC LIMIT ?",
+    );
+    const rows = stmt.all(bounded) as unknown as PlanRow[];
+    return rows.map((row) => this.mapPlanRow(row));
+  }
+
+  /** Records an explicit one-way approval or rejection decision for a pending plan. */
   recordApproval(decision: ApprovalDecision): StoredPlan {
     const validated = ApprovalDecisionSchema.parse(decision);
     const existing = this.getPlan(validated.planId);
     if (!existing) {
       throw new Error(`Execution plan "${validated.planId}" not found.`);
     }
-    if (existing.status === "executed") {
-      throw new Error(`Execution plan "${validated.planId}" was already executed.`);
+    if (existing.status !== "pending") {
+      throw new Error(
+        `Execution plan "${validated.planId}" is already "${existing.status}" and cannot be re-decided.`,
+      );
     }
 
     const nextStatus: PlanStatus = validated.approved ? "approved" : "rejected";
@@ -243,9 +262,20 @@ export class SystemRegistryStore {
     const stmt = this.db.prepare(`
       UPDATE execution_plans
       SET status = ?, decided_by = ?, decision_note = ?, decided_at = ?
-      WHERE id = ? AND status IN ('pending', 'approved', 'rejected')
+      WHERE id = ? AND status = 'pending'
     `);
-    stmt.run(nextStatus, validated.decidedBy, cleanNote, decidedAt, validated.planId);
+    const result = stmt.run(
+      nextStatus,
+      validated.decidedBy,
+      cleanNote,
+      decidedAt,
+      validated.planId,
+    );
+    if (result.changes === 0) {
+      throw new Error(
+        `Execution plan "${validated.planId}" is no longer pending.`,
+      );
+    }
 
     return {
       ...existing,
