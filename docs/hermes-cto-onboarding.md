@@ -95,7 +95,7 @@ In addition, Hermes can author new custom skills under `/vps-os/hermes/skills/` 
 | `inspect_apps` | List registered apps, domains, ports, and resource limits | Read-only |
 | `list_audit_events` | Inspect recent redacted audit trail entries | Read-only |
 | `propose_plan` | Classify risk (`low` / `medium` / `high`) and persist an `ExecutionPlan` | Redacts secrets in goal |
-| `get_plan_status` | Poll whether a pending `ExecutionPlan` has been approved or rejected | Read-only |
+| `get_plan_status` | Check whether a pending `ExecutionPlan` has been approved or rejected | Read-only |
 | `prepare_app_workspace` | Create `/apps/<slug>`, Compose file, `.env.example`, `.env` (`0600`), and `provisioning` record | **Blocked unless plan status is `approved`**; marks plan `executed` to prevent replay |
 | `update_app_status` | Record final lifecycle status (`provisioning`, `running`, `stopped`, `error`) + audit event | Validates slug (`validateAppSlug`) and status (`AppStatusSchema`) |
 
