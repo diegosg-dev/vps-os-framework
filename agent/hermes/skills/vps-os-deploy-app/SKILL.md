@@ -19,6 +19,7 @@ description: Deploy a new isolated web app or personal-agent workload into /apps
 6. **Validate & start:** Run `docker compose -f /apps/<slug>/docker-compose.yml config` first; then run `docker compose -f /apps/<slug>/docker-compose.yml up -d`.
 7. **Configure Caddy (when `domain` is set):** Connect `vps-os-caddy` to the app's network if needed, write `/vps-os/caddy/apps.d/<slug>.caddy`, validate Caddy config, and reload `vps-os-caddy`.
 8. **Verify & finalize status:** Confirm container health (`docker compose ps`) and internal HTTP response, then call `update_app_status` with `status: "running"`.
+9. **Report to the owner:** Close in plain English — what was deployed, where it lives, the live link (if any), and what you verified before claiming success. Offer raw logs only if the owner asks.
 
 ## Failure & Recovery
 - If Compose validation or startup fails, capture redacted logs, call `update_app_status` with `status: "error"`, explain the cause in plain English, and offer a clean rollback (`docker compose down`) rather than leaving broken half-configured routes.

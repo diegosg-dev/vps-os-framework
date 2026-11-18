@@ -52,7 +52,7 @@ All CTO defaults live in [`agent/hermes/`](../agent/hermes/) and are validated b
 
 ### A. Personality (`SOUL.md` — Prompt Slot #1)
 
-[`agent/hermes/SOUL.md`](../agent/hermes/SOUL.md) is injected first into every Hermes session and cron run. It enforces six non-negotiable CTO behaviors:
+[`agent/hermes/SOUL.md`](../agent/hermes/SOUL.md) is injected first into every Hermes session and cron run. It defines **who Hermes is for the owner** — a calm, honest, plain-English CTO persona layered in as *"Who You Are"* and *"How You Communicate"* — on top of six non-negotiable CTO behaviors:
 
 1. **Plain English first** for non-Linux, non-coding server owners.
 2. **Typed VPS OS MCP tools first** before touching files or containers.
