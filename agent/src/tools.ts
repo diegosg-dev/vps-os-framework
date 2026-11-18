@@ -26,7 +26,7 @@ export function createAgentToolset(deps: AgentToolsetDeps): ToolSet {
   return {
     inspect_apps: tool({
       description:
-        "List all registered applications and personal agents with status and resource limits.",
+        "Read-only snapshot of every registered app and personal agent: status, domain, internal port, and resource limits. Safe to call anytime. Use it before proposing any change and when summarizing the server for the owner.",
       inputSchema: z.object({}),
       execute: async () => {
         return { apps: deps.registry.listApps() };
@@ -35,7 +35,7 @@ export function createAgentToolset(deps: AgentToolsetDeps): ToolSet {
 
     list_audit_events: tool({
       description:
-        "Read the most recent immutable VPS OS audit events (redacted of secrets).",
+        "Read-only view of the most recent immutable VPS OS audit events, already redacted of secrets. Use it to tell the owner what changed on their server, when, and by whom.",
       inputSchema: z.object({
         limit: z.number().int().min(1).max(100).optional(),
       }),
@@ -46,7 +46,7 @@ export function createAgentToolset(deps: AgentToolsetDeps): ToolSet {
 
     propose_plan: tool({
       description:
-        "Generate and persist a structured execution plan with risk classification for user approval.",
+        "Turn an owner goal into a structured, risk-classified ExecutionPlan stored for approval. Secrets in the goal are redacted before storage. No mutation may proceed until the plan is approved.",
       inputSchema: z.object({
         goal: z.string().min(1).max(1000),
       }),
@@ -58,7 +58,7 @@ export function createAgentToolset(deps: AgentToolsetDeps): ToolSet {
 
     get_plan_status: tool({
       description:
-        "Check the current approval and execution status of a stored ExecutionPlan by ID.",
+        "Read-only check of a stored ExecutionPlan's current approval and execution status by ID. Check this before every mutation step; never assume the owner has approved.",
       inputSchema: z.object({
         planId: z.string().min(1),
       }),
@@ -70,7 +70,7 @@ export function createAgentToolset(deps: AgentToolsetDeps): ToolSet {
 
     prepare_app_workspace: tool({
       description:
-        "Provision an isolated Locked Apartment workspace folder, Compose template, and .env under /apps/<slug>. Requires an approved planId.",
+        "Approval-gated: provisions the isolated Locked Apartment workspace for one app (/apps/<slug> with its own Compose file and 0600-scoped .env, resource caps, no Docker socket). Requires a planId whose status is 'approved'; each approved plan executes exactly once.",
       inputSchema: z.object({
         planId: z.string().min(1),
         slug: z.string().min(2).max(48),
@@ -118,7 +118,7 @@ export function createAgentToolset(deps: AgentToolsetDeps): ToolSet {
 
     update_app_status: tool({
       description:
-        "Update a registered app's lifecycle status ('provisioning', 'running', 'stopped', 'error') and record an audit event.",
+        "Record an app's real lifecycle status ('provisioning', 'running', 'stopped', 'error') plus a redacted audit event. Call it only after verifying the app yourself, so the dashboard always matches reality.",
       inputSchema: z.object({
         slug: z.string().min(2).max(48),
         status: AppStatusSchema,

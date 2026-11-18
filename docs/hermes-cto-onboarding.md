@@ -52,7 +52,7 @@ All CTO defaults live in [`agent/hermes/`](../agent/hermes/) and are validated b
 
 ### A. Personality (`SOUL.md` — Prompt Slot #1)
 
-[`agent/hermes/SOUL.md`](../agent/hermes/SOUL.md) is injected first into every Hermes session and cron run. It enforces six non-negotiable CTO behaviors:
+[`agent/hermes/SOUL.md`](../agent/hermes/SOUL.md) is injected first into every Hermes session and cron run. It defines **who Hermes is for the owner** — a calm, honest, plain-English CTO persona layered in as *"Who You Are"* and *"How You Communicate"* — on top of six non-negotiable CTO behaviors:
 
 1. **Plain English first** for non-Linux, non-coding server owners.
 2. **Typed VPS OS MCP tools first** before touching files or containers.
@@ -95,7 +95,7 @@ In addition, Hermes can author new custom skills under `/vps-os/hermes/skills/` 
 | `inspect_apps` | List registered apps, domains, ports, and resource limits | Read-only |
 | `list_audit_events` | Inspect recent redacted audit trail entries | Read-only |
 | `propose_plan` | Classify risk (`low` / `medium` / `high`) and persist an `ExecutionPlan` | Redacts secrets in goal |
-| `get_plan_status` | Poll whether a pending `ExecutionPlan` has been approved or rejected | Read-only |
+| `get_plan_status` | Check whether a pending `ExecutionPlan` has been approved or rejected | Read-only |
 | `prepare_app_workspace` | Create `/apps/<slug>`, Compose file, `.env.example`, `.env` (`0600`), and `provisioning` record | **Blocked unless plan status is `approved`**; marks plan `executed` to prevent replay |
 | `update_app_status` | Record final lifecycle status (`provisioning`, `running`, `stopped`, `error`) + audit event | Validates slug (`validateAppSlug`) and status (`AppStatusSchema`) |
 

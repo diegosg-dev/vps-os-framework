@@ -15,3 +15,6 @@ description: Verify DNS resolution and safely bind or update an automatic HTTPS 
 3. **Write scoped route file:** Create `/vps-os/caddy/apps.d/<slug>.caddy` proxying `<domain>` over TLS to the app container's internal service name and port on its shared bridge. Never expose internal `/agent/*` or `127.0.0.1:8642` endpoints.
 4. **Validate & reload Caddy:** Run `docker exec vps-os-caddy caddy validate --config /etc/caddy/Caddyfile` before reloading (`caddy reload --config /etc/caddy/Caddyfile`).
 5. **Confirm HTTPS:** Verify TLS handshake and HTTP status, then report the live `https://<domain>` link to the user.
+
+## Failure & Recovery
+- If the TLS handshake or certificate issuance fails, never hammer retries — repeated failed attempts can trigger longer ACME rate limits. Explain in plain English the confirmed or most likely cause (DNS not pointing here yet, port `80`/`443` blocked, or an ACME rate limit), what remains uncertain, and what you will check next. Offer a safe retry interval only when the observed ACME response supports one.
