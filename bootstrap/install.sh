@@ -2,19 +2,106 @@
 set -euo pipefail
 
 # VPS OS Framework - Idempotent Ubuntu LTS Bootstrapper (Step 0)
-# Usage: sudo bash bootstrap/install.sh [--force]
+# Usage:
+#   sudo bash bootstrap/install.sh [--force] [--non-interactive] [--domain os.yourdomain.com] [--email you@yourdomain.com]
+#   curl -fsSL https://raw.githubusercontent.com/diegosg-dev/vps-os-framework/main/bootstrap/install.sh | sudo bash
 
 VPS_OS_ROOT="${VPS_OS_ROOT:-/vps-os}"
 APPS_ROOT="${APPS_ROOT:-/apps}"
 HERMES_HOME="${HERMES_HOME:-${VPS_OS_ROOT}/hermes}"
 CORE_NETWORK="${CORE_NETWORK:-vps-os-core}"
 INSTALL_HERMES="${INSTALL_HERMES:-true}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-FORCE_OVERWRITE="${1:-}"
+VPS_OS_REPO_URL="${VPS_OS_REPO_URL:-https://github.com/diegosg-dev/vps-os-framework.git}"
+VPS_OS_REPO_REF="${VPS_OS_REPO_REF:-main}"
+VPS_OS_REPO_DIR="${VPS_OS_REPO_DIR:-/opt/vps-os-framework}"
+
+FORCE_OVERWRITE=""
+NON_INTERACTIVE="false"
+ARG_DOMAIN=""
+ARG_EMAIL=""
+ARG_LLM_PROVIDER=""
+ARG_LLM_MODEL=""
+ARG_LLM_KEY=""
+ROTATE_SETUP_CODE="false"
+GENERATED_SETUP_CODE=""
+DETECTED_PUBLIC_IP=""
+
+SOURCE_PATH="${BASH_SOURCE[0]:-}"
+if [[ -n "${SOURCE_PATH}" && -f "${SOURCE_PATH}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${SOURCE_PATH}")" && pwd)"
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+else
+  SCRIPT_DIR=""
+  REPO_ROOT=""
+fi
 
 log() {
   printf '[vps-os-bootstrap] %s\n' "$1"
+}
+
+usage() {
+  cat <<'EOF'
+VPS OS Framework — Ubuntu LTS Bootstrapper
+
+Options:
+  --domain <host>         Public dashboard domain (e.g. os.yourdomain.com)
+  --email <email>         ACME/Let's Encrypt notification email
+  --llm-provider <name>   Pre-configure LLM provider (openai|anthropic|openrouter|nous|ollama)
+  --llm-model <model>     Pre-configure LLM model identifier
+  --llm-key <key>         Pre-configure LLM API key
+  --rotate-setup-code     Generate a fresh single-use browser setup pairing code
+  --non-interactive, -y   Skip interactive prompts (for cloud-init / CI)
+  --force                 Overwrite preserved config and unit files
+  --help, -h              Show this help message
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force)
+        FORCE_OVERWRITE="--force"
+        shift
+        ;;
+      --non-interactive|-y)
+        NON_INTERACTIVE="true"
+        shift
+        ;;
+      --domain)
+        ARG_DOMAIN="${2:-}"
+        shift 2
+        ;;
+      --email)
+        ARG_EMAIL="${2:-}"
+        shift 2
+        ;;
+      --llm-provider)
+        ARG_LLM_PROVIDER="${2:-}"
+        shift 2
+        ;;
+      --llm-model)
+        ARG_LLM_MODEL="${2:-}"
+        shift 2
+        ;;
+      --llm-key)
+        ARG_LLM_KEY="${2:-}"
+        shift 2
+        ;;
+      --rotate-setup-code)
+        ROTATE_SETUP_CODE="true"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Error: Unknown argument '$1'." >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
 }
 
 require_root() {
@@ -36,6 +123,30 @@ require_ubuntu() {
     exit 1
   fi
   log "Detected Ubuntu ${VERSION_ID:-unknown}"
+}
+
+ensure_repo_checkout() {
+  if [[ -n "${REPO_ROOT}" && -d "${REPO_ROOT}/agent/hermes" && -f "${REPO_ROOT}/bootstrap/docker-compose.core.yml" ]]; then
+    return
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    log "Installing git to fetch VPS OS repository..."
+    apt-get update -y
+    apt-get install -y git ca-certificates curl
+  fi
+
+  if [[ -d "${VPS_OS_REPO_DIR}/.git" ]]; then
+    log "Updating existing VPS OS repository in ${VPS_OS_REPO_DIR}..."
+    git -C "${VPS_OS_REPO_DIR}" fetch --depth 1 origin "${VPS_OS_REPO_REF}"
+    git -C "${VPS_OS_REPO_DIR}" checkout -B "${VPS_OS_REPO_REF}" "origin/${VPS_OS_REPO_REF}"
+  else
+    log "Cloning VPS OS repository into ${VPS_OS_REPO_DIR}..."
+    git clone --depth 1 --branch "${VPS_OS_REPO_REF}" "${VPS_OS_REPO_URL}" "${VPS_OS_REPO_DIR}"
+  fi
+
+  REPO_ROOT="${VPS_OS_REPO_DIR}"
+  SCRIPT_DIR="${REPO_ROOT}/bootstrap"
 }
 
 ensure_docker() {
@@ -67,6 +178,25 @@ detect_ssh_port() {
     port="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config || true)"
   fi
   printf '%s' "${port:-22}"
+}
+
+detect_public_ip() {
+  local ip=""
+  local probe
+  for probe in "https://api.ipify.org" "https://ipv4.icanhazip.com"; do
+    ip="$(curl -fsS --max-time 3 "${probe}" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s' "${ip}"
+      return
+    fi
+  done
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}' || true)"
+    if [[ "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s' "${ip}"
+      return
+    fi
+  fi
 }
 
 harden_ssh() {
@@ -113,13 +243,130 @@ copy_if_needed() {
   fi
 }
 
+upsert_env_key() {
+  local env_file="$1"
+  local key="$2"
+  local val="$3"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  awk -v target_key="${key}" -v target_val="${val}" '
+    BEGIN { updated = 0 }
+    index($0, target_key "=") == 1 {
+      print target_key "=" target_val
+      updated = 1
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print target_key "=" target_val
+      }
+    }
+  ' "${env_file}" > "${tmp_file}"
+  chmod 600 "${tmp_file}"
+  mv "${tmp_file}" "${env_file}"
+}
+
+sha256_hex() {
+  local input="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "${input}" | sha256sum | awk '{print $1}'
+  else
+    printf '%s' "${input}" | openssl dgst -sha256 -r | awk '{print $1}'
+  fi
+}
+
+generate_setup_claim() {
+  local claim_file="${VPS_OS_ROOT}/data/setup-claim.json"
+  if [[ -f "${claim_file}" && "${ROTATE_SETUP_CODE}" != "true" ]]; then
+    return
+  fi
+
+  local raw_code=""
+  while [[ "${#raw_code}" -lt 12 ]]; do
+    raw_code="${raw_code}$(openssl rand -base64 24 | tr -dc 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789')"
+  done
+  raw_code="${raw_code:0:12}"
+  GENERATED_SETUP_CODE="${raw_code:0:4}-${raw_code:4:4}-${raw_code:8:4}"
+
+  local code_hash created_at expires_at
+  code_hash="$(sha256_hex "${raw_code}")"
+  created_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  expires_at="$(date -u -d "+24 hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u +"%Y-%m-%dT23:59:59Z")"
+
+  cat > "${claim_file}" <<EOF
+{
+  "codeHash": "${code_hash}",
+  "createdAt": "${created_at}",
+  "expiresAt": "${expires_at}",
+  "consumedAt": null,
+  "failedAttempts": 0
+}
+EOF
+  chown 1000:1000 "${claim_file}"
+  chmod 600 "${claim_file}"
+}
+
+prompt_domain_if_interactive() {
+  if [[ -n "${ARG_DOMAIN}" || "${NON_INTERACTIVE}" == "true" || ! -t 0 ]]; then
+    return
+  fi
+
+  # shellcheck source=/dev/null
+  source "${VPS_OS_ROOT}/.env"
+  if [[ -n "${VPS_OS_DOMAIN:-}" && "${VPS_OS_DOMAIN}" != "localhost" && "${VPS_OS_DOMAIN}" != "os.example.com" ]]; then
+    return
+  fi
+
+  printf '\n'
+  log "Optional domain setup (you can also do this in the browser Setup Wizard):"
+  if [[ -n "${DETECTED_PUBLIC_IP}" ]]; then
+    printf '  Detected public IP: %s\n' "${DETECTED_PUBLIC_IP}"
+  fi
+  local input_domain=""
+  read -r -p "  Enter domain for automatic HTTPS (or press Enter for IP setup mode): " input_domain || true
+  input_domain="${input_domain// /}"
+  if [[ -n "${input_domain}" ]]; then
+    ARG_DOMAIN="${input_domain}"
+    if [[ -z "${ARG_EMAIL}" ]]; then
+      local input_email=""
+      read -r -p "  Enter email for Let's Encrypt SSL alerts (optional): " input_email || true
+      ARG_EMAIL="${input_email// /}"
+    fi
+  fi
+}
+
+check_domain_dns() {
+  local domain="$1"
+  local resolved=""
+  if command -v getent >/dev/null 2>&1; then
+    resolved="$(getent ahostsv4 "${domain}" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
+  fi
+  if [[ -z "${resolved}" ]] && command -v dig >/dev/null 2>&1; then
+    resolved="$(dig +short A "${domain}" 2>/dev/null | tr '\n' ' ' || true)"
+  fi
+
+  if [[ -z "${resolved}" ]]; then
+    log "Warning: DNS A record for ${domain} does not resolve yet."
+    if [[ -n "${DETECTED_PUBLIC_IP}" ]]; then
+      log "Create an A record: ${domain} -> ${DETECTED_PUBLIC_IP}, then verify in the Setup Wizard."
+    fi
+  elif [[ -n "${DETECTED_PUBLIC_IP}" && " ${resolved} " != *" ${DETECTED_PUBLIC_IP} "* ]]; then
+    log "Warning: ${domain} resolves to [${resolved}], expected ${DETECTED_PUBLIC_IP}."
+    log "Update your DNS A record to ${DETECTED_PUBLIC_IP} before requesting public TLS certificates."
+  else
+    log "DNS check passed: ${domain} -> ${resolved}"
+  fi
+}
+
 prepare_directories() {
   log "Preparing ${VPS_OS_ROOT}, ${APPS_ROOT}, and ${HERMES_HOME}..."
-  mkdir -p "${VPS_OS_ROOT}/data" "${VPS_OS_ROOT}/caddy/apps.d" "${APPS_ROOT}" \
-    "${HERMES_HOME}/memories" "${HERMES_HOME}/skills"
-  chmod 750 "${VPS_OS_ROOT}" "${APPS_ROOT}" "${HERMES_HOME}"
-  chown 1000:1000 "${VPS_OS_ROOT}/data" "${APPS_ROOT}"
+  mkdir -p "${VPS_OS_ROOT}/data" "${VPS_OS_ROOT}/config" "${VPS_OS_ROOT}/caddy/apps.d" \
+    "${APPS_ROOT}" "${HERMES_HOME}/memories" "${HERMES_HOME}/skills"
+  chmod 750 "${VPS_OS_ROOT}" "${VPS_OS_ROOT}/config" "${APPS_ROOT}" "${HERMES_HOME}"
+  chown 1000:1000 "${VPS_OS_ROOT}/data" "${VPS_OS_ROOT}/config" "${APPS_ROOT}"
 
+  local fresh_env="false"
   if [[ ! -f "${VPS_OS_ROOT}/.env" ]]; then
     local generated_token generated_hermes_key
     generated_token="$(openssl rand -hex 32)"
@@ -130,7 +377,56 @@ prepare_directories() {
       -e "s|^HERMES_HOME=.*$|HERMES_HOME=${HERMES_HOME}|" \
       "${SCRIPT_DIR}/.env.example" > "${VPS_OS_ROOT}/.env"
     chmod 600 "${VPS_OS_ROOT}/.env"
+    fresh_env="true"
     log "Created ${VPS_OS_ROOT}/.env with generated VPS_OS_ADMIN_TOKEN and HERMES_API_SERVER_KEY."
+  fi
+
+  if [[ ! -f "${VPS_OS_ROOT}/config/onboarding.env" ]]; then
+    : > "${VPS_OS_ROOT}/config/onboarding.env"
+    chown 1000:1000 "${VPS_OS_ROOT}/config/onboarding.env"
+    chmod 600 "${VPS_OS_ROOT}/config/onboarding.env"
+  fi
+
+  DETECTED_PUBLIC_IP="$(detect_public_ip || true)"
+  if [[ -n "${DETECTED_PUBLIC_IP}" ]]; then
+    upsert_env_key "${VPS_OS_ROOT}/.env" "VPS_OS_PUBLIC_IP" "${DETECTED_PUBLIC_IP}"
+  fi
+
+  prompt_domain_if_interactive
+
+  if [[ -n "${ARG_DOMAIN}" ]]; then
+    if [[ "${ARG_DOMAIN}" == "os.example.com" ]]; then
+      echo "Error: --domain cannot be placeholder os.example.com." >&2
+      exit 1
+    fi
+    upsert_env_key "${VPS_OS_ROOT}/.env" "VPS_OS_DOMAIN" "${ARG_DOMAIN}"
+    upsert_env_key "${VPS_OS_ROOT}/.env" "VPS_OS_SITE_ADDRESS" "${ARG_DOMAIN}"
+    check_domain_dns "${ARG_DOMAIN}"
+  else
+    # Default to :80 setup mode on initial install when no domain is bound yet,
+    # so the owner can immediately open http://<PUBLIC_IP> and run the Setup Wizard.
+    # shellcheck source=/dev/null
+    source "${VPS_OS_ROOT}/.env"
+    if [[ "${VPS_OS_DOMAIN:-localhost}" == "localhost" && -n "${DETECTED_PUBLIC_IP}" ]]; then
+      upsert_env_key "${VPS_OS_ROOT}/.env" "VPS_OS_SITE_ADDRESS" ":80"
+    fi
+  fi
+
+  if [[ -n "${ARG_EMAIL}" ]]; then
+    upsert_env_key "${VPS_OS_ROOT}/.env" "VPS_OS_ACME_EMAIL" "${ARG_EMAIL}"
+  fi
+  if [[ -n "${ARG_LLM_PROVIDER}" ]]; then
+    upsert_env_key "${VPS_OS_ROOT}/.env" "LLM_PROVIDER" "${ARG_LLM_PROVIDER}"
+  fi
+  if [[ -n "${ARG_LLM_MODEL}" ]]; then
+    upsert_env_key "${VPS_OS_ROOT}/.env" "LLM_MODEL" "${ARG_LLM_MODEL}"
+  fi
+  if [[ -n "${ARG_LLM_KEY}" ]]; then
+    upsert_env_key "${VPS_OS_ROOT}/.env" "LLM_API_KEY" "${ARG_LLM_KEY}"
+  fi
+
+  if [[ "${fresh_env}" == "true" || "${ROTATE_SETUP_CODE}" == "true" ]]; then
+    generate_setup_claim
   fi
 
   copy_if_needed "${SCRIPT_DIR}/Caddyfile" "${VPS_OS_ROOT}/Caddyfile"
@@ -263,15 +559,60 @@ EOF
     systemctl enable vps-os-hermes-cto.service
   fi
 
-  # Start gateway automatically once an LLM API key is configured.
+  # Start gateway automatically once an LLM API key (or local Ollama) is configured.
   # shellcheck source=/dev/null
   source "${VPS_OS_ROOT}/.env"
-  if [[ -n "${LLM_API_KEY:-}" ]] && [[ "${LLM_API_KEY}" != replace-with-* ]]; then
+  if [[ "${LLM_PROVIDER:-}" == "ollama" ]] || { [[ -n "${LLM_API_KEY:-}" ]] && [[ "${LLM_API_KEY}" != replace-with-* ]]; }; then
     systemctl restart vps-os-hermes-cto.service
     log "Hermes CTO gateway is running on 127.0.0.1:8642."
   else
-    log "Hermes CTO configured at ${HERMES_HOME}; set LLM_API_KEY in ${VPS_OS_ROOT}/.env and run 'systemctl start vps-os-hermes-cto'."
+    log "Hermes CTO configured at ${HERMES_HOME}; complete setup in the browser Setup Wizard to start it automatically."
   fi
+}
+
+configure_onboarding_sync_service() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return
+  fi
+  local apply_script="${REPO_ROOT}/bootstrap/apply-onboarding.sh"
+  if [[ ! -f "${apply_script}" ]]; then
+    return
+  fi
+  chmod 750 "${apply_script}"
+
+  local svc_file="/etc/systemd/system/vps-os-onboarding-apply.service"
+  local path_file="/etc/systemd/system/vps-os-onboarding-apply.path"
+  if [[ ! -f "${svc_file}" ]] || [[ "${FORCE_OVERWRITE}" == "--force" ]]; then
+    cat > "${svc_file}" <<EOF
+[Unit]
+Description=Apply VPS OS Browser Onboarding Configuration
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment="VPS_OS_ROOT=${VPS_OS_ROOT}"
+Environment="HERMES_HOME=${HERMES_HOME}"
+ExecStart=/bin/bash ${apply_script}
+EOF
+    chmod 644 "${svc_file}"
+  fi
+
+  if [[ ! -f "${path_file}" ]] || [[ "${FORCE_OVERWRITE}" == "--force" ]]; then
+    cat > "${path_file}" <<EOF
+[Unit]
+Description=Watch VPS OS Onboarding Apply Trigger
+
+[Path]
+PathModified=${VPS_OS_ROOT}/data/onboarding-apply.trigger
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "${path_file}"
+  fi
+
+  systemctl daemon-reload
+  systemctl enable --now vps-os-onboarding-apply.path
 }
 
 validate_runtime_env() {
@@ -307,9 +648,37 @@ bring_up_core() {
   log "VPS OS core stack is running."
 }
 
+print_onboarding_summary() {
+  # shellcheck source=/dev/null
+  source "${VPS_OS_ROOT}/.env"
+  local base_url=""
+  if [[ -n "${VPS_OS_DOMAIN:-}" && "${VPS_OS_DOMAIN}" != "localhost" ]]; then
+    base_url="https://${VPS_OS_DOMAIN}"
+  elif [[ -n "${DETECTED_PUBLIC_IP}" ]]; then
+    base_url="http://${DETECTED_PUBLIC_IP}"
+  else
+    base_url="http://localhost"
+  fi
+
+  printf '\n====================================================================\n'
+  printf '  VPS OS Framework is ready for browser onboarding!\n'
+  printf '====================================================================\n'
+  printf '  Dashboard URL : %s/\n' "${base_url}"
+  if [[ -n "${GENERATED_SETUP_CODE}" ]]; then
+    printf '  Setup Code    : %s (single-use, expires in 24h)\n' "${GENERATED_SETUP_CODE}"
+    printf '  One-Click Link: %s/#claim=%s\n' "${base_url}" "${GENERATED_SETUP_CODE}"
+  else
+    printf '  Sign In       : Use your Admin Passphrase or VPS_OS_ADMIN_TOKEN\n'
+    printf '                  (run with --rotate-setup-code to mint a new pairing code)\n'
+  fi
+  printf '====================================================================\n\n'
+}
+
 main() {
+  parse_args "$@"
   require_root
   require_ubuntu
+  ensure_repo_checkout
   ensure_docker
   harden_ssh
   configure_firewall
@@ -322,6 +691,8 @@ main() {
   ensure_hermes
   sync_hermes_pack
   configure_hermes_service
+  configure_onboarding_sync_service
+  print_onboarding_summary
 }
 
 main "$@"

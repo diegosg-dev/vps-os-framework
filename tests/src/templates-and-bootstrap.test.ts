@@ -26,21 +26,41 @@ function findBashBinary(): string | null {
   return null;
 }
 
-test("bootstrap/install.sh passes bash -n and avoids destructive defaults", () => {
+test("bootstrap/install.sh and apply-onboarding.sh pass bash -n, use LF endings, and avoid destructive defaults", () => {
   const scriptPath = path.join(REPO_ROOT, "bootstrap", "install.sh");
+  const applyScriptPath = path.join(REPO_ROOT, "bootstrap", "apply-onboarding.sh");
   const script = fs.readFileSync(scriptPath, "utf8");
+  const applyScript = fs.readFileSync(applyScriptPath, "utf8");
 
   assert.match(script, /^#!\/usr\/bin\/env bash/);
   assert.match(script, /set -euo pipefail/);
+  assert.equal(script.includes("\r\n"), false, "install.sh must use LF line endings");
   assert.equal(script.includes("rm -rf /"), false);
+
+  assert.match(applyScript, /^#!\/usr\/bin\/env bash/);
+  assert.match(applyScript, /set -euo pipefail/);
+  assert.equal(
+    applyScript.includes("\r\n"),
+    false,
+    "apply-onboarding.sh must use LF line endings",
+  );
+  assert.equal(
+    /^\s*(?:source|\.)\s+.*onboarding\.env/m.test(applyScript),
+    false,
+    "apply-onboarding.sh must never source onboarding.env",
+  );
 
   const bash = findBashBinary();
   if (bash) {
     execFileSync(bash, ["-n", scriptPath], { stdio: "pipe" });
+    execFileSync(bash, ["-n", applyScriptPath], { stdio: "pipe" });
   }
 
   assert.match(script, /sync_hermes_pack/);
   assert.match(script, /vps-os-hermes-cto\.service/);
+  assert.match(script, /generate_setup_claim/);
+  assert.match(script, /configure_onboarding_sync_service/);
+  assert.match(script, /print_onboarding_summary/);
 });
 
 test("bootstrap core files include Dockerfile, private agent routing, and non-empty Caddy apps.d", () => {

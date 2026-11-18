@@ -18,6 +18,11 @@ import {
   type AuditEvent,
   AuditEventSchema,
 } from "./registry.js";
+import {
+  type OnboardingState,
+  OnboardingStateSchema,
+  createDefaultOnboardingState,
+} from "./onboarding.js";
 import { redactSecrets, validateAppSlug, validateDomain } from "./safety.js";
 
 interface AppRow {
@@ -116,6 +121,12 @@ export class SystemRegistryStore {
         decision_note TEXT,
         created_at TEXT NOT NULL,
         decided_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS system_settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       );
     `);
   }
@@ -333,6 +344,107 @@ export class SystemRegistryStore {
       riskLevel: row.risk_level,
       createdAt: row.created_at,
     }));
+  }
+
+  /** Reads the persisted onboarding wizard state (returns defaults if uninitialized). */
+  getOnboardingState(): OnboardingState {
+    const stmt = this.db.prepare(
+      "SELECT value_json FROM system_settings WHERE key = 'onboarding_state'",
+    );
+    const row = stmt.get() as { value_json: string } | undefined;
+    if (!row) {
+      return createDefaultOnboardingState();
+    }
+    try {
+      return OnboardingStateSchema.parse(JSON.parse(row.value_json));
+    } catch {
+      return createDefaultOnboardingState();
+    }
+  }
+
+  /** Merges and persists sanitized onboarding state into SQLite (never stores plaintext secrets). */
+  saveOnboardingState(patch: Partial<OnboardingState>): OnboardingState {
+    const current = this.getOnboardingState();
+    const next = OnboardingStateSchema.parse({
+      ...current,
+      ...patch,
+      persona: {
+        ...current.persona,
+        ...(patch.persona ?? {}),
+      },
+      updatedAt: new Date().toISOString(),
+    });
+    const stmt = this.db.prepare(`
+      INSERT INTO system_settings (key, value_json, updated_at)
+      VALUES ('onboarding_state', ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        value_json = excluded.value_json,
+        updated_at = excluded.updated_at
+    `);
+    stmt.run(JSON.stringify(next), next.updatedAt);
+    return next;
+  }
+
+  /** Reads the salted scrypt admin passphrase hash, or null if none is configured. */
+  getPassphraseHash(): string | null {
+    const stmt = this.db.prepare(
+      "SELECT value_json FROM system_settings WHERE key = 'admin_passphrase_hash'",
+    );
+    const row = stmt.get() as { value_json: string } | undefined;
+    if (!row) return null;
+    try {
+      const parsed = JSON.parse(row.value_json) as unknown;
+      return typeof parsed === "string" && parsed.startsWith("scrypt:")
+        ? parsed
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Stores a salted scrypt admin passphrase hash. */
+  setPassphraseHash(hash: string): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(`
+      INSERT INTO system_settings (key, value_json, updated_at)
+      VALUES ('admin_passphrase_hash', ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        value_json = excluded.value_json,
+        updated_at = excluded.updated_at
+    `);
+    stmt.run(JSON.stringify(hash), now);
+  }
+
+  /** Reads the monotonic session epoch used to invalidate issued session tokens. */
+  getSessionEpoch(): number {
+    const stmt = this.db.prepare(
+      "SELECT value_json FROM system_settings WHERE key = 'session_epoch'",
+    );
+    const row = stmt.get() as { value_json: string } | undefined;
+    if (!row) return 1;
+    try {
+      const parsed = JSON.parse(row.value_json) as unknown;
+      return typeof parsed === "number" && Number.isInteger(parsed) && parsed >= 1
+        ? parsed
+        : 1;
+    } catch {
+      return 1;
+    }
+  }
+
+  /** Increments and returns the session epoch, revoking previously issued session tokens. */
+  bumpSessionEpoch(): number {
+    const nextEpoch = this.getSessionEpoch() + 1;
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(`
+      INSERT INTO system_settings (key, value_json, updated_at)
+      VALUES ('session_epoch', ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        value_json = excluded.value_json,
+        updated_at = excluded.updated_at
+    `);
+    stmt.run(JSON.stringify(nextEpoch), now);
+    return nextEpoch;
   }
 
   close(): void {
