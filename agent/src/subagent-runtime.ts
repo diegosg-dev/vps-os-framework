@@ -29,6 +29,43 @@ export interface ProvisionWorkspaceResult {
   record: AppRecord;
 }
 
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function buildStarterWebHtml(appName: string, slug: string): string {
+  const safeName = escapeHtml(appName);
+  const safeSlug = escapeHtml(slug);
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${safeName} · VPS OS</title>
+    <style>
+      body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; display: grid; place-items: center; min-height: 100vh; }
+      main { max-width: 34rem; padding: 2rem; border: 1px solid #1e293b; border-radius: 1rem; background: #020617; }
+      h1 { margin: 0 0 0.5rem; font-size: 1.5rem; }
+      p { margin: 0.25rem 0; color: #94a3b8; line-height: 1.5; }
+      code { color: #38bdf8; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>${safeName}</h1>
+      <p>Isolated VPS OS workload <code>${safeSlug}</code> is up and serving traffic.</p>
+      <p>Replace files in <code>/apps/${safeSlug}/data/</code> to customize this app.</p>
+    </main>
+  </body>
+</html>
+`;
+}
+
 /**
  * Isolated Subagent Runtime (Step 6):
  * Prepares a "Locked Apartment" workspace under `<appsRoot>/<slug>` without
@@ -77,6 +114,17 @@ export function provisionIsolatedWorkspace(
 
     fs.writeFileSync(envExamplePath, envTemplate, "utf8");
     fs.writeFileSync(envPath, envTemplate, { encoding: "utf8", mode: 0o600 });
+
+    if (input.kind === "web-app") {
+      const indexHtmlPath = path.join(dataDir, "index.html");
+      if (!fs.existsSync(indexHtmlPath)) {
+        fs.writeFileSync(
+          indexHtmlPath,
+          buildStarterWebHtml(input.name.trim(), input.slug),
+          "utf8",
+        );
+      }
+    }
 
     const now = new Date().toISOString();
     const record = input.registry.upsertApp({

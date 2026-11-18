@@ -1,7 +1,12 @@
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { SystemRegistryStore, redactSecrets } from "@vps-os/shared";
+import {
+  type RuntimeBridge,
+  SystemRegistryStore,
+  createRuntimeBridgeFromEnv,
+  redactSecrets,
+} from "@vps-os/shared";
 import { z } from "zod";
 import { type AgentToolsetDeps, createAgentToolset } from "./tools.js";
 
@@ -202,6 +207,7 @@ export interface McpStdioServerOptions {
   dbPath?: string;
   appsRoot?: string;
   templatesRoot?: string;
+  runtimeBridge?: RuntimeBridge;
 }
 
 /** Starts the newline-delimited JSON-RPC MCP stdio server for Hermes Agent. */
@@ -212,6 +218,8 @@ export function startMcpStdioServer(
     path.dirname(fileURLToPath(import.meta.url)),
     "../../templates",
   );
+  const runtimeBridge = options.runtimeBridge ?? createRuntimeBridgeFromEnv();
+
   const registry = new SystemRegistryStore(
     options.dbPath ?? process.env.VPS_OS_REGISTRY_DB ?? "/data/registry.db",
   );
@@ -222,6 +230,7 @@ export function startMcpStdioServer(
       options.templatesRoot ??
       process.env.VPS_OS_TEMPLATES_ROOT ??
       defaultTemplatesRoot,
+    ...(runtimeBridge ? { runtimeBridge } : {}),
   });
 
   const rl = readline.createInterface({

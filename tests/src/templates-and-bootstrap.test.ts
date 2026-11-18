@@ -26,11 +26,25 @@ function findBashBinary(): string | null {
   return null;
 }
 
-test("bootstrap/install.sh and apply-onboarding.sh pass bash -n, use LF endings, and avoid destructive defaults", () => {
+function findPythonBinary(): string | null {
+  for (const bin of ["python3", "python"]) {
+    try {
+      execFileSync(bin, ["--version"], { stdio: "ignore" });
+      return bin;
+    } catch {
+      // Try next candidate
+    }
+  }
+  return null;
+}
+
+test("bootstrap/install.sh, apply-onboarding.sh, and runtime-bridge.py pass syntax checks and use LF endings", () => {
   const scriptPath = path.join(REPO_ROOT, "bootstrap", "install.sh");
   const applyScriptPath = path.join(REPO_ROOT, "bootstrap", "apply-onboarding.sh");
+  const bridgeScriptPath = path.join(REPO_ROOT, "bootstrap", "runtime-bridge.py");
   const script = fs.readFileSync(scriptPath, "utf8");
   const applyScript = fs.readFileSync(applyScriptPath, "utf8");
+  const bridgeScript = fs.readFileSync(bridgeScriptPath, "utf8");
 
   assert.match(script, /^#!\/usr\/bin\/env bash/);
   assert.match(script, /set -euo pipefail/);
@@ -50,16 +64,47 @@ test("bootstrap/install.sh and apply-onboarding.sh pass bash -n, use LF endings,
     "apply-onboarding.sh must never source onboarding.env",
   );
 
+  assert.match(bridgeScript, /^#!\/usr\/bin\/env python3/);
+  assert.equal(
+    bridgeScript.includes("\r\n"),
+    false,
+    "runtime-bridge.py must use LF line endings",
+  );
+  assert.equal(
+    bridgeScript.includes("shell=True"),
+    false,
+    "runtime-bridge.py must never invoke subprocesses with shell=True",
+  );
+
   const bash = findBashBinary();
   if (bash) {
     execFileSync(bash, ["-n", scriptPath], { stdio: "pipe" });
     execFileSync(bash, ["-n", applyScriptPath], { stdio: "pipe" });
   }
 
+  const pyBin = findPythonBinary();
+  if (pyBin) {
+    execFileSync(
+      pyBin,
+      [
+        "-c",
+        "import ast, sys; ast.parse(open(sys.argv[1], encoding='utf-8').read())",
+        bridgeScriptPath,
+      ],
+      { stdio: "pipe" },
+    );
+  }
+
   assert.match(script, /sync_hermes_pack/);
   assert.match(script, /vps-os-hermes-cto\.service/);
   assert.match(script, /generate_setup_claim/);
   assert.match(script, /configure_onboarding_sync_service/);
+  assert.match(script, /configure_runtime_bridge_service/);
+  assert.match(script, /vps-os-runtime\.service/);
+  assert.match(script, /VPS_OS_RUNTIME_TOKEN/);
+  assert.match(script, /runtime-bridge\.env/);
+  assert.match(script, /ProtectSystem=strict/);
+  assert.match(script, /! grep -q "ProtectHome=true"/);
   assert.match(script, /print_onboarding_summary/);
 });
 
@@ -84,6 +129,20 @@ test("bootstrap core files include Dockerfile, private agent routing, and non-em
     false,
     "Caddyfile must not expose internal /agent/* endpoints publicly",
   );
+
+  const coreCompose = fs.readFileSync(
+    path.join(REPO_ROOT, "bootstrap", "docker-compose.core.yml"),
+    "utf8",
+  );
+  assert.match(coreCompose, /VPS_OS_RUNTIME_SOCKET=\/run\/vps-os\/runtime\.sock/);
+  assert.match(coreCompose, /VPS_OS_RUNTIME_TOKEN=\$\{VPS_OS_RUNTIME_TOKEN:\?/);
+  assert.match(coreCompose, /VPS_OS_AGENT_URL=http:\/\/agent:3002/);
+
+  const personalAgentCompose = fs.readFileSync(
+    path.join(REPO_ROOT, "templates", "personal-agent", "docker-compose.yml"),
+    "utf8",
+  );
+  assert.match(personalAgentCompose, /\binit:\s*true\b/);
 });
 
 test("docker-compose templates enforce Locked Apartment isolation", () => {

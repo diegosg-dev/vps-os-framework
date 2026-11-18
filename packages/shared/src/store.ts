@@ -120,7 +120,10 @@ export class SystemRegistryStore {
         decided_by TEXT,
         decision_note TEXT,
         created_at TEXT NOT NULL,
-        decided_at TEXT
+        decided_at TEXT,
+        execution_owner TEXT,
+        execution_started_at TEXT,
+        execution_expires_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS system_settings (
@@ -129,6 +132,38 @@ export class SystemRegistryStore {
         updated_at TEXT NOT NULL
       );
     `);
+
+    const appCols = this.db
+      .prepare("PRAGMA table_info(apps)")
+      .all() as Array<{ name: string }>;
+    const appColNames = new Set(appCols.map((col) => col.name));
+    if (!appColNames.has("cleanup_pending")) {
+      this.db.exec(
+        "ALTER TABLE apps ADD COLUMN cleanup_pending INTEGER NOT NULL DEFAULT 0;",
+      );
+    }
+
+    try {
+      this.db.exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_apps_unique_domain ON apps (lower(domain)) WHERE domain IS NOT NULL;",
+      );
+    } catch {
+      // Ignore if legacy rows contain duplicate domains prior to manual cleanup
+    }
+
+    const planCols = this.db
+      .prepare("PRAGMA table_info(execution_plans)")
+      .all() as Array<{ name: string }>;
+    const colNames = new Set(planCols.map((col) => col.name));
+    if (!colNames.has("execution_owner")) {
+      this.db.exec("ALTER TABLE execution_plans ADD COLUMN execution_owner TEXT;");
+    }
+    if (!colNames.has("execution_started_at")) {
+      this.db.exec("ALTER TABLE execution_plans ADD COLUMN execution_started_at TEXT;");
+    }
+    if (!colNames.has("execution_expires_at")) {
+      this.db.exec("ALTER TABLE execution_plans ADD COLUMN execution_expires_at TEXT;");
+    }
   }
 
   /** Inserts or updates an app metadata record in the registry. */
@@ -136,6 +171,17 @@ export class SystemRegistryStore {
     const validated = AppRecordSchema.parse(record);
     const safeSlug = validateAppSlug(validated.slug);
     const safeDomain = validated.domain ? validateDomain(validated.domain) : null;
+
+    if (safeDomain) {
+      const conflict = this.db
+        .prepare("SELECT slug FROM apps WHERE lower(domain) = lower(?) AND slug != ?")
+        .get(safeDomain, safeSlug) as { slug: string } | undefined;
+      if (conflict) {
+        throw new Error(
+          `Domain "${safeDomain}" is already assigned to app "${conflict.slug}".`,
+        );
+      }
+    }
 
     const stmt = this.db.prepare(`
       INSERT INTO apps (
@@ -193,6 +239,33 @@ export class SystemRegistryStore {
       "UPDATE apps SET status = ?, updated_at = ? WHERE slug = ?",
     );
     const result = stmt.run(validStatus, ts, slug);
+    return result.changes > 0;
+  }
+
+  /** Marks or clears the cleanup-pending flag on a failed-deploy app record. */
+  setAppCleanupPending(slug: string, pending: boolean): boolean {
+    const safeSlug = validateAppSlug(slug);
+    const stmt = this.db.prepare(
+      "UPDATE apps SET cleanup_pending = ? WHERE slug = ?",
+    );
+    const result = stmt.run(pending ? 1 : 0, safeSlug);
+    return result.changes > 0;
+  }
+
+  /** Lists slugs whose cleanup failed after an aborted deployment. */
+  listCleanupPendingSlugs(): string[] {
+    const stmt = this.db.prepare(
+      "SELECT slug FROM apps WHERE cleanup_pending = 1",
+    );
+    const rows = stmt.all() as Array<{ slug: string }>;
+    return rows.map((row) => row.slug);
+  }
+
+  /** Removes an app metadata record by slug (used for clean teardown or failed-deploy rollback). */
+  deleteApp(slug: string): boolean {
+    const safeSlug = validateAppSlug(slug);
+    const stmt = this.db.prepare("DELETE FROM apps WHERE slug = ?");
+    const result = stmt.run(safeSlug);
     return result.changes > 0;
   }
 
@@ -297,11 +370,70 @@ export class SystemRegistryStore {
     };
   }
 
+  /**
+   * Atomically claims an approved execution plan across processes using a
+   * time-bounded lease so concurrent callers (Dashboard, Agent, MCP) cannot
+   * double-execute the same plan.
+   */
+  claimPlanExecution(
+    planId: string,
+    ownerId: string,
+    leaseMs = 300_000,
+  ): boolean {
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const expiresIso = new Date(nowMs + Math.max(1000, leaseMs)).toISOString();
+    const stmt = this.db.prepare(`
+      UPDATE execution_plans
+      SET execution_owner = ?, execution_started_at = ?, execution_expires_at = ?
+      WHERE id = ? AND status = 'approved'
+        AND (execution_owner IS NULL OR execution_expires_at IS NULL OR execution_expires_at < ?)
+    `);
+    const result = stmt.run(ownerId, nowIso, expiresIso, planId, nowIso);
+    return result.changes > 0;
+  }
+
+  /** Checks whether an approved plan currently holds a valid active lease for `ownerId`. */
+  isPlanLeaseHeldBy(planId: string, ownerId: string): boolean {
+    const nowIso = new Date().toISOString();
+    const stmt = this.db.prepare(`
+      SELECT 1 FROM execution_plans
+      WHERE id = ? AND status = 'approved'
+        AND execution_owner = ? AND execution_expires_at >= ?
+    `);
+    const row = stmt.get(planId, ownerId, nowIso);
+    return row !== undefined;
+  }
+
+  /** Releases an in-flight execution lease after a failed or aborted run. */
+  releasePlanExecution(planId: string, ownerId: string): boolean {
+    const stmt = this.db.prepare(`
+      UPDATE execution_plans
+      SET execution_owner = NULL, execution_started_at = NULL, execution_expires_at = NULL
+      WHERE id = ? AND execution_owner = ? AND status = 'approved'
+    `);
+    const result = stmt.run(planId, ownerId);
+    return result.changes > 0;
+  }
+
   /** Marks an approved plan as executed so it cannot be replayed. */
-  markPlanExecuted(planId: string): boolean {
-    const stmt = this.db.prepare(
-      "UPDATE execution_plans SET status = 'executed' WHERE id = ? AND status = 'approved'",
-    );
+  markPlanExecuted(planId: string, ownerId?: string): boolean {
+    if (ownerId) {
+      const nowIso = new Date().toISOString();
+      const stmt = this.db.prepare(`
+        UPDATE execution_plans
+        SET status = 'executed', execution_owner = NULL, execution_started_at = NULL, execution_expires_at = NULL
+        WHERE id = ? AND status = 'approved'
+          AND execution_owner = ? AND (execution_expires_at IS NULL OR execution_expires_at >= ?)
+      `);
+      const result = stmt.run(planId, ownerId, nowIso);
+      return result.changes > 0;
+    }
+    const stmt = this.db.prepare(`
+      UPDATE execution_plans
+      SET status = 'executed', execution_owner = NULL, execution_started_at = NULL, execution_expires_at = NULL
+      WHERE id = ? AND status = 'approved'
+    `);
     const result = stmt.run(planId);
     return result.changes > 0;
   }
