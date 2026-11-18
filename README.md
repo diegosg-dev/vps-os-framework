@@ -37,6 +37,7 @@ Instead of managing Ubuntu over SSH, editing Nginx configs, or debugging Docker 
 ## Documentation Index
 
 - **[Architecture Overview & Detailed Model Breakdown](docs/architecture.md)** — Visual diagrams (FigJam exports + editable Mermaid), plus a 5-part breakdown (*Role, Inputs, Internal Mechanics, Outputs, Safety/Stack*) for every numbered step (`0`–`11` + `V`).
+- **[Hermes CTO Agent — Architecture, Onboarding & Phase 2 Roadmap](docs/hermes-cto-onboarding.md)** — Phase 1 Hermes CTO pack (`SOUL.md`, `memories/`, `skills/vps-os-*`), `vps-os-mcp` JSON-RPC bridge, `bootstrap/install.sh` integration, Mermaid diagrams, and the planned Phase 2 browser setup wizard.
 - **[Lifecycle Flows & Real-World Use Cases](docs/flows-and-use-cases.md)** — Plain-language walkthroughs for first-time provisioning, conversational app deployment, live monitoring, and running a **Personal Life Agent container (with full terminal power inside its folder)** alongside **separate isolated app containers**.
 - **[Repository Structure & Safety Boundaries](docs/boundaries-and-structure.md)** — Directory map, greenfield stack policy, secret/host isolation rules, and verification gates.
 - **[AGENTS.md](AGENTS.md) / [CLAUDE.md](CLAUDE.md)** — Project guardrails and engineering rules for AI coding agents.

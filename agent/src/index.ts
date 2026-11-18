@@ -4,6 +4,8 @@ import { pathToFileURL } from "node:url";
 import { SystemRegistryStore, redactSecrets } from "@vps-os/shared";
 import { createExecutionPlan } from "./planner.js";
 
+export * from "./hermes-pack.js";
+export * from "./mcp-server.js";
 export * from "./planner.js";
 export * from "./subagent-runtime.js";
 export * from "./tools.js";

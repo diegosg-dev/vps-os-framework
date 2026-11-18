@@ -15,6 +15,7 @@ RUN pnpm install --frozen-lockfile
 
 COPY packages/shared/src packages/shared/src
 COPY agent/src agent/src
+COPY agent/hermes agent/hermes
 COPY dashboard/api/src dashboard/api/src
 COPY dashboard/web/src dashboard/web/src
 COPY templates templates

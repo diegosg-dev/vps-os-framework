@@ -148,16 +148,16 @@ Every numbered badge (`1`–`11`) in the diagram above—along with Step `0` (Bo
 - **4D. Outputs & Downstream Effects:** Reads System & App Registry (`8`), queries Ubuntu host & Docker stats (`10`), and triggers tasks on the Autonomous AI Agent (`5`).
 - **4E. Safety & Stack Status:** Exposes typed endpoints rather than arbitrary shell execution. Backend language/framework remains open for confirmation.
 
-#### `5` — Autonomous AI Agent (`agent/`)
+#### `5` — Autonomous AI Agent (`agent/` + Hermes CTO Gateway)
 
-- **5A. Role & Purpose:** The CTO, Sysadmin, and Developer brain of VPS OS. Turns natural-language user goals into planned, verified server and app deployments.
-- **5B. Inputs & Triggers:** Conversational prompts from Natural-Language CTO Chat (`2`) and automated task triggers from Dashboard Control API (`4`).
+- **5A. Role & Purpose:** The CTO, Sysadmin, and Developer brain of VPS OS. Turns natural-language user goals into planned, verified server and app deployments. Uses **NousResearch Hermes Agent** (`vps-os-hermes-cto.service` on the Ubuntu host) backed by the typed **VPS OS MCP Server** (`agent/src/mcp-server.ts`) inside the `vps-os-agent` container.
+- **5B. Inputs & Triggers:** Conversational prompts from Natural-Language CTO Chat (`2`), Hermes gateway API (`/v1/responses`, `/v1/runs`), scheduled `cronjob` routines, and automated task triggers from Dashboard Control API (`4`).
 - **5C. Internal Parts & Mechanics:**
-  - Context & Intent Planner (breaks goals into atomic steps)
-  - Tool Execution Engine (Docker, Compose, filesystem, proxy routes)
-  - Policy Gate & Rollback Verifier (health checks before finalizing)
-- **5D. Outputs & Downstream Effects:** Calls LLM Provider API (`11`) for reasoning, spawns Isolated Subagent Runtimes (`6`), deploys App Containers (`7`), and updates System & App Registry (`8`).
-- **5E. Safety & Stack Status:** Never runs destructive host commands outside sandboxed targets. Never prints or commits real secrets.
+  - Identity & Bounded Memory (`agent/hermes/SOUL.md`, `MEMORY.md`, `USER.md`, SQLite `FTS5`)
+  - Progressive-Disclosure CTO Skills (`agent/hermes/skills/vps-os-*/SKILL.md` + self-learned skills)
+  - Typed MCP Tool Execution & Approval Gate (`inspect_apps`, `list_audit_events`, `propose_plan`, `get_plan_status`, `prepare_app_workspace`, `update_app_status`)
+- **5D. Outputs & Downstream Effects:** Calls LLM Provider API (`11`) for reasoning, spawns Isolated Subagent Runtimes (`6`), deploys App Containers (`7`), updates Caddy routes (`3`), and updates System & App Registry (`8`).
+- **5E. Safety & Stack Status:** Never runs destructive host commands outside approved plans. Never prints or commits real secrets. Browser First-Boot Setup Wizard & `/v1/runs` UI proxy are planned for **Phase 2** (see [Hermes CTO Architecture & Onboarding](hermes-cto-onboarding.md)).
 
 #### `6` — Isolated Subagent Runtime (`agent/` + `apps/`)
 

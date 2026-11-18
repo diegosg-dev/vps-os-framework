@@ -38,6 +38,9 @@ test("bootstrap/install.sh passes bash -n and avoids destructive defaults", () =
   if (bash) {
     execFileSync(bash, ["-n", scriptPath], { stdio: "pipe" });
   }
+
+  assert.match(script, /sync_hermes_pack/);
+  assert.match(script, /vps-os-hermes-cto\.service/);
 });
 
 test("bootstrap core files include Dockerfile, private agent routing, and non-empty Caddy apps.d", () => {

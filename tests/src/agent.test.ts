@@ -6,10 +6,16 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  DEFAULT_HERMES_PACK_DIR,
+  HERMES_MEMORY_MAX_CHARS,
+  HERMES_USER_MAX_CHARS,
   createAgentHttpServer,
   createAgentToolset,
   createExecutionPlan,
+  createMcpRequestHandler,
+  provisionHermesHome,
   provisionIsolatedWorkspace,
+  validateHermesPack,
 } from "@vps-os/agent";
 import { SystemRegistryStore } from "@vps-os/shared";
 
@@ -213,5 +219,204 @@ test("Agent HTTP server enforces auth, secret redaction, and body size cap", asy
     assert.equal(bigRes.status, 413);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("Hermes CTO pack validates limits, frontmatter, and idempotent provisioning", () => {
+  const result = validateHermesPack(DEFAULT_HERMES_PACK_DIR);
+  assert.equal(result.valid, true);
+  assert.equal(result.memoryChars <= HERMES_MEMORY_MAX_CHARS, true);
+  assert.equal(result.userChars <= HERMES_USER_MAX_CHARS, true);
+  assert.deepEqual(result.skillNames, [
+    "vps-os-backup-cron",
+    "vps-os-deploy-app",
+    "vps-os-diagnose-and-recover",
+    "vps-os-domain-tls",
+    "vps-os-secrets-hygiene",
+  ]);
+
+  const hermesHome = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-hermes-"));
+  try {
+    const first = provisionHermesHome({
+      hermesHome,
+      mcpCommand: "node",
+      mcpEntry: "/srv/vps-os/agent/dist/mcp-server.js",
+    });
+    assert.equal(first.syncedSkills.length, 5);
+    assert.equal(fs.existsSync(path.join(hermesHome, "SOUL.md")), true);
+    const renderedConfig = fs.readFileSync(
+      path.join(hermesHome, "config.yaml"),
+      "utf8",
+    );
+    assert.match(renderedConfig, /command: "node"/);
+    assert.equal(renderedConfig.includes("__VPS_OS_MCP_"), false);
+
+    // Simulate server-owned runtime state that must survive upgrades
+    const customMemPath = path.join(hermesHome, "memories", "MEMORY.md");
+    fs.writeFileSync(customMemPath, "Custom learned server facts", "utf8");
+    const learnedSkillDir = path.join(hermesHome, "skills", "learned-postgres");
+    fs.mkdirSync(learnedSkillDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(learnedSkillDir, "SKILL.md"),
+      "---\nname: learned-postgres\ndescription: Custom learned skill\n---\n",
+      "utf8",
+    );
+
+    const second = provisionHermesHome({ hermesHome });
+    assert.equal(second.preservedFiles.includes(customMemPath), true);
+    assert.equal(fs.readFileSync(customMemPath, "utf8"), "Custom learned server facts");
+    assert.equal(fs.existsSync(path.join(learnedSkillDir, "SKILL.md")), true);
+  } finally {
+    fs.rmSync(hermesHome, { recursive: true, force: true });
+  }
+});
+
+test("MCP JSON-RPC handler exposes CTO tools, enforces approval gate, and updates app status", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-mcp-"));
+  const registry = new SystemRegistryStore(":memory:");
+
+  try {
+    const handle = createMcpRequestHandler({
+      registry,
+      appsRoot: tempRoot,
+      templatesRoot: TEMPLATES_ROOT,
+    });
+
+    const initRes = await handle({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+    });
+    assert.equal(
+      (initRes?.result as { serverInfo: { name: string } }).serverInfo.name,
+      "vps-os-mcp",
+    );
+
+    // Notifications must produce no response
+    const notifRes = await handle({
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+    });
+    assert.equal(notifRes, null);
+
+    const listRes = await handle({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    const tools = (listRes?.result as { tools: Array<{ name: string }> }).tools;
+    const names = tools.map((t) => t.name);
+    assert.ok(names.includes("inspect_apps"));
+    assert.ok(names.includes("propose_plan"));
+    assert.ok(names.includes("get_plan_status"));
+    assert.ok(names.includes("prepare_app_workspace"));
+    assert.ok(names.includes("update_app_status"));
+    assert.ok(names.includes("list_audit_events"));
+
+    const proposeRes = await handle({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "propose_plan",
+        arguments: { goal: "Deploy analytics app with password=supersecret" },
+      },
+    });
+    const proposePayload = JSON.parse(
+      (proposeRes?.result as { content: Array<{ text: string }> }).content[0]!.text,
+    ) as { id: string; goal: string; status: string };
+    assert.equal(proposePayload.status, "pending");
+    assert.equal(proposePayload.goal.includes("supersecret"), false);
+
+    // Blocked while pending
+    const blockedRes = await handle({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "prepare_app_workspace",
+        arguments: {
+          planId: proposePayload.id,
+          slug: "analytics",
+          name: "Analytics",
+          kind: "web-app",
+          domain: "analytics.example.com",
+        },
+      },
+    });
+    assert.equal((blockedRes?.result as { isError: boolean }).isError, true);
+
+    // Approve and execute via MCP
+    registry.recordApproval({
+      planId: proposePayload.id,
+      approved: true,
+      decidedBy: "owner",
+    });
+
+    const planStatusRes = await handle({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: {
+        name: "get_plan_status",
+        arguments: { planId: proposePayload.id },
+      },
+    });
+    const statusPayload = JSON.parse(
+      (planStatusRes?.result as { content: Array<{ text: string }> }).content[0]!.text,
+    ) as { found: boolean; plan: { status: string } };
+    assert.equal(statusPayload.found, true);
+    assert.equal(statusPayload.plan.status, "approved");
+
+    const prepRes = await handle({
+      jsonrpc: "2.0",
+      id: 6,
+      method: "tools/call",
+      params: {
+        name: "prepare_app_workspace",
+        arguments: {
+          planId: proposePayload.id,
+          slug: "analytics",
+          name: "Analytics",
+          kind: "web-app",
+          domain: "analytics.example.com",
+        },
+      },
+    });
+    assert.equal((prepRes?.result as { isError: boolean }).isError, false);
+
+    const updateStatusRes = await handle({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
+      params: {
+        name: "update_app_status",
+        arguments: {
+          slug: "analytics",
+          status: "running",
+          summary: "Container healthy with API_KEY=sk-1234567890abcdef",
+        },
+      },
+    });
+    const updatedPayload = JSON.parse(
+      (updateStatusRes?.result as { content: Array<{ text: string }> }).content[0]!.text,
+    ) as { app: { status: string } };
+    assert.equal(updatedPayload.app.status, "running");
+
+    const auditRes = await handle({
+      jsonrpc: "2.0",
+      id: 8,
+      method: "tools/call",
+      params: {
+        name: "list_audit_events",
+        arguments: { limit: 5 },
+      },
+    });
+    const auditText = (auditRes?.result as { content: Array<{ text: string }> })
+      .content[0]!.text;
+    assert.equal(auditText.includes("sk-1234567890abcdef"), false);
+  } finally {
+    registry.close();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 });
