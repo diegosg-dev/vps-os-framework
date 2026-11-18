@@ -9,6 +9,7 @@ export const PlanStepSchema = z.object({
   toolName: z.string().min(1).max(80),
   riskLevel: RiskLevelSchema,
   requiresApproval: z.boolean(),
+  args: z.record(z.string(), z.unknown()).optional(),
 });
 export type PlanStep = z.infer<typeof PlanStepSchema>;
 

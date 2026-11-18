@@ -2,12 +2,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { serve } from "@hono/node-server";
-import { SystemRegistryStore } from "@vps-os/shared";
+import {
+  SystemRegistryStore,
+  createRuntimeBridgeFromEnv,
+} from "@vps-os/shared";
 import { createDashboardApp } from "./app.js";
+import {
+  createAgentPlanExecutor,
+  createRuntimeWorkloadController,
+} from "./runtime.js";
 
 export * from "./app.js";
 export * from "./metrics.js";
 export * from "./onboarding.js";
+export * from "./runtime.js";
 export * from "./static.js";
 
 const MIN_ADMIN_TOKEN_LENGTH = 16;
@@ -68,6 +76,34 @@ if (entryArg && import.meta.url === pathToFileURL(entryArg).href) {
   const hermesGatewayUrl = process.env.HERMES_GATEWAY_URL?.trim();
   const hermesApiServerKey = process.env.HERMES_API_SERVER_KEY?.trim();
 
+  const runtimeBridge = createRuntimeBridgeFromEnv();
+  const workloadController = runtimeBridge
+    ? createRuntimeWorkloadController(runtimeBridge)
+    : undefined;
+
+  const agentUrl = process.env.VPS_OS_AGENT_URL?.trim();
+  const appsRoot = process.env.VPS_OS_APPS_ROOT?.trim();
+  const defaultTemplatesRoot = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../../templates",
+  );
+  const templatesRoot =
+    process.env.VPS_OS_TEMPLATES_ROOT?.trim() || defaultTemplatesRoot;
+  const executePlan = createAgentPlanExecutor({
+    agentUrl,
+    adminToken,
+    ...(appsRoot
+      ? {
+          localDeps: {
+            registry,
+            appsRoot,
+            templatesRoot,
+            runtimeBridge,
+          },
+        }
+      : {}),
+  });
+
   const app = createDashboardApp({
     registry,
     adminToken,
@@ -80,6 +116,8 @@ if (entryArg && import.meta.url === pathToFileURL(entryArg).href) {
     ...(setupClaimPath ? { setupClaimPath } : {}),
     ...(hermesGatewayUrl ? { hermesGatewayUrl } : {}),
     ...(hermesApiServerKey ? { hermesApiServerKey } : {}),
+    ...(workloadController ? { workloadController } : {}),
+    ...(executePlan ? { executePlan } : {}),
   });
 
   const server = serve({ fetch: app.fetch, port, hostname }, (info) => {

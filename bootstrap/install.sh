@@ -172,6 +172,15 @@ ensure_docker() {
   systemctl enable --now docker
 }
 
+ensure_python3() {
+  if command -v python3 >/dev/null 2>&1; then
+    return
+  fi
+  log "Installing Python 3 for the VPS OS Host Runtime Bridge..."
+  apt-get update -y
+  apt-get install -y python3
+}
+
 detect_ssh_port() {
   local port=""
   if [[ -f /etc/ssh/sshd_config ]]; then
@@ -249,8 +258,12 @@ upsert_env_key() {
   local val="$3"
   local tmp_file
   tmp_file="$(mktemp)"
-  awk -v target_key="${key}" -v target_val="${val}" '
-    BEGIN { updated = 0 }
+  TARGET_KEY="${key}" TARGET_VAL="${val}" awk '
+    BEGIN {
+      target_key = ENVIRON["TARGET_KEY"]
+      target_val = ENVIRON["TARGET_VAL"]
+      updated = 0
+    }
     index($0, target_key "=") == 1 {
       print target_key "=" target_val
       updated = 1
@@ -361,24 +374,35 @@ check_domain_dns() {
 
 prepare_directories() {
   log "Preparing ${VPS_OS_ROOT}, ${APPS_ROOT}, and ${HERMES_HOME}..."
-  mkdir -p "${VPS_OS_ROOT}/data" "${VPS_OS_ROOT}/config" "${VPS_OS_ROOT}/caddy/apps.d" \
-    "${APPS_ROOT}" "${HERMES_HOME}/memories" "${HERMES_HOME}/skills"
-  chmod 750 "${VPS_OS_ROOT}" "${VPS_OS_ROOT}/config" "${APPS_ROOT}" "${HERMES_HOME}"
+  mkdir -p "${VPS_OS_ROOT}/data" "${VPS_OS_ROOT}/config" "${VPS_OS_ROOT}/run" \
+    "${VPS_OS_ROOT}/caddy/apps.d" "${APPS_ROOT}" "${HERMES_HOME}/memories" "${HERMES_HOME}/skills"
+  chmod 750 "${VPS_OS_ROOT}" "${VPS_OS_ROOT}/config" "${VPS_OS_ROOT}/run" "${APPS_ROOT}" "${HERMES_HOME}"
+  chown 0:1000 "${VPS_OS_ROOT}/run"
   chown 1000:1000 "${VPS_OS_ROOT}/data" "${VPS_OS_ROOT}/config" "${APPS_ROOT}"
 
   local fresh_env="false"
   if [[ ! -f "${VPS_OS_ROOT}/.env" ]]; then
-    local generated_token generated_hermes_key
+    local generated_token generated_runtime_token generated_hermes_key
     generated_token="$(openssl rand -hex 32)"
+    generated_runtime_token="$(openssl rand -hex 32)"
     generated_hermes_key="$(openssl rand -hex 32)"
     sed \
       -e "s|^VPS_OS_ADMIN_TOKEN=.*$|VPS_OS_ADMIN_TOKEN=${generated_token}|" \
+      -e "s|^VPS_OS_RUNTIME_TOKEN=.*$|VPS_OS_RUNTIME_TOKEN=${generated_runtime_token}|" \
       -e "s|^HERMES_API_SERVER_KEY=.*$|HERMES_API_SERVER_KEY=${generated_hermes_key}|" \
       -e "s|^HERMES_HOME=.*$|HERMES_HOME=${HERMES_HOME}|" \
       "${SCRIPT_DIR}/.env.example" > "${VPS_OS_ROOT}/.env"
     chmod 600 "${VPS_OS_ROOT}/.env"
     fresh_env="true"
-    log "Created ${VPS_OS_ROOT}/.env with generated VPS_OS_ADMIN_TOKEN and HERMES_API_SERVER_KEY."
+    log "Created ${VPS_OS_ROOT}/.env with generated admin, runtime, and Hermes keys."
+  else
+    # Ensure existing installs upgrading to the runtime bridge receive VPS_OS_RUNTIME_TOKEN.
+    # shellcheck source=/dev/null
+    source "${VPS_OS_ROOT}/.env"
+    if [[ -z "${VPS_OS_RUNTIME_TOKEN:-}" ]] || [[ "${VPS_OS_RUNTIME_TOKEN}" == replace-with-* ]]; then
+      upsert_env_key "${VPS_OS_ROOT}/.env" "VPS_OS_RUNTIME_TOKEN" "$(openssl rand -hex 32)"
+      log "Generated missing VPS_OS_RUNTIME_TOKEN in ${VPS_OS_ROOT}/.env."
+    fi
   fi
 
   if [[ ! -f "${VPS_OS_ROOT}/config/onboarding.env" ]]; then
@@ -430,7 +454,13 @@ prepare_directories() {
   fi
 
   copy_if_needed "${SCRIPT_DIR}/Caddyfile" "${VPS_OS_ROOT}/Caddyfile"
-  copy_if_needed "${SCRIPT_DIR}/docker-compose.core.yml" "${VPS_OS_ROOT}/docker-compose.yml"
+  if [[ -f "${VPS_OS_ROOT}/docker-compose.yml" ]] && [[ "${FORCE_OVERWRITE}" != "--force" ]] && ! grep -q "VPS_OS_RUNTIME_SOCKET" "${VPS_OS_ROOT}/docker-compose.yml"; then
+    cp "${VPS_OS_ROOT}/docker-compose.yml" "${VPS_OS_ROOT}/docker-compose.yml.bak"
+    cp "${SCRIPT_DIR}/docker-compose.core.yml" "${VPS_OS_ROOT}/docker-compose.yml"
+    log "Upgraded ${VPS_OS_ROOT}/docker-compose.yml for runtime bridge wiring (backup at docker-compose.yml.bak)."
+  else
+    copy_if_needed "${SCRIPT_DIR}/docker-compose.core.yml" "${VPS_OS_ROOT}/docker-compose.yml"
+  fi
   copy_if_needed "${SCRIPT_DIR}/caddy/apps.d/00-default.caddy" "${VPS_OS_ROOT}/caddy/apps.d/00-default.caddy"
 }
 
@@ -615,6 +645,68 @@ EOF
   systemctl enable --now vps-os-onboarding-apply.path
 }
 
+configure_runtime_bridge_service() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return
+  fi
+  local bridge_script="${REPO_ROOT}/bootstrap/runtime-bridge.py"
+  if [[ ! -f "${bridge_script}" ]]; then
+    echo "Error: missing runtime bridge script at ${bridge_script}." >&2
+    exit 1
+  fi
+  chmod 750 "${bridge_script}"
+
+  # Expose ONLY VPS_OS_RUNTIME_TOKEN to the root runtime daemon (never admin/LLM keys),
+  # stored under root-owned ${VPS_OS_ROOT} (not container-writable config/).
+  # shellcheck source=/dev/null
+  source "${VPS_OS_ROOT}/.env"
+  local bridge_env="${VPS_OS_ROOT}/runtime-bridge.env"
+  local tmp_env
+  tmp_env="$(mktemp)"
+  printf 'VPS_OS_RUNTIME_TOKEN=%s\n' "${VPS_OS_RUNTIME_TOKEN}" > "${tmp_env}"
+  chown 0:0 "${tmp_env}"
+  chmod 600 "${tmp_env}"
+  mv "${tmp_env}" "${bridge_env}"
+
+  local svc_file="/etc/systemd/system/vps-os-runtime.service"
+  if [[ ! -f "${svc_file}" ]] || [[ "${FORCE_OVERWRITE}" == "--force" ]] || ! grep -q "ProtectHome=true" "${svc_file}"; then
+    log "Configuring ${svc_file}..."
+    cat > "${svc_file}" <<EOF
+[Unit]
+Description=VPS OS Host Runtime Bridge (Docker Compose & Caddy)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=${bridge_env}
+Environment="VPS_OS_RUNTIME_SOCKET=${VPS_OS_ROOT}/run/runtime.sock"
+Environment="VPS_OS_APPS_ROOT=${APPS_ROOT}"
+Environment="VPS_OS_CADDY_APPS_DIR=${VPS_OS_ROOT}/caddy/apps.d"
+Environment="VPS_OS_CADDY_CONTAINER=vps-os-caddy"
+ExecStart=/usr/bin/env python3 ${bridge_script}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=${VPS_OS_ROOT} ${APPS_ROOT} /run
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "${svc_file}"
+    systemctl daemon-reload
+  fi
+
+  systemctl enable vps-os-runtime.service
+  systemctl restart vps-os-runtime.service
+  log "Host runtime bridge listening at ${VPS_OS_ROOT}/run/runtime.sock."
+}
+
 validate_runtime_env() {
   # shellcheck source=/dev/null
   source "${VPS_OS_ROOT}/.env"
@@ -624,6 +716,10 @@ validate_runtime_env() {
   fi
   if [[ -z "${VPS_OS_ADMIN_TOKEN:-}" ]] || [[ "${VPS_OS_ADMIN_TOKEN}" == replace-with-* ]]; then
     echo "Error: VPS_OS_ADMIN_TOKEN in ${VPS_OS_ROOT}/.env must be a generated secret." >&2
+    exit 1
+  fi
+  if [[ -z "${VPS_OS_RUNTIME_TOKEN:-}" ]] || [[ "${VPS_OS_RUNTIME_TOKEN}" == replace-with-* ]]; then
+    echo "Error: VPS_OS_RUNTIME_TOKEN in ${VPS_OS_ROOT}/.env must be a generated secret." >&2
     exit 1
   fi
 }
@@ -680,11 +776,13 @@ main() {
   require_ubuntu
   ensure_repo_checkout
   ensure_docker
+  ensure_python3
   harden_ssh
   configure_firewall
   prepare_directories
   validate_runtime_env
   ensure_core_network
+  configure_runtime_bridge_service
   bring_up_core
   # Install Hermes before syncing our CTO pack so repo SOUL.md, config.yaml,
   # and vps-os-* skills take precedence over installer defaults.

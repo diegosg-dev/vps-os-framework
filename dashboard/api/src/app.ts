@@ -12,6 +12,7 @@ import {
   type SystemMetrics,
   type SystemRegistryStore,
   redactSecrets,
+  syncAppStatuses,
   validateAppSlug,
 } from "@vps-os/shared";
 import {
@@ -44,6 +45,13 @@ export interface WorkloadController {
     action: AppLifecycleAction,
   ): Promise<{ status: AppStatus }> | { status: AppStatus };
   getLogs(slug: string, tail: number): Promise<string[]> | string[];
+  syncStatuses?: (
+    slugs: string[],
+  ) => Promise<Record<string, AppStatus>> | Record<string, AppStatus>;
+}
+
+export interface PlanExecutionContext {
+  leaseOwnerId?: string;
 }
 
 export interface PlanExecutionResult {
@@ -65,6 +73,7 @@ export interface DashboardAppDeps {
   workloadController?: WorkloadController;
   executePlan?: (
     plan: StoredPlan,
+    context?: PlanExecutionContext,
   ) => Promise<PlanExecutionResult> | PlanExecutionResult;
   onboardingEnvPath?: string;
   dataDir?: string;
@@ -153,6 +162,36 @@ function resolveClientKey(c: Context, trustProxy: boolean): string {
   return realIp || "local";
 }
 
+type RuntimeErrorHttpStatus = 400 | 404 | 409 | 422 | 502 | 503 | 504;
+
+function resolveRuntimeErrorResponse(
+  err: unknown,
+  fallbackMessage: string,
+): { status: RuntimeErrorHttpStatus; message: string } {
+  const rawMessage = err instanceof Error ? err.message : fallbackMessage;
+  const message = redactSecrets(rawMessage || fallbackMessage);
+  const candidate =
+    typeof err === "object" &&
+    err !== null &&
+    "statusCode" in err &&
+    typeof (err as { statusCode: unknown }).statusCode === "number"
+      ? (err as { statusCode: number }).statusCode
+      : 502;
+
+  switch (candidate) {
+    case 400:
+    case 404:
+    case 409:
+    case 422:
+    case 502:
+    case 503:
+    case 504:
+      return { status: candidate, message };
+    default:
+      return { status: 502, message };
+  }
+}
+
 const PUBLIC_AUTH_PATHS = new Set([
   "/api/onboarding/status",
   "/api/auth/claim",
@@ -196,7 +235,6 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
 
   // Sliding-window timestamp queues keyed by client identifier.
   const requestBuckets = new Map<string, number[]>();
-  const inFlightExecutions = new Set<string>();
 
   function pruneExpiredBuckets(now: number): void {
     const cutoff = now - windowMs;
@@ -314,11 +352,15 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
     return c.json(disk ? { ...metrics, disk } : metrics);
   });
 
-  app.get("/api/apps", (c) => {
-    return c.json({ apps: deps.registry.listApps().map(toAppView) });
+  app.get("/api/apps", async (c) => {
+    const apps = await syncAppStatuses(
+      deps.registry,
+      deps.workloadController?.syncStatuses,
+    );
+    return c.json({ apps: apps.map(toAppView) });
   });
 
-  app.get("/api/apps/:slug", (c) => {
+  app.get("/api/apps/:slug", async (c) => {
     let safeSlug: string;
     try {
       safeSlug = validateAppSlug(c.req.param("slug"));
@@ -328,11 +370,15 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
         400,
       );
     }
-    const appRecord = deps.registry.getAppBySlug(safeSlug);
-    if (!appRecord) {
+    const existing = deps.registry.getAppBySlug(safeSlug);
+    if (!existing) {
       return c.json({ error: `App "${safeSlug}" not found.` }, 404);
     }
-    return c.json({ app: toAppView(appRecord) });
+    await syncAppStatuses(deps.registry, deps.workloadController?.syncStatuses, [
+      safeSlug,
+    ]);
+    const refreshed = deps.registry.getAppBySlug(safeSlug);
+    return c.json({ app: toAppView(refreshed ?? existing) });
   });
 
   app.post("/api/apps/:slug/lifecycle", async (c) => {
@@ -373,11 +419,31 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
       );
     }
 
-    const outcome = await deps.workloadController.control(
-      safeSlug,
-      parsed.data.action,
-    );
+    let outcome: { status: AppStatus };
+    try {
+      outcome = await deps.workloadController.control(
+        safeSlug,
+        parsed.data.action,
+      );
+    } catch (err) {
+      const mapped = resolveRuntimeErrorResponse(
+        err,
+        `Could not ${parsed.data.action} ${safeSlug}.`,
+      );
+      deps.registry.recordAudit({
+        id: crypto.randomUUID(),
+        actor: "user",
+        action: `app.${parsed.data.action}_failed`,
+        targetSlug: safeSlug,
+        summary: `${parsed.data.action} failed on ${safeSlug}: ${mapped.message}`,
+        riskLevel: "medium",
+        createdAt: new Date().toISOString(),
+      });
+      return c.json({ error: mapped.message }, mapped.status);
+    }
+
     const updatedAt = new Date().toISOString();
+    deps.registry.setAppCleanupPending(safeSlug, false);
     deps.registry.updateAppStatus(safeSlug, outcome.status, updatedAt);
 
     deps.registry.recordAudit({
@@ -430,9 +496,17 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
       );
     }
 
-    const rawLines = await deps.workloadController.getLogs(safeSlug, tail);
-    const lines = rawLines.slice(-tail).map((line) => redactSecrets(line));
-    return c.json({ slug: safeSlug, lines });
+    try {
+      const rawLines = await deps.workloadController.getLogs(safeSlug, tail);
+      const lines = rawLines.slice(-tail).map((line) => redactSecrets(line));
+      return c.json({ slug: safeSlug, lines });
+    } catch (err) {
+      const mapped = resolveRuntimeErrorResponse(
+        err,
+        `Could not read logs for ${safeSlug}.`,
+      );
+      return c.json({ error: mapped.message }, mapped.status);
+    }
   });
 
   app.get("/api/audit", (c) => {
@@ -614,23 +688,29 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
       return c.json({ error: "Plan execution runtime is not configured." }, 501);
     }
 
-    if (inFlightExecutions.has(existing.id)) {
+    const leaseOwnerId = `dashboard:${crypto.randomUUID()}`;
+    if (!deps.registry.claimPlanExecution(existing.id, leaseOwnerId)) {
       return c.json(
         { error: `Plan "${existing.id}" is already executing.` },
         409,
       );
     }
 
-    inFlightExecutions.add(existing.id);
     let execution: PlanExecutionResult;
     try {
-      execution = await deps.executePlan(existing);
-    } finally {
-      inFlightExecutions.delete(existing.id);
+      execution = await deps.executePlan(existing, { leaseOwnerId });
+    } catch (err) {
+      deps.registry.releasePlanExecution(existing.id, leaseOwnerId);
+      const mapped = resolveRuntimeErrorResponse(
+        err,
+        `Could not execute plan "${existing.id}".`,
+      );
+      return c.json({ error: mapped.message }, mapped.status);
     }
 
-    const transitioned = deps.registry.markPlanExecuted(existing.id);
+    const transitioned = deps.registry.markPlanExecuted(existing.id, leaseOwnerId);
     if (!transitioned) {
+      deps.registry.releasePlanExecution(existing.id, leaseOwnerId);
       return c.json(
         { error: `Plan "${existing.id}" was already executed or modified.` },
         409,

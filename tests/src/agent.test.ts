@@ -35,6 +35,47 @@ test("createExecutionPlan handles 1000-char goals and fails closed on unknown ac
 
   const wipePlan = createExecutionPlan("Wipe the disk cleanly");
   assert.equal(wipePlan.requiresUserApproval, true);
+  assert.equal(wipePlan.steps[0]?.toolName, "manual_review");
+
+  const deployPlan = createExecutionPlan("Deploy billing app at billing.example.com");
+  assert.equal(deployPlan.requiresUserApproval, true);
+  assert.equal(deployPlan.steps[1]?.toolName, "prepare_app_workspace");
+  assert.deepEqual(deployPlan.steps[1]?.args, {
+    slug: "billing",
+    name: "Billing",
+    kind: "web-app",
+    domain: "billing.example.com",
+    internalPort: 80,
+  });
+
+  const personalPlan = createExecutionPlan(
+    "Create a personal life agent in its own isolated folder with Telegram access",
+  );
+  assert.equal(personalPlan.requiresUserApproval, true);
+  assert.equal(personalPlan.steps[1]?.args?.kind, "personal-agent");
+  assert.equal(personalPlan.steps[1]?.args?.slug, "personal-life-agent");
+
+  const filenamePlan = createExecutionPlan(
+    "Deploy static app serving index.html named My Portal at portal.example.com on port 8080",
+  );
+  assert.equal(filenamePlan.steps[1]?.args?.slug, "my-portal");
+  assert.equal(filenamePlan.steps[1]?.args?.domain, "portal.example.com");
+  assert.equal(filenamePlan.steps[1]?.args?.internalPort, 80);
+  assert.equal(filenamePlan.steps[2]?.toolName, "update_app_status");
+
+  const genericSubdomainPlan = createExecutionPlan(
+    "Deploy my-app at app.example.com",
+  );
+  assert.equal(genericSubdomainPlan.steps[1]?.args?.slug, "my-app");
+  assert.equal(genericSubdomainPlan.steps[1]?.args?.domain, "app.example.com");
+
+  const lifecyclePlan = createExecutionPlan("Restart crm-portal");
+  assert.equal(lifecyclePlan.requiresUserApproval, true);
+  assert.equal(lifecyclePlan.steps[1]?.toolName, "control_app_lifecycle");
+  assert.deepEqual(lifecyclePlan.steps[1]?.args, {
+    slug: "crm-portal",
+    action: "restart",
+  });
 
   const longGoal = `Deploy CRM app ${"x".repeat(980)}`;
   assert.equal(longGoal.length <= 1000, true);
@@ -178,7 +219,11 @@ test("agent toolset enforces server-side ExecutionPlan approval before provision
   }
 });
 
-test("Agent HTTP server enforces auth, secret redaction, and body size cap", async () => {
+test("Agent HTTP server fails closed without adminToken and enforces auth, secret redaction, and body size cap", async () => {
+  assert.throws(
+    () => createAgentHttpServer({ adminToken: "" }),
+    /requires a non-empty adminToken/,
+  );
   const { server } = createAgentHttpServer({ adminToken: "agent-secret-token" });
 
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -310,6 +355,10 @@ test("MCP JSON-RPC handler exposes CTO tools, enforces approval gate, and update
     assert.ok(names.includes("propose_plan"));
     assert.ok(names.includes("get_plan_status"));
     assert.ok(names.includes("prepare_app_workspace"));
+    assert.ok(names.includes("deploy_workload"));
+    assert.ok(names.includes("control_app_lifecycle"));
+    assert.ok(names.includes("configure_app_domain"));
+    assert.ok(names.includes("read_app_logs"));
     assert.ok(names.includes("update_app_status"));
     assert.ok(names.includes("list_audit_events"));
 

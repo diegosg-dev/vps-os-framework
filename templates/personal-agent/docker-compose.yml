@@ -6,6 +6,7 @@ services:
     image: node:24-bookworm-slim
     container_name: vps-os-app-${APP_SLUG}
     restart: unless-stopped
+    init: true
     working_dir: /workspace
     command: ["sleep", "infinity"]
     env_file:
