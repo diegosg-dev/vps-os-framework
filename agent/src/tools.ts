@@ -58,7 +58,7 @@ export function createAgentToolset(deps: AgentToolsetDeps): ToolSet {
 
     get_plan_status: tool({
       description:
-        "Read-only check of a stored ExecutionPlan's current approval and execution status by ID. Poll this before every mutation step; never assume the owner has approved.",
+        "Read-only check of a stored ExecutionPlan's current approval and execution status by ID. Check this before every mutation step; never assume the owner has approved.",
       inputSchema: z.object({
         planId: z.string().min(1),
       }),

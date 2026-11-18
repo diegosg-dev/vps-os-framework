@@ -17,4 +17,4 @@ description: Safely diagnose unhealthy containers, port conflicts, disk/RAM pres
 3. **Check ingress & routes:** Verify `vps-os-caddy` logs and `/vps-os/caddy/apps.d/<slug>.caddy` if the symptom is 502/504 or TLS failure.
 4. **Propose minimal fix:** Call `propose_plan` before editing Compose files, restarting services, or changing Caddy routes.
 5. **Verify recovery:** After approval and execution, confirm the container is healthy, HTTP responds cleanly, and call `update_app_status` (`running` or `error`) to keep the dashboard accurate.
-6. **Explain the incident to the owner:** After recovery, summarize in plain English what broke, why, what you changed to fix it, and one concrete way to prevent it from happening again. No blame, no raw logs unless the owner asks.
+6. **Explain the incident to the owner:** After recovery, summarize in plain English what broke, what is known about why (label anything unconfirmed as uncertain), what you changed to fix it, and — when available — one concrete way to prevent it from happening again. No blame; if the owner wants logs, share them redacted.
