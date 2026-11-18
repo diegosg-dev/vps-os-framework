@@ -1,0 +1,15 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": false,
+    "declarationMap": false
+  },
+  "references": [
+    { "path": "../packages/shared" },
+    { "path": "../agent" },
+    { "path": "../dashboard/api" }
+  ],
+  "include": ["src/**/*.ts"]
+}

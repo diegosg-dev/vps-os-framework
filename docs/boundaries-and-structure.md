@@ -11,20 +11,25 @@ The repository root stays intentionally minimal (`README.md`, `AGENTS.md`, `CLAU
 | Directory | Status | Responsibility |
 |---|---|---|
 | `docs/` | Active | Architecture overview, FigJam exports, lifecycle flows, and boundary docs |
-| `bootstrap/` | Planned | Ubuntu setup, host hardening, Docker setup, and plug-and-play installer scripts |
-| `dashboard/` | Planned | Management Web UI and Control Plane backend API |
-| `agent/` | Planned | Autonomous AI CTO orchestrator, tool engine, and isolated subagent runtime |
-| `apps/` or `templates/` | Planned | Isolated per-app / per-agent Docker Compose templates deployed into separate folders |
-| `tests/` | Planned | Unit, integration, and sandboxed provisioning verification tests |
+| `packages/shared/` | Active | Shared Zod schemas, safety/isolation guards, secret redaction, and SQLite registry |
+| `bootstrap/` | Active | Ubuntu setup, host hardening, Caddy reverse proxy, and core Compose stack |
+| `dashboard/api/` | Active | Hono Control Plane backend API |
+| `dashboard/web/` | Active | React + Vite + Tailwind Management Web UI & CTO Chat |
+| `agent/` | Active | Autonomous AI CTO planner, Vercel AI SDK toolset, and isolated subagent runtime |
+| `templates/` | Active | Isolated per-app / per-agent Docker Compose templates deployed into separate folders |
+| `tests/` | Active | Unit, isolation, API, and template/bootstrap guardrail tests |
 
 ---
 
-## Greenfield Stack Policy
+## Confirmed Tech Stack
 
-The language, web framework, agent SDK, database, and package manager are **intentionally undecided** at this stage:
+The repository uses a **TypeScript + pnpm workspace** core paired with **Bash + Caddy + Docker Compose v2** on Ubuntu LTS:
 
-- Architecture and documentation define **clear layer interfaces and isolation boundaries** without prematurely locking in a stack.
-- Once a stack is explicitly confirmed for `bootstrap/`, `dashboard/`, and `agent/`, update the **Project Overview & Stack** and **Commands & Verification** sections of [AGENTS.md](../AGENTS.md) and [CLAUDE.md](../CLAUDE.md) together.
+- **Ingress (`3`) & Bootstrap (`0`):** POSIX/Bash (`bootstrap/install.sh`), Caddy 2 Auto-TLS reverse proxy, and Docker Compose v2.
+- **Shared Core & Registry (`8`):** TypeScript, Zod, and Node's built-in `node:sqlite` (WAL mode).
+- **Dashboard (`1`, `4`):** React 19 + Vite + Tailwind CSS v4 (`dashboard/web/`) and Hono on Node.js LTS (`dashboard/api/`).
+- **Autonomous AI Agent (`5`, `6`):** TypeScript + Vercel AI SDK (`ai`) + Zod tools (`agent/`).
+- **Isolated Workloads (`7`, `9`):** Locked-apartment Docker Compose templates (`templates/personal-agent/`, `templates/web-app/`).
 
 ---
 
