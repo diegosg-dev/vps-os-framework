@@ -175,17 +175,25 @@ flowchart LR
 
 ---
 
-## 4. Future Roadmap — Phase 2: Browser First-Boot Setup Wizard (Planned)
+## 4. Phase 2: Browser First-Boot Setup Wizard (Implemented)
 
-> **Status:** Future Idea (not yet implemented in Phase 1).
+Phase 2 moves final setup out of SSH into the Management Web UI (`dashboard/web/` + `dashboard/api/`) while preserving strict container isolation (`cap_drop: ALL`, no Docker socket mount):
 
-Phase 1 eliminates manual YAML/skill/MCP wiring during server bootstrap, but still expects `LLM_API_KEY` (and optional channel tokens) in `/vps-os/.env` before starting `vps-os-hermes-cto.service`. **Phase 2** will move final configuration into the Management Web UI (`dashboard/web/` + `dashboard/api/`) for a 100% zero-SSH onboarding experience:
+1. **One-Time Bootstrap Claim & Passphrase Login:**
+   - [`bootstrap/install.sh`](../bootstrap/install.sh) prints a single-use setup pairing code (storing only its SHA-256 hash and 24-hour expiry in `/vps-os/data/setup-claim.json`, locked after 5 failed attempts) plus a `#claim=` link that the browser consumes and scrubs from the URL immediately.
+   - `POST /api/auth/claim` and `POST /api/auth/login` issue HMAC-signed session tokens (`vpsos_sess_...`) scoped to `session_epoch` in SQLite. Owners can configure a memorable Admin Passphrase (`scrypt`-hashed) during onboarding so they don't need to copy the raw 64-char `VPS_OS_ADMIN_TOKEN`.
+2. **5-Step Browser First-Boot Wizard (`dashboard/web/src/components/OnboardingWizard.tsx`):**
+   - **Step 1 — Domain & HTTPS:** Detects the server public IP, guides `A` record creation, verifies live DNS (`POST /api/onboarding/domain/verify`), or supports IP setup mode (`:80`) until DNS propagates.
+   - **Step 2 — AI CTO Brain:** Connects OpenAI, Anthropic, OpenRouter, Nous Research, or local Ollama, tests connectivity (`POST /api/onboarding/provider/test`), and stores keys in `/vps-os/config/onboarding.env` (`0600`) without ever storing plaintext keys in SQLite or returning them to the browser.
+   - **Step 3 — Security, Persona & Channels:** Sets an optional dashboard passphrase, updates bounded `USER.md` (`<= 1,375` chars) and `approvals.mode` (`manual` vs. `smart`), and accepts optional Telegram/Discord bot tokens.
+   - **Step 4 — Baseline Server Scan:** Runs `POST /api/onboarding/baseline-scan`, inspects OS, CPU/RAM/disk, domain/TLS, and Hermes Gateway health, and updates `MEMORY.md` (`<= 2,200` chars).
+   - **Step 5 — Launch:** Marks onboarding complete (`POST /api/onboarding/complete`), invalidates the one-time setup claim, and opens the Management Dashboard.
+3. **Scoped Host Sync Bridge (`bootstrap/apply-onboarding.sh`):**
+   - `dashboard-api` writes whitelisted keys to `/vps-os/config/onboarding.env` and stages Hermes memory/config overrides under `/vps-os/data/hermes-staging/`, then touches `/vps-os/data/onboarding-apply.trigger`.
+   - `vps-os-onboarding-apply.path` + `vps-os-onboarding-apply.service` on the Ubuntu host invoke [`bootstrap/apply-onboarding.sh`](../bootstrap/apply-onboarding.sh), safely merging whitelisted keys into `/vps-os/.env`, reloading `caddy`/`agent`, and starting `vps-os-hermes-cto.service`.
 
-1. **Zero-SSH Provider Connection Card:**
-   - First-boot wizard in `dashboard/web` lets the owner pick a provider (OpenAI, Anthropic, OpenRouter, Nous, or local Ollama), paste an API key, and test connectivity.
-   - `dashboard/api` writes `LLM_PROVIDER`, `LLM_MODEL`, and `LLM_API_KEY` to `/vps-os/.env` (`0600`) without ever echoing keys back to the browser, then signals `vps-os-hermes-cto.service` to start.
-2. **Plain-English Persona & Channel Wizard:**
-   - Visual toggles populate `/vps-os/hermes/memories/USER.md` (plain-English vs. technical verbosity) and `approvals.mode` (`manual` vs. `smart`), plus optional Telegram/Discord bot token binding for mobile CTO chat.
-3. **Hermes `/v1/runs` Proxy & Approval Bridge + Baseline Scan:**
-   - Bridge `dashboard/api` (`/api/chat/*`) to Hermes Gateway's `/v1/responses` and `/v1/runs` SSE streams (using `HERMES_API_SERVER_KEY` and `X-Hermes-Session-Key`), surfacing interactive plan/command approval cards directly in the browser.
-   - Trigger an automatic first CTO baseline scan (*inspect Ubuntu release, CPU/RAM/disk, Docker/Caddy/UFW health, and populate `MEMORY.md`*) right at the end of onboarding.
+---
+
+## 5. Next Phase Roadmap — Live Hermes SSE Chat Bridge (Planned)
+
+- Bridge `dashboard/api` (`/api/chat/*`) directly to Hermes Gateway's `/v1/responses` and `/v1/runs` SSE streams (using `HERMES_API_SERVER_KEY` and `X-Hermes-Session-Key`) for streaming multi-turn CTO execution inside the browser.

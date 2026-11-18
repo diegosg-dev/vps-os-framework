@@ -10,10 +10,10 @@ This guide explains how all components of the **VPS OS Framework** work together
 
 **Goal:** Turn a blank Ubuntu VPS into a browser-managed server appliance in one step.
 
-1. **Bare Ubuntu VPS Entry (`0`):** An operator runs the one-shot installer from `bootstrap/` on a fresh Ubuntu LTS VPS.
-2. **Host & Docker Setup (`10`):** The bootstrapper configures the firewall (exposing only required web ports `80`/`443` and hardened SSH), installs Docker Engine, and creates isolated Docker bridge networks.
+1. **Bare Ubuntu VPS Entry (`0`):** An operator runs the one-shot installer from `bootstrap/` (`sudo bash bootstrap/install.sh` or `curl -fsSL ... | sudo bash`) on a fresh Ubuntu LTS VPS.
+2. **Host & Docker Setup (`10`):** The bootstrapper configures the firewall (exposing only required web ports `80`/`443` and hardened SSH), installs Docker Engine, creates isolated Docker bridge networks, and prints a one-time setup pairing URL.
 3. **Core Stack Bring-Up (`3`, `4`, `5`, `8`):** The installer launches the **Auto-TLS Reverse Proxy (`3`)**, **Dashboard Control API (`4`)**, **VPS OS MCP Agent (`5`)**, and **System & App Registry (`8`)**, then installs **Hermes Agent** with the pre-seeded CTO pack (`SOUL.md`, `memories/`, `skills/vps-os-*`) and `vps-os-hermes-cto.service` (see [Hermes CTO Architecture & Onboarding](hermes-cto-onboarding.md)).
-4. **Ready for Non-Linux Users (`1`, `2`):** You open `https://os.yourdomain.com` in a browser with valid HTTPS certificates already active—no more SSH or manual Linux setup required.
+4. **Browser First-Boot Setup Wizard (`1`, `2`):** Open the printed setup link in a browser to claim your server with the single-use pairing code, verify DNS for automatic HTTPS, connect and test your AI provider key, set a memorable dashboard passphrase, and run your initial baseline server scan—no further SSH setup required.
 
 ---
 

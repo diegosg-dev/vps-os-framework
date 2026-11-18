@@ -42,10 +42,20 @@ services:
     environment:
       - PORT=3001
       - VPS_OS_REGISTRY_DB=/data/registry.db
+      - VPS_OS_DATA_DIR=/data
+      - VPS_OS_ONBOARDING_ENV_FILE=/vps-os-config/onboarding.env
       - VPS_OS_WEB_DIST=/srv/vps-os/dashboard/web/dist
       - VPS_OS_ADMIN_TOKEN=${VPS_OS_ADMIN_TOKEN:?VPS_OS_ADMIN_TOKEN must be set}
+      - VPS_OS_DOMAIN=${VPS_OS_DOMAIN:-localhost}
+      - VPS_OS_ACME_EMAIL=${VPS_OS_ACME_EMAIL:-admin@example.com}
+      - VPS_OS_PUBLIC_IP=${VPS_OS_PUBLIC_IP:-}
+      - HERMES_GATEWAY_URL=${HERMES_GATEWAY_URL:-http://host.docker.internal:8642}
+      - HERMES_API_SERVER_KEY=${HERMES_API_SERVER_KEY:-}
     volumes:
       - ./data:/data
+      - ./config:/vps-os-config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     cap_drop:
       - ALL
     security_opt:

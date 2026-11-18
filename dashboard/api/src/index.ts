@@ -7,6 +7,7 @@ import { createDashboardApp } from "./app.js";
 
 export * from "./app.js";
 export * from "./metrics.js";
+export * from "./onboarding.js";
 export * from "./static.js";
 
 const MIN_ADMIN_TOKEN_LENGTH = 16;
@@ -58,11 +59,27 @@ if (entryArg && import.meta.url === pathToFileURL(entryArg).href) {
     (fs.existsSync(defaultWebDist) ? defaultWebDist : undefined);
 
   const registry = new SystemRegistryStore(dbPath);
+  const dataDir =
+    process.env.VPS_OS_DATA_DIR?.trim() ||
+    (dbPath === ":memory:" ? undefined : path.dirname(path.resolve(dbPath)));
+  const onboardingEnvPath = process.env.VPS_OS_ONBOARDING_ENV_FILE?.trim();
+  const hermesHome = process.env.VPS_OS_HERMES_HOME?.trim();
+  const setupClaimPath = process.env.VPS_OS_SETUP_CLAIM_FILE?.trim();
+  const hermesGatewayUrl = process.env.HERMES_GATEWAY_URL?.trim();
+  const hermesApiServerKey = process.env.HERMES_API_SERVER_KEY?.trim();
+
   const app = createDashboardApp({
     registry,
     adminToken,
     trustProxy,
+    initialEnv: process.env,
     ...(webDistDir ? { webDistDir } : {}),
+    ...(dataDir ? { dataDir } : {}),
+    ...(onboardingEnvPath ? { onboardingEnvPath } : {}),
+    ...(hermesHome ? { hermesHome } : {}),
+    ...(setupClaimPath ? { setupClaimPath } : {}),
+    ...(hermesGatewayUrl ? { hermesGatewayUrl } : {}),
+    ...(hermesApiServerKey ? { hermesApiServerKey } : {}),
   });
 
   const server = serve({ fetch: app.fetch, port, hostname }, (info) => {

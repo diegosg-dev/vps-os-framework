@@ -19,6 +19,21 @@ import {
   collectDiskMetrics,
   collectSystemMetrics,
 } from "./metrics.js";
+import {
+  extractRequestToken,
+  handleBodyReadError,
+  readJsonBody,
+  tokensEqual,
+} from "./http-utils.js";
+import {
+  type DnsVerificationResult,
+  type HermesHealthStatus,
+  type ProviderTestInput,
+  type ProviderTestResult,
+  seedInitialOnboardingStateFromEnv,
+  verifySessionToken,
+} from "./onboarding.js";
+import { registerOnboardingRoutes } from "./onboarding-routes.js";
 import { readStaticUiAssetAsync } from "./static.js";
 
 export type AppLifecycleAction = "start" | "stop" | "restart";
@@ -51,6 +66,27 @@ export interface DashboardAppDeps {
   executePlan?: (
     plan: StoredPlan,
   ) => Promise<PlanExecutionResult> | PlanExecutionResult;
+  onboardingEnvPath?: string;
+  dataDir?: string;
+  hermesHome?: string;
+  setupClaimPath?: string;
+  initialSetupCodeHash?: string;
+  initialEnv?: NodeJS.ProcessEnv;
+  publicIp?: string | null;
+  hermesGatewayUrl?: string;
+  hermesApiServerKey?: string;
+  detectPublicIp?: () => Promise<string | null>;
+  verifyDns?: (
+    domain: string,
+    expectedIp: string | null,
+  ) => Promise<DnsVerificationResult>;
+  testProviderConnection?: (
+    input: ProviderTestInput,
+  ) => Promise<ProviderTestResult>;
+  checkHermesHealth?: () => Promise<HermesHealthStatus>;
+  triggerHostApply?: (
+    reason: string,
+  ) => Promise<{ queued: boolean; detail: string }> | { queued: boolean; detail: string };
 }
 
 export interface AppView {
@@ -98,29 +134,6 @@ function toAppView(app: AppRecord): AppView {
   };
 }
 
-function sha256Digest(value: string): Buffer {
-  return crypto.createHash("sha256").update(value, "utf8").digest();
-}
-
-function tokensEqual(provided: string | undefined, expected: string): boolean {
-  if (!provided) return false;
-  return crypto.timingSafeEqual(sha256Digest(provided), sha256Digest(expected));
-}
-
-function extractRequestToken(
-  authHeader: string | undefined,
-  headerToken: string | undefined,
-): string | undefined {
-  if (headerToken?.trim()) {
-    return headerToken.trim();
-  }
-  if (authHeader?.startsWith("Bearer ")) {
-    const token = authHeader.slice(7).trim();
-    return token || undefined;
-  }
-  return undefined;
-}
-
 function resolveClientKey(c: Context, trustProxy: boolean): string {
   if (!trustProxy) {
     return "local";
@@ -140,75 +153,11 @@ function resolveClientKey(c: Context, trustProxy: boolean): string {
   return realIp || "local";
 }
 
-class PayloadTooLargeError extends Error {
-  constructor() {
-    super("Payload too large.");
-  }
-}
-
-class InvalidJsonError extends Error {
-  constructor() {
-    super("Invalid JSON body.");
-  }
-}
-
-async function readJsonBody(c: Context, maxBodyBytes: number): Promise<unknown> {
-  const declaredLen = c.req.header("content-length");
-  if (declaredLen !== undefined) {
-    const parsedLen = Number(declaredLen);
-    if (Number.isFinite(parsedLen) && parsedLen > maxBodyBytes) {
-      throw new PayloadTooLargeError();
-    }
-  }
-
-  let rawText: string;
-  const bodyStream = c.req.raw.body;
-  if (bodyStream) {
-    const reader = bodyStream.getReader();
-    const chunks: Uint8Array[] = [];
-    let totalBytes = 0;
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-          totalBytes += value.byteLength;
-          if (totalBytes > maxBodyBytes) {
-            await reader.cancel().catch(() => undefined);
-            throw new PayloadTooLargeError();
-          }
-          chunks.push(value);
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-    rawText = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString(
-      "utf8",
-    );
-  } else {
-    rawText = await c.req.text();
-    if (Buffer.byteLength(rawText, "utf8") > maxBodyBytes) {
-      throw new PayloadTooLargeError();
-    }
-  }
-
-  try {
-    return JSON.parse(rawText) as unknown;
-  } catch {
-    throw new InvalidJsonError();
-  }
-}
-
-function handleBodyReadError(c: Context, err: unknown): Response {
-  if (err instanceof PayloadTooLargeError) {
-    return c.json({ error: err.message }, 413);
-  }
-  if (err instanceof InvalidJsonError) {
-    return c.json({ error: err.message }, 400);
-  }
-  return c.json({ error: "Invalid request body." }, 400);
-}
+const PUBLIC_AUTH_PATHS = new Set([
+  "/api/onboarding/status",
+  "/api/auth/claim",
+  "/api/auth/login",
+]);
 
 /**
  * Creates the Dashboard Control API (Step 4) Hono application.
@@ -221,6 +170,16 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
     throw new Error(
       "createDashboardApp requires a non-empty adminToken unless allowUnauthenticated is explicitly true.",
     );
+  }
+
+  if (deps.initialEnv) {
+    const initialPatch = seedInitialOnboardingStateFromEnv(
+      deps.registry.getOnboardingState(),
+      deps.initialEnv,
+    );
+    if (initialPatch) {
+      deps.registry.saveOnboardingState(initialPatch);
+    }
   }
 
   const app = new Hono();
@@ -303,12 +262,16 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
     requestBuckets.delete(clientKey);
     requestBuckets.set(clientKey, active);
 
-    if (trimmedToken) {
+    if (trimmedToken && !PUBLIC_AUTH_PATHS.has(c.req.path)) {
       const provided = extractRequestToken(
         c.req.header("authorization"),
         c.req.header("x-vps-os-token"),
       );
-      if (!tokensEqual(provided, trimmedToken)) {
+      const epoch = deps.registry.getSessionEpoch();
+      const valid =
+        tokensEqual(provided, trimmedToken) ||
+        verifySessionToken(provided, trimmedToken, epoch);
+      if (!valid) {
         return c.json({ error: "Unauthorized." }, 401);
       }
     }
@@ -322,6 +285,27 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
       service: "vps-os-dashboard-api",
       timestamp: new Date().toISOString(),
     });
+  });
+
+  registerOnboardingRoutes(app, {
+    registry: deps.registry,
+    trimmedToken,
+    maxBodyBytes,
+    getMetrics,
+    getDisk,
+    onboardingEnvPath: deps.onboardingEnvPath,
+    dataDir: deps.dataDir,
+    hermesHome: deps.hermesHome,
+    setupClaimPath: deps.setupClaimPath,
+    initialSetupCodeHash: deps.initialSetupCodeHash,
+    publicIp: deps.publicIp,
+    hermesGatewayUrl: deps.hermesGatewayUrl,
+    hermesApiServerKey: deps.hermesApiServerKey,
+    detectPublicIp: deps.detectPublicIp,
+    verifyDns: deps.verifyDns,
+    testProviderConnection: deps.testProviderConnection,
+    checkHermesHealth: deps.checkHermesHealth,
+    triggerHostApply: deps.triggerHostApply,
   });
 
   app.get("/api/system/metrics", (c) => {
