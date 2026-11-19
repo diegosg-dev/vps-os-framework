@@ -106,6 +106,10 @@ test("bootstrap/install.sh, apply-onboarding.sh, and runtime-bridge.py pass synt
   assert.match(script, /runtime-bridge\.env/);
   assert.match(script, /ProtectSystem=strict/);
   assert.match(script, /! grep -q "ProtectHome=true"/);
+  assert.match(
+    script,
+    /! grep -q "VPS_OS_SITE_ADDRESS" "\$\{VPS_OS_ROOT\}\/docker-compose\.yml"/,
+  );
   assert.match(script, /print_onboarding_summary/);
 });
 
@@ -134,6 +138,11 @@ test("bootstrap core files include Dockerfile, private agent routing, and non-em
   const coreCompose = fs.readFileSync(
     path.join(REPO_ROOT, "bootstrap", "docker-compose.core.yml"),
     "utf8",
+  );
+  assert.match(
+    coreCompose,
+    /^\s*caddy:\r?\n[\s\S]*?^\s+environment:\r?\n(?:^\s+-\s+.*\r?\n)*?^\s+-\s+VPS_OS_SITE_ADDRESS=\$\{VPS_OS_SITE_ADDRESS:-localhost\}\r?\n[\s\S]*?^\s*dashboard-api:/m,
+    "caddy service must pass VPS_OS_SITE_ADDRESS=${VPS_OS_SITE_ADDRESS:-localhost}",
   );
   assert.match(coreCompose, /VPS_OS_RUNTIME_SOCKET=\/run\/vps-os\/runtime\.sock/);
   assert.match(coreCompose, /VPS_OS_RUNTIME_TOKEN=\$\{VPS_OS_RUNTIME_TOKEN:\?/);

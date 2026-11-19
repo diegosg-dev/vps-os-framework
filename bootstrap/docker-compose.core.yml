@@ -10,6 +10,7 @@ services:
       - "80:80"
       - "443:443"
     environment:
+      - VPS_OS_SITE_ADDRESS=${VPS_OS_SITE_ADDRESS:-localhost}
       - VPS_OS_DOMAIN=${VPS_OS_DOMAIN:-localhost}
       - VPS_OS_ACME_EMAIL=${VPS_OS_ACME_EMAIL:-admin@example.com}
     volumes:
