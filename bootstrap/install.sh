@@ -497,10 +497,10 @@ prepare_directories() {
   fi
 
   copy_if_needed "${SCRIPT_DIR}/Caddyfile" "${VPS_OS_ROOT}/Caddyfile"
-  if [[ -f "${VPS_OS_ROOT}/docker-compose.yml" ]] && [[ "${FORCE_OVERWRITE}" != "--force" ]] && ! grep -q "VPS_OS_RUNTIME_SOCKET" "${VPS_OS_ROOT}/docker-compose.yml"; then
+  if [[ -f "${VPS_OS_ROOT}/docker-compose.yml" ]] && [[ "${FORCE_OVERWRITE}" != "--force" ]] && { ! grep -q "VPS_OS_RUNTIME_SOCKET" "${VPS_OS_ROOT}/docker-compose.yml" || ! grep -q "VPS_OS_SITE_ADDRESS" "${VPS_OS_ROOT}/docker-compose.yml"; }; then
     cp "${VPS_OS_ROOT}/docker-compose.yml" "${VPS_OS_ROOT}/docker-compose.yml.bak"
     cp "${SCRIPT_DIR}/docker-compose.core.yml" "${VPS_OS_ROOT}/docker-compose.yml"
-    log "Upgraded ${VPS_OS_ROOT}/docker-compose.yml for runtime bridge wiring (backup at docker-compose.yml.bak)."
+    log "Upgraded ${VPS_OS_ROOT}/docker-compose.yml for runtime bridge and Caddy site address wiring (backup at docker-compose.yml.bak)."
   else
     copy_if_needed "${SCRIPT_DIR}/docker-compose.core.yml" "${VPS_OS_ROOT}/docker-compose.yml"
   fi
