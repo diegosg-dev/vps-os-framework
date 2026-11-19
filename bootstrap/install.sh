@@ -208,22 +208,65 @@ detect_public_ip() {
   fi
 }
 
+file_has_ssh_public_key() {
+  local key_file="$1"
+  [[ -f "${key_file}" && -r "${key_file}" && -s "${key_file}" ]] || return 1
+  grep -Eq '^[[:space:]]*([^#[:space:]].*[[:space:]])?(ssh-|ecdsa-sha2-|sk-)[A-Za-z0-9@.-]+[[:space:]]+[A-Za-z0-9+/=]+' "${key_file}"
+}
+
+resolve_user_home() {
+  local user="$1"
+  local home_dir=""
+  if command -v getent >/dev/null 2>&1; then
+    home_dir="$(getent passwd "${user}" 2>/dev/null | cut -d: -f6 || true)"
+  fi
+  if [[ -z "${home_dir}" && -r /etc/passwd ]]; then
+    home_dir="$(awk -F: -v u="${user}" '$1 == u {print $6; exit}' /etc/passwd 2>/dev/null || true)"
+  fi
+  printf '%s' "${home_dir}"
+}
+
+has_authorized_ssh_keys() {
+  local root_keys="${SSH_ROOT_AUTHORIZED_KEYS:-/root/.ssh/authorized_keys}"
+  if file_has_ssh_public_key "${root_keys}"; then
+    return 0
+  fi
+
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    local sudo_home="${SSH_SUDO_USER_HOME:-}"
+    if [[ -z "${sudo_home}" ]]; then
+      sudo_home="$(resolve_user_home "${SUDO_USER}")"
+    fi
+    if [[ -n "${sudo_home}" ]] && file_has_ssh_public_key "${sudo_home}/.ssh/authorized_keys"; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
 harden_ssh() {
-  local conf_dir="/etc/ssh/sshd_config.d"
+  local conf_dir="${SSH_CONFIG_DIR:-/etc/ssh/sshd_config.d}"
   local conf_file="${conf_dir}/99-vps-os-hardening.conf"
   if [[ ! -d "${conf_dir}" ]] || [[ -f "${conf_file}" && "${FORCE_OVERWRITE}" != "--force" ]]; then
+    return
+  fi
+
+  if ! has_authorized_ssh_keys; then
+    log "Warning: skipping SSH hardening because no valid SSH public keys were found."
+    log "Add an SSH public key to /root/.ssh/authorized_keys (or your sudo user's ~/.ssh/authorized_keys) and re-run with --force to enable SSH hardening."
     return
   fi
 
   log "Applying non-destructive SSH hardening defaults..."
   {
     echo "PermitRootLogin prohibit-password"
-    if [[ -s /root/.ssh/authorized_keys ]]; then
-      echo "PasswordAuthentication no"
-    fi
+    echo "PasswordAuthentication no"
   } > "${conf_file}"
   chmod 644 "${conf_file}"
-  systemctl reload ssh || systemctl reload sshd || true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl reload ssh || systemctl reload sshd || true
+  fi
 }
 
 configure_firewall() {
@@ -542,8 +585,8 @@ ensure_hermes() {
     return
   fi
 
-  log "Installing NousResearch Hermes Agent into ${HERMES_HOME}..."
-  HERMES_HOME="${HERMES_HOME}" curl -fsSL https://hermes-agent.nousresearch.com/install.sh | HERMES_HOME="${HERMES_HOME}" bash
+  log "Installing NousResearch Hermes Agent (headless, non-interactive) into ${HERMES_HOME}..."
+  HERMES_HOME="${HERMES_HOME}" curl -fsSL https://hermes-agent.nousresearch.com/install.sh | HERMES_HOME="${HERMES_HOME}" bash -s -- --non-interactive --skip-browser --skip-computer-use
 }
 
 configure_hermes_service() {
@@ -793,4 +836,6 @@ main() {
   print_onboarding_summary
 }
 
-main "$@"
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
