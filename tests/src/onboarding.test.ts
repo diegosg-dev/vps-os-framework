@@ -192,7 +192,8 @@ test("Dashboard onboarding supports one-time claim, brute-force lock, passphrase
       providerCatalog: Array<{ id: string }>;
     };
     assert.equal(stateJson.state.publicIp, "203.0.113.42");
-    assert.equal(stateJson.providerCatalog.length, 5);
+    assert.equal(stateJson.providerCatalog.length, 6);
+    assert.equal(stateJson.providerCatalog[0]?.id, "opencode");
 
     // 5. Reject placeholder domain os.example.com, accept real domain
     const badDomainRes = await app.request("/api/onboarding/domain", {
@@ -383,5 +384,115 @@ test("Setup claim locks permanently after 5 invalid attempts", async () => {
     assert.equal(realRes.status, 429);
   } finally {
     registry.close();
+  }
+});
+
+test("OpenCode provider supports Zen, Go, and local opencode serve setup & env persistence", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-opencode-"));
+  const envPath = path.join(tempDir, "config", "onboarding.env");
+  const hermesHome = path.join(tempDir, "hermes");
+  provisionHermesHome({ hermesHome });
+
+  const registry = new SystemRegistryStore(path.join(tempDir, "data", "registry.db"));
+  const headers = {
+    "content-type": "application/json",
+    authorization: "Bearer master-admin-token-for-opencode-tests",
+  };
+
+  const app = createDashboardApp({
+    registry,
+    adminToken: "master-admin-token-for-opencode-tests",
+    onboardingEnvPath: envPath,
+    hermesHome,
+    dataDir: path.join(tempDir, "data"),
+    testProviderConnection: async (input) => ({
+      ok: true,
+      provider: input.provider,
+      model: input.model,
+      latencyMs: 18,
+      availableModels: ["claude-sonnet-4-5", "gpt-5.2", "deepseek-r1"],
+      message: `Connected to OpenCode (${input.model}) in 18ms. Found 3 models.`,
+    }),
+  });
+
+  try {
+    // 1. OpenCode Go requires an API key
+    const goNoKeyRes = await app.request("/api/onboarding/provider", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        provider: "opencode",
+        model: "deepseek-r1",
+        baseUrl: "https://opencode.ai/zen/go/v1",
+      }),
+    });
+    assert.equal(goNoKeyRes.status, 400);
+
+    // 2. OpenCode Zen saves cleanly with OPENCODE_API_KEY and default Zen URL
+    const zenSaveRes = await app.request("/api/onboarding/provider", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        provider: "opencode",
+        model: "claude-sonnet-4-5",
+        apiKey: "sk-opencode-secret-key-999999",
+      }),
+    });
+    assert.equal(zenSaveRes.status, 200);
+    const zenJson = (await zenSaveRes.json()) as {
+      state: { llmProvider: string; llmModel: string; llmBaseUrl: string; llmConfigured: boolean };
+    };
+    assert.equal(zenJson.state.llmProvider, "opencode");
+    assert.equal(zenJson.state.llmModel, "claude-sonnet-4-5");
+    assert.equal(zenJson.state.llmBaseUrl, "https://opencode.ai/zen/v1");
+    assert.equal(zenJson.state.llmConfigured, true);
+
+    const zenEnv = fs.readFileSync(envPath, "utf8");
+    assert.match(zenEnv, /^LLM_PROVIDER=opencode$/m);
+    assert.match(zenEnv, /^LLM_BASE_URL=https:\/\/opencode\.ai\/zen\/v1$/m);
+    assert.match(zenEnv, /^OPENCODE_API_KEY=sk-opencode-secret-key-999999$/m);
+
+    // 3. Test endpoint returns discovered models list
+    const testRes = await app.request("/api/onboarding/provider/test", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        provider: "opencode",
+        model: "claude-sonnet-4-5",
+      }),
+    });
+    assert.equal(testRes.status, 200);
+    const testJson = (await testRes.json()) as {
+      result: { ok: boolean; availableModels?: string[] };
+    };
+    assert.equal(testJson.result.ok, true);
+    assert.deepEqual(testJson.result.availableModels, [
+      "claude-sonnet-4-5",
+      "gpt-5.2",
+      "deepseek-r1",
+    ]);
+
+    // 4. Local OpenCode Server works without API key and clears OPENCODE_API_KEY
+    const localSaveRes = await app.request("/api/onboarding/provider", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        provider: "opencode",
+        model: "gpt-5.2",
+        baseUrl: "http://host.docker.internal:4096",
+      }),
+    });
+    assert.equal(localSaveRes.status, 200);
+    const localEnv = fs.readFileSync(envPath, "utf8");
+    assert.match(localEnv, /^LLM_BASE_URL=http:\/\/host\.docker\.internal:4096$/m);
+    assert.equal(localEnv.includes("OPENCODE_API_KEY="), false);
+
+    // Hermes config.yaml reflects opencode provider
+    const hermesCfg = fs.readFileSync(path.join(hermesHome, "config.yaml"), "utf8");
+    assert.match(hermesCfg, /provider: "opencode"/);
+    assert.match(hermesCfg, /name: "gpt-5\.2"/);
+  } finally {
+    registry.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });

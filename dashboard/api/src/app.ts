@@ -34,6 +34,7 @@ import {
   seedInitialOnboardingStateFromEnv,
   verifySessionToken,
 } from "./onboarding.js";
+import { registerChatRoutes } from "./chat-routes.js";
 import { registerOnboardingRoutes } from "./onboarding-routes.js";
 import { readStaticUiAssetAsync } from "./static.js";
 
@@ -96,6 +97,8 @@ export interface DashboardAppDeps {
   triggerHostApply?: (
     reason: string,
   ) => Promise<{ queued: boolean; detail: string }> | { queued: boolean; detail: string };
+  chatFetch?: typeof fetch;
+  disableExternalLlm?: boolean;
 }
 
 export interface AppView {
@@ -344,6 +347,19 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
     testProviderConnection: deps.testProviderConnection,
     checkHermesHealth: deps.checkHermesHealth,
     triggerHostApply: deps.triggerHostApply,
+  });
+
+  registerChatRoutes(app, {
+    registry: deps.registry,
+    maxBodyBytes,
+    dataDir: deps.dataDir,
+    onboardingEnvPath: deps.onboardingEnvPath,
+    getMetrics,
+    getDisk,
+    syncStatuses: deps.workloadController?.syncStatuses,
+    getLogs: deps.workloadController?.getLogs,
+    fetchFn: deps.chatFetch,
+    disableExternalLlm: deps.disableExternalLlm,
   });
 
   app.get("/api/system/metrics", (c) => {
@@ -755,7 +771,7 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
           "x-frame-options": "DENY",
           "referrer-policy": "no-referrer",
           "content-security-policy":
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'",
         },
       });
     });

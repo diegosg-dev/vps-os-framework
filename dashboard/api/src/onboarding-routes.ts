@@ -7,12 +7,14 @@ import {
   CommunicationStyleSchema,
   LLM_PROVIDER_CATALOG,
   LlmProviderSchema,
+  OPENCODE_ZEN_BASE_URL,
   type SetupClaimRecord,
   type SystemMetrics,
   type SystemRegistryStore,
   TechnicalLevelSchema,
   hashPassphrase,
   hashSetupCode,
+  isOpenCodeLocalServerUrl,
   normalizeSetupCode,
   redactSecrets,
   validateDomain,
@@ -32,6 +34,7 @@ import {
   isSetupClaimAvailable,
   issueSessionToken,
   readHostApplyStatus,
+  readOnboardingEnvValues,
   readSetupClaim,
   syncHermesOnboardingFiles,
   testLlmProviderConnection,
@@ -627,10 +630,23 @@ export function registerOnboardingRoutes(app: Hono, deps: OnboardingRouteDeps): 
       }
     }
 
+    let effectiveApiKey = parsed.data.apiKey;
+    if (!effectiveApiKey && deps.onboardingEnvPath) {
+      const existing = deps.registry.getOnboardingState();
+      if (existing.llmConfigured && existing.llmProvider === parsed.data.provider) {
+        const savedEnv = readOnboardingEnvValues(deps.onboardingEnvPath);
+        effectiveApiKey =
+          savedEnv.LLM_API_KEY ||
+          savedEnv.OPENCODE_API_KEY ||
+          savedEnv.OPENCODE_SERVER_PASSWORD ||
+          undefined;
+      }
+    }
+
     const result = await testProviderFn({
       provider: parsed.data.provider,
       model: parsed.data.model,
-      apiKey: parsed.data.apiKey,
+      apiKey: effectiveApiKey,
       baseUrl: parsed.data.baseUrl,
     });
 
@@ -665,17 +681,6 @@ export function registerOnboardingRoutes(app: Hono, deps: OnboardingRouteDeps): 
     const hasExistingKeyForProvider =
       existing.llmConfigured && existing.llmProvider === parsed.data.provider;
 
-    if (
-      catalogEntry?.requiresApiKey &&
-      !parsed.data.apiKey?.trim() &&
-      !hasExistingKeyForProvider
-    ) {
-      return c.json(
-        { error: `An API key is required for ${catalogEntry.label}.` },
-        400,
-      );
-    }
-
     let safeBaseUrl: string | null = null;
     if (parsed.data.baseUrl?.trim()) {
       try {
@@ -686,17 +691,56 @@ export function registerOnboardingRoutes(app: Hono, deps: OnboardingRouteDeps): 
           400,
         );
       }
+    } else if (parsed.data.provider === "opencode") {
+      safeBaseUrl = OPENCODE_ZEN_BASE_URL;
+    }
+
+    const isOpenCodeGo =
+      parsed.data.provider === "opencode" &&
+      Boolean(safeBaseUrl?.toLowerCase().includes("/zen/go"));
+
+    if (
+      (catalogEntry?.requiresApiKey || isOpenCodeGo) &&
+      !parsed.data.apiKey?.trim() &&
+      !hasExistingKeyForProvider
+    ) {
+      return c.json(
+        {
+          error: isOpenCodeGo
+            ? "An OpenCode API key (from opencode.ai/auth) is required for OpenCode Go."
+            : `An API key is required for ${catalogEntry?.label ?? parsed.data.provider}.`,
+        },
+        400,
+      );
     }
 
     if (deps.onboardingEnvPath) {
-      updateOnboardingEnvFile(deps.onboardingEnvPath, {
+      const trimmedKey = parsed.data.apiKey?.trim();
+      const envUpdates: Record<string, string | null | undefined> = {
         LLM_PROVIDER: parsed.data.provider,
         LLM_MODEL: parsed.data.model,
-        ...(parsed.data.apiKey?.trim()
-          ? { LLM_API_KEY: parsed.data.apiKey.trim() }
-          : {}),
+        ...(trimmedKey ? { LLM_API_KEY: trimmedKey } : {}),
         ...(safeBaseUrl ? { LLM_BASE_URL: safeBaseUrl } : { LLM_BASE_URL: null }),
-      });
+      };
+
+      if (parsed.data.provider === "opencode") {
+        if (isOpenCodeLocalServerUrl(safeBaseUrl)) {
+          if (trimmedKey) {
+            envUpdates.OPENCODE_SERVER_PASSWORD = trimmedKey;
+          }
+          envUpdates.OPENCODE_API_KEY = null;
+        } else {
+          if (trimmedKey) {
+            envUpdates.OPENCODE_API_KEY = trimmedKey;
+          }
+          envUpdates.OPENCODE_SERVER_PASSWORD = null;
+        }
+      } else {
+        envUpdates.OPENCODE_API_KEY = null;
+        envUpdates.OPENCODE_SERVER_PASSWORD = null;
+      }
+
+      updateOnboardingEnvFile(deps.onboardingEnvPath, envUpdates);
     }
 
     syncHermesOnboardingFiles({

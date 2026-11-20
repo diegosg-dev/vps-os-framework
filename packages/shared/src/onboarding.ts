@@ -7,6 +7,7 @@ const HERMES_MEMORY_LIMIT = 2200;
 const HERMES_USER_LIMIT = 1375;
 
 export const LlmProviderSchema = z.enum([
+  "opencode",
   "openai",
   "anthropic",
   "openrouter",
@@ -15,18 +16,107 @@ export const LlmProviderSchema = z.enum([
 ]);
 export type LlmProvider = z.infer<typeof LlmProviderSchema>;
 
+export interface ProviderEndpointPreset {
+  id: string;
+  label: string;
+  description: string;
+  baseUrl: string;
+  requiresApiKey: boolean;
+  keyLabel?: string;
+  keyPlaceholder?: string;
+}
+
 export interface LlmProviderCatalogEntry {
   id: LlmProvider;
   label: string;
+  badge?: string;
   description: string;
   defaultModel: string;
   suggestedModels: string[];
   requiresApiKey: boolean;
   keyPlaceholder: string;
   defaultBaseUrl: string;
+  endpointPresets?: readonly ProviderEndpointPreset[];
+  setupHint?: string;
+}
+
+export const OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen/v1";
+export const OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1";
+export const OPENCODE_LOCAL_BASE_URL = "http://host.docker.internal:4096";
+
+/**
+ * Returns true when an OpenCode base URL points to a self-hosted `opencode serve`
+ * daemon rather than the hosted OpenCode Zen / OpenCode Go OpenAI-compatible API.
+ */
+export function isOpenCodeLocalServerUrl(baseUrl: string | null | undefined): boolean {
+  const trimmed = baseUrl?.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    if (host === "opencode.ai" || host.endsWith(".opencode.ai")) {
+      return false;
+    }
+    if (pathname.endsWith("/v1")) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export const LLM_PROVIDER_CATALOG: readonly LlmProviderCatalogEntry[] = [
+  {
+    id: "opencode",
+    label: "OpenCode",
+    badge: "Direct",
+    description:
+      "Connect directly to OpenCode Zen, OpenCode Go, or a local opencode serve daemon with agentic coding & reasoning models.",
+    defaultModel: "claude-sonnet-4-5",
+    suggestedModels: [
+      "claude-sonnet-4-5",
+      "gpt-5.2",
+      "gemini-2.5-pro",
+      "deepseek-r1",
+      "big-pickle",
+    ],
+    requiresApiKey: false,
+    keyPlaceholder: "opencode-... (from opencode.ai/auth or optional for local serve)",
+    defaultBaseUrl: OPENCODE_ZEN_BASE_URL,
+    endpointPresets: [
+      {
+        id: "zen",
+        label: "OpenCode Zen",
+        description: "Pay-as-you-go curated frontier & free models via opencode.ai/zen/v1.",
+        baseUrl: OPENCODE_ZEN_BASE_URL,
+        requiresApiKey: false,
+        keyLabel: "OpenCode API Key (OPENCODE_API_KEY)",
+        keyPlaceholder: "sk-... (from opencode.ai/auth; optional for free models)",
+      },
+      {
+        id: "go",
+        label: "OpenCode Go",
+        description: "Subscription open-model tier via opencode.ai/zen/go/v1.",
+        baseUrl: OPENCODE_GO_BASE_URL,
+        requiresApiKey: true,
+        keyLabel: "OpenCode API Key (OPENCODE_API_KEY)",
+        keyPlaceholder: "sk-... (from opencode.ai/auth)",
+      },
+      {
+        id: "local",
+        label: "Local OpenCode Server",
+        description: "Self-hosted `opencode serve --port 4096` running directly on this VPS.",
+        baseUrl: OPENCODE_LOCAL_BASE_URL,
+        requiresApiKey: false,
+        keyLabel: "Server Password (optional)",
+        keyPlaceholder: "OPENCODE_SERVER_PASSWORD (leave blank if unauthenticated)",
+      },
+    ],
+    setupHint:
+      "Get an API key at opencode.ai/auth (or run `opencode serve --port 4096 --hostname 0.0.0.0` on your VPS for direct local sessions).",
+  },
   {
     id: "openai",
     label: "OpenAI",
@@ -74,6 +164,7 @@ export const LLM_PROVIDER_CATALOG: readonly LlmProviderCatalogEntry[] = [
   {
     id: "ollama",
     label: "Local Ollama",
+    badge: "Local",
     description: "Self-hosted private models running locally without an external API key.",
     defaultModel: "llama3.3",
     suggestedModels: ["llama3.3", "qwen2.5-coder:14b", "mistral"],
