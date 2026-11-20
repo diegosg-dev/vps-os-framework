@@ -13,6 +13,8 @@ import {
 } from "./runtime.js";
 
 export * from "./app.js";
+export * from "./chat-engine.js";
+export * from "./chat-routes.js";
 export * from "./metrics.js";
 export * from "./onboarding.js";
 export * from "./runtime.js";

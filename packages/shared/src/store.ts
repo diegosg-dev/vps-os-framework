@@ -19,6 +19,16 @@ import {
   AuditEventSchema,
 } from "./registry.js";
 import {
+  type ChatAttachment,
+  ChatAttachmentSchema,
+  type ChatMessage,
+  ChatMessageSchema,
+  type ChatReasoningBlock,
+  type ChatThread,
+  ChatThreadSchema,
+  type ChatToolCall,
+} from "./chat.js";
+import {
   type OnboardingState,
   OnboardingStateSchema,
   createDefaultOnboardingState,
@@ -60,6 +70,49 @@ interface PlanRow {
   decision_note: string | null;
   created_at: string;
   decided_at: string | null;
+}
+
+interface ChatThreadRow {
+  id: string;
+  title: string;
+  provider: string | null;
+  model: string | null;
+  created_at: string;
+  updated_at: string;
+  message_count?: number;
+}
+
+interface ChatMessageRow {
+  id: string;
+  thread_id: string;
+  role: ChatMessage["role"];
+  content: string;
+  attachments_json: string;
+  reasoning_json: string;
+  tool_calls_json: string;
+  plan_id: string | null;
+  provider: string | null;
+  model: string | null;
+  status: ChatMessage["status"];
+  created_at: string;
+}
+
+interface ChatAttachmentRow {
+  id: string;
+  thread_id: string | null;
+  name: string;
+  mime_type: string;
+  size_bytes: number;
+  kind: ChatAttachment["kind"];
+  text_preview: string | null;
+  storage_path: string | null;
+  data_base64: string | null;
+  created_at: string;
+}
+
+export interface StoredChatAttachmentRecord extends ChatAttachment {
+  storagePath: string | null;
+  dataBase64: string | null;
 }
 
 /**
@@ -130,6 +183,49 @@ export class SystemRegistryStore {
         key TEXT PRIMARY KEY,
         value_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS chat_threads (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        provider TEXT,
+        model TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_chat_threads_updated_at
+        ON chat_threads (updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+        content TEXT NOT NULL,
+        attachments_json TEXT NOT NULL DEFAULT '[]',
+        reasoning_json TEXT NOT NULL DEFAULT '[]',
+        tool_calls_json TEXT NOT NULL DEFAULT '[]',
+        plan_id TEXT,
+        provider TEXT,
+        model TEXT,
+        status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('streaming', 'completed', 'error')),
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_created
+        ON chat_messages (thread_id, created_at ASC);
+
+      CREATE TABLE IF NOT EXISTS chat_attachments (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT REFERENCES chat_threads(id) ON DELETE SET NULL,
+        name TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('image', 'text', 'file')),
+        text_preview TEXT,
+        storage_path TEXT,
+        data_base64 TEXT,
+        created_at TEXT NOT NULL
       );
     `);
 
@@ -579,8 +675,313 @@ export class SystemRegistryStore {
     return nextEpoch;
   }
 
+  /** Creates a new agentic chat thread. */
+  createChatThread(input: {
+    id: string;
+    title: string;
+    provider?: string | null;
+    model?: string | null;
+    createdAt?: string;
+  }): ChatThread {
+    const now = input.createdAt ?? new Date().toISOString();
+    const cleanTitle = redactSecrets(input.title.trim() || "New Conversation").slice(0, 160);
+    const stmt = this.db.prepare(`
+      INSERT INTO chat_threads (id, title, provider, model, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      input.id,
+      cleanTitle,
+      input.provider ?? null,
+      input.model ?? null,
+      now,
+      now,
+    );
+    return ChatThreadSchema.parse({
+      id: input.id,
+      title: cleanTitle,
+      provider: input.provider ?? null,
+      model: input.model ?? null,
+      messageCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+
+  /** Lists chat threads ordered by most recently updated. */
+  listChatThreads(limit = 50): ChatThread[] {
+    const bounded = Math.max(1, Math.min(limit, 200));
+    const stmt = this.db.prepare(`
+      SELECT t.*, (SELECT COUNT(*) FROM chat_messages m WHERE m.thread_id = t.id) AS message_count
+      FROM chat_threads t
+      ORDER BY t.updated_at DESC
+      LIMIT ?
+    `);
+    const rows = stmt.all(bounded) as unknown as ChatThreadRow[];
+    return rows.map((row) => this.mapChatThreadRow(row));
+  }
+
+  /** Fetches a single chat thread by ID, or null if missing. */
+  getChatThread(threadId: string): ChatThread | null {
+    const stmt = this.db.prepare(`
+      SELECT t.*, (SELECT COUNT(*) FROM chat_messages m WHERE m.thread_id = t.id) AS message_count
+      FROM chat_threads t
+      WHERE t.id = ?
+    `);
+    const row = stmt.get(threadId) as ChatThreadRow | undefined;
+    return row ? this.mapChatThreadRow(row) : null;
+  }
+
+  /** Updates a chat thread's title, provider, model, or updatedAt timestamp. */
+  updateChatThread(
+    threadId: string,
+    patch: {
+      title?: string;
+      provider?: string | null;
+      model?: string | null;
+      updatedAt?: string;
+    },
+  ): ChatThread | null {
+    const existing = this.getChatThread(threadId);
+    if (!existing) return null;
+    const nextTitle =
+      patch.title !== undefined
+        ? redactSecrets(patch.title.trim() || existing.title).slice(0, 160)
+        : existing.title;
+    const nextProvider =
+      patch.provider !== undefined ? patch.provider : existing.provider;
+    const nextModel = patch.model !== undefined ? patch.model : existing.model;
+    const updatedAt = patch.updatedAt ?? new Date().toISOString();
+
+    const stmt = this.db.prepare(`
+      UPDATE chat_threads
+      SET title = ?, provider = ?, model = ?, updated_at = ?
+      WHERE id = ?
+    `);
+    stmt.run(nextTitle, nextProvider, nextModel, updatedAt, threadId);
+    return this.getChatThread(threadId);
+  }
+
+  /** Deletes a chat thread and cascades to its messages. */
+  deleteChatThread(threadId: string): boolean {
+    const stmt = this.db.prepare("DELETE FROM chat_threads WHERE id = ?");
+    const result = stmt.run(threadId);
+    return result.changes > 0;
+  }
+
+  /** Appends a secret-redacted chat message to a thread and bumps thread updated_at. */
+  appendChatMessage(message: ChatMessage): ChatMessage {
+    const sanitized = this.sanitizeChatMessage(message);
+    const stmt = this.db.prepare(`
+      INSERT INTO chat_messages (
+        id, thread_id, role, content, attachments_json, reasoning_json,
+        tool_calls_json, plan_id, provider, model, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      sanitized.id,
+      sanitized.threadId,
+      sanitized.role,
+      sanitized.content,
+      JSON.stringify(sanitized.attachments),
+      JSON.stringify(sanitized.reasoning),
+      JSON.stringify(sanitized.toolCalls),
+      sanitized.planId,
+      sanitized.provider,
+      sanitized.model,
+      sanitized.status,
+      sanitized.createdAt,
+    );
+    this.db
+      .prepare("UPDATE chat_threads SET updated_at = ? WHERE id = ?")
+      .run(sanitized.createdAt, sanitized.threadId);
+    return sanitized;
+  }
+
+  /** Updates an existing chat message (used as streaming turns finish or plans update). */
+  updateChatMessage(message: ChatMessage): ChatMessage {
+    const sanitized = this.sanitizeChatMessage(message);
+    const stmt = this.db.prepare(`
+      UPDATE chat_messages
+      SET content = ?, attachments_json = ?, reasoning_json = ?, tool_calls_json = ?,
+          plan_id = ?, provider = ?, model = ?, status = ?
+      WHERE id = ? AND thread_id = ?
+    `);
+    stmt.run(
+      sanitized.content,
+      JSON.stringify(sanitized.attachments),
+      JSON.stringify(sanitized.reasoning),
+      JSON.stringify(sanitized.toolCalls),
+      sanitized.planId,
+      sanitized.provider,
+      sanitized.model,
+      sanitized.status,
+      sanitized.id,
+      sanitized.threadId,
+    );
+    this.db
+      .prepare("UPDATE chat_threads SET updated_at = ? WHERE id = ?")
+      .run(new Date().toISOString(), sanitized.threadId);
+    return sanitized;
+  }
+
+  /** Lists all messages in a thread ordered chronologically. */
+  listChatMessages(threadId: string, limit = 200): ChatMessage[] {
+    const bounded = Math.max(1, Math.min(limit, 500));
+    const stmt = this.db.prepare(`
+      SELECT * FROM chat_messages
+      WHERE thread_id = ?
+      ORDER BY created_at ASC, rowid ASC
+      LIMIT ?
+    `);
+    const rows = stmt.all(threadId, bounded) as unknown as ChatMessageRow[];
+    return rows.map((row) => this.mapChatMessageRow(row));
+  }
+
+  /** Persists uploaded attachment metadata (and redacted text preview / storage pointer). */
+  saveChatAttachment(record: {
+    id: string;
+    threadId?: string | null;
+    name: string;
+    mimeType: string;
+    sizeBytes: number;
+    kind: ChatAttachment["kind"];
+    textPreview?: string | null;
+    storagePath?: string | null;
+    dataBase64?: string | null;
+    createdAt?: string;
+  }): StoredChatAttachmentRecord {
+    const createdAt = record.createdAt ?? new Date().toISOString();
+    const safePreview = record.textPreview
+      ? redactSecrets(record.textPreview).slice(0, 16_000)
+      : null;
+    const stmt = this.db.prepare(`
+      INSERT INTO chat_attachments (
+        id, thread_id, name, mime_type, size_bytes, kind,
+        text_preview, storage_path, data_base64, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      record.id,
+      record.threadId ?? null,
+      record.name,
+      record.mimeType,
+      record.sizeBytes,
+      record.kind,
+      safePreview,
+      record.storagePath ?? null,
+      record.dataBase64 ?? null,
+      createdAt,
+    );
+    return {
+      ...ChatAttachmentSchema.parse({
+        id: record.id,
+        threadId: record.threadId ?? null,
+        name: record.name,
+        mimeType: record.mimeType,
+        sizeBytes: record.sizeBytes,
+        kind: record.kind,
+        textPreview: safePreview,
+        url: `/api/chat/attachments/${record.id}`,
+        createdAt,
+      }),
+      storagePath: record.storagePath ?? null,
+      dataBase64: record.dataBase64 ?? null,
+    };
+  }
+
+  /** Fetches a stored chat attachment record including storage path/payload. */
+  getChatAttachment(attachmentId: string): StoredChatAttachmentRecord | null {
+    const stmt = this.db.prepare("SELECT * FROM chat_attachments WHERE id = ?");
+    const row = stmt.get(attachmentId) as ChatAttachmentRow | undefined;
+    return row ? this.mapChatAttachmentRow(row) : null;
+  }
+
+  /** Fetches multiple attachments by ID, optionally attaching them to a thread. */
+  getChatAttachmentsByIds(
+    attachmentIds: string[],
+    bindThreadId?: string,
+  ): StoredChatAttachmentRecord[] {
+    const results: StoredChatAttachmentRecord[] = [];
+    for (const id of attachmentIds) {
+      const record = this.getChatAttachment(id);
+      if (!record) continue;
+      if (bindThreadId && record.threadId === null) {
+        this.db
+          .prepare("UPDATE chat_attachments SET thread_id = ? WHERE id = ?")
+          .run(bindThreadId, id);
+        record.threadId = bindThreadId;
+      }
+      results.push(record);
+    }
+    return results;
+  }
+
   close(): void {
     this.db.close();
+  }
+
+  private sanitizeChatMessage(message: ChatMessage): ChatMessage {
+    const validated = ChatMessageSchema.parse(message);
+    return {
+      ...validated,
+      content: redactSecrets(validated.content),
+      reasoning: validated.reasoning.map((block) => ({
+        ...block,
+        title: redactSecrets(block.title),
+        content: redactSecrets(block.content),
+      })),
+      toolCalls: validated.toolCalls.map((call) => ({
+        ...call,
+        label: redactSecrets(call.label),
+        error: call.error ? redactSecrets(call.error) : null,
+      })),
+    };
+  }
+
+  private mapChatThreadRow(row: ChatThreadRow): ChatThread {
+    return {
+      id: row.id,
+      title: row.title,
+      provider: row.provider,
+      model: row.model,
+      messageCount: Number(row.message_count ?? 0),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private mapChatMessageRow(row: ChatMessageRow): ChatMessage {
+    return {
+      id: row.id,
+      threadId: row.thread_id,
+      role: row.role,
+      content: row.content,
+      attachments: JSON.parse(row.attachments_json) as ChatAttachment[],
+      reasoning: JSON.parse(row.reasoning_json) as ChatReasoningBlock[],
+      toolCalls: JSON.parse(row.tool_calls_json) as ChatToolCall[],
+      planId: row.plan_id,
+      provider: row.provider,
+      model: row.model,
+      status: row.status,
+      createdAt: row.created_at,
+    };
+  }
+
+  private mapChatAttachmentRow(row: ChatAttachmentRow): StoredChatAttachmentRecord {
+    return {
+      id: row.id,
+      threadId: row.thread_id,
+      name: row.name,
+      mimeType: row.mime_type,
+      sizeBytes: row.size_bytes,
+      kind: row.kind,
+      textPreview: row.text_preview,
+      url: `/api/chat/attachments/${row.id}`,
+      createdAt: row.created_at,
+      storagePath: row.storage_path,
+      dataBase64: row.data_base64,
+    };
   }
 
   private mapAppRow(row: AppRow): AppRecord {

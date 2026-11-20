@@ -11,11 +11,13 @@ import {
   LLM_PROVIDER_CATALOG,
   type LlmProvider,
   type OnboardingState,
+  OPENCODE_ZEN_BASE_URL,
   type PersonaPreferences,
   SetupClaimRecordSchema,
   type SetupClaimRecord,
   type SystemMetrics,
   hashSetupCode,
+  isOpenCodeLocalServerUrl,
   normalizeSetupCode,
   redactSecrets,
   renderServerMemoryMarkdown,
@@ -46,6 +48,8 @@ export interface ProviderTestResult {
   model: string;
   latencyMs: number;
   message: string;
+  availableModels?: string[];
+  serverVersion?: string;
 }
 
 export interface HermesHealthStatus {
@@ -81,9 +85,39 @@ const ALLOWED_ENV_KEYS = new Set([
   "LLM_MODEL",
   "LLM_API_KEY",
   "LLM_BASE_URL",
+  "OPENCODE_API_KEY",
+  "OPENCODE_SERVER_PASSWORD",
   "TELEGRAM_BOT_TOKEN",
   "DISCORD_BOT_TOKEN",
 ]);
+
+/**
+ * Reads whitelisted onboarding environment key/value pairs from disk (server-side only).
+ * Never return the resulting map directly to clients.
+ */
+export function readOnboardingEnvValues(
+  envFilePath: string | undefined,
+): Record<string, string> {
+  if (!envFilePath || !fs.existsSync(envFilePath)) {
+    return {};
+  }
+  const values: Record<string, string> = {};
+  try {
+    const lines = fs.readFileSync(envFilePath, "utf8").split(/\r?\n/);
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx <= 0) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      if (!ALLOWED_ENV_KEYS.has(key)) continue;
+      values[key] = trimmed.slice(eqIdx + 1).trim();
+    }
+  } catch {
+    return {};
+  }
+  return values;
+}
 
 function signPayload(encodedPayload: string, secret: string): string {
   return crypto
@@ -522,6 +556,36 @@ export async function verifyDomainDns(
   };
 }
 
+function extractModelIdsFromPayload(payload: unknown): string[] {
+  if (!payload || typeof payload !== "object") return [];
+  const obj = payload as Record<string, unknown>;
+  const collected: string[] = [];
+
+  if (Array.isArray(obj.data)) {
+    for (const item of obj.data) {
+      if (item && typeof item === "object" && typeof (item as { id?: unknown }).id === "string") {
+        collected.push((item as { id: string }).id);
+      }
+    }
+  } else if (Array.isArray(obj.models)) {
+    for (const item of obj.models) {
+      if (typeof item === "string") {
+        collected.push(item);
+      } else if (item && typeof item === "object") {
+        const candidate =
+          typeof (item as { name?: unknown }).name === "string"
+            ? (item as { name: string }).name
+            : typeof (item as { id?: unknown }).id === "string"
+              ? (item as { id: string }).id
+              : null;
+        if (candidate) collected.push(candidate);
+      }
+    }
+  }
+
+  return Array.from(new Set(collected)).slice(0, 25);
+}
+
 export async function testLlmProviderConnection(
   input: ProviderTestInput,
 ): Promise<ProviderTestResult> {
@@ -551,18 +615,88 @@ export async function testLlmProviderConnection(
   }
 
   const trimmedKey = input.apiKey?.trim() ?? "";
-  if (entry?.requiresApiKey && !trimmedKey) {
+  const isOpenCodeGo =
+    input.provider === "opencode" &&
+    baseUrl.toLowerCase().includes("/zen/go");
+  if ((entry?.requiresApiKey || isOpenCodeGo) && !trimmedKey) {
     return {
       ok: false,
       provider: input.provider,
       model: input.model,
       latencyMs: 0,
-      message: `An API key is required for ${entry.label}.`,
+      message: isOpenCodeGo
+        ? "An OpenCode API key (from opencode.ai/auth) is required for OpenCode Go."
+        : `An API key is required for ${entry?.label ?? input.provider}.`,
     };
   }
 
   const started = Date.now();
   try {
+    if (input.provider === "opencode" && isOpenCodeLocalServerUrl(baseUrl)) {
+      const headers: Record<string, string> = {};
+      if (trimmedKey) {
+        headers.authorization = `Basic ${Buffer.from(`opencode:${trimmedKey}`, "utf8").toString("base64")}`;
+      }
+
+      const healthRes = await fetch(`${baseUrl}/global/health`, {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(6000),
+      });
+      const latencyMs = Date.now() - started;
+
+      if (healthRes.ok) {
+        let serverVersion: string | undefined;
+        try {
+          const healthJson = (await healthRes.json()) as {
+            healthy?: boolean;
+            version?: string;
+          };
+          if (typeof healthJson.version === "string" && healthJson.version.trim()) {
+            serverVersion = healthJson.version.trim();
+          }
+        } catch {
+          // non-JSON health response still ok
+        }
+
+        let availableModels: string[] | undefined;
+        try {
+          const modelsRes = await fetch(`${baseUrl}/models`, {
+            method: "GET",
+            headers,
+            signal: AbortSignal.timeout(3000),
+          });
+          if (modelsRes.ok) {
+            const discovered = extractModelIdsFromPayload(await modelsRes.json());
+            if (discovered.length > 0) availableModels = discovered;
+          }
+        } catch {
+          // optional model discovery
+        }
+
+        return {
+          ok: true,
+          provider: input.provider,
+          model: input.model,
+          latencyMs,
+          ...(serverVersion ? { serverVersion } : {}),
+          ...(availableModels ? { availableModels } : {}),
+          message: `Connected to OpenCode Server${serverVersion ? ` v${serverVersion}` : ""} (${input.model}) in ${latencyMs}ms.`,
+        };
+      }
+
+      if (healthRes.status !== 404) {
+        return {
+          ok: false,
+          provider: input.provider,
+          model: input.model,
+          latencyMs,
+          message: `OpenCode Server returned HTTP ${healthRes.status}. Verify OPENCODE_SERVER_PASSWORD or that \`opencode serve\` is reachable.`,
+        };
+      }
+      // Fall through to OpenAI-compatible /models probe if endpoint returned 404 on /global/health
+    }
+
     let targetUrl = `${baseUrl}/models`;
     const headers: Record<string, string> = {};
 
@@ -571,6 +705,8 @@ export async function testLlmProviderConnection(
     } else if (input.provider === "anthropic") {
       headers["x-api-key"] = trimmedKey;
       headers["anthropic-version"] = "2023-06-01";
+    } else if (input.provider === "opencode") {
+      headers.authorization = `Bearer ${trimmedKey || "public"}`;
     } else {
       headers.authorization = `Bearer ${trimmedKey}`;
     }
@@ -592,12 +728,25 @@ export async function testLlmProviderConnection(
       };
     }
 
+    let availableModels: string[] | undefined;
+    try {
+      const discovered = extractModelIdsFromPayload(await res.json());
+      if (discovered.length > 0) {
+        availableModels = discovered;
+      }
+    } catch {
+      // Ignore non-JSON bodies
+    }
+
     return {
       ok: true,
       provider: input.provider,
       model: input.model,
       latencyMs,
-      message: `Connected to ${entry?.label ?? input.provider} (${input.model}) in ${latencyMs}ms.`,
+      ...(availableModels ? { availableModels } : {}),
+      message: `Connected to ${entry?.label ?? input.provider} (${input.model}) in ${latencyMs}ms.${
+        availableModels ? ` Found ${availableModels.length} models.` : ""
+      }`,
     };
   } catch (err) {
     const latencyMs = Date.now() - started;
@@ -781,7 +930,11 @@ export function seedInitialOnboardingStateFromEnv(
   const rawPublicIp = env.VPS_OS_PUBLIC_IP?.trim();
   const rawProvider = env.LLM_PROVIDER?.trim();
   const rawModel = env.LLM_MODEL?.trim();
-  const rawKey = env.LLM_API_KEY?.trim();
+  const rawBaseUrl = env.LLM_BASE_URL?.trim();
+  const rawKey =
+    env.LLM_API_KEY?.trim() ||
+    env.OPENCODE_API_KEY?.trim() ||
+    env.OPENCODE_SERVER_PASSWORD?.trim();
 
   if (
     rawDomain &&
@@ -800,12 +953,29 @@ export function seedInitialOnboardingStateFromEnv(
   }
 
   const validProvider = LLM_PROVIDER_CATALOG.find((p) => p.id === rawProvider)?.id;
+  const hasRealKey = Boolean(rawKey && !rawKey.startsWith("replace-with-"));
+  const isOpenCodeLocal =
+    validProvider === "opencode" &&
+    Boolean(rawBaseUrl && isOpenCodeLocalServerUrl(rawBaseUrl));
   if (
     validProvider &&
-    ((rawKey && !rawKey.startsWith("replace-with-")) || validProvider === "ollama")
+    (hasRealKey || validProvider === "ollama" || isOpenCodeLocal)
   ) {
     patch.llmProvider = validProvider;
-    patch.llmModel = rawModel || LLM_PROVIDER_CATALOG.find((p) => p.id === validProvider)?.defaultModel || null;
+    patch.llmModel =
+      rawModel ||
+      LLM_PROVIDER_CATALOG.find((p) => p.id === validProvider)?.defaultModel ||
+      null;
+    if (rawBaseUrl) {
+      try {
+        patch.llmBaseUrl = validateHttpBaseUrl(rawBaseUrl);
+      } catch {
+        patch.llmBaseUrl =
+          validProvider === "opencode" ? OPENCODE_ZEN_BASE_URL : null;
+      }
+    } else if (validProvider === "opencode") {
+      patch.llmBaseUrl = OPENCODE_ZEN_BASE_URL;
+    }
     patch.llmConfigured = true;
   }
 

@@ -81,22 +81,31 @@ export function OnboardingWizard({
   const [dnsCheck, setDnsCheck] = useState<DnsCheckView | null>(null);
 
   // Step 2: AI Provider
-  const defaultProvider: LlmProviderId = state.llmProvider ?? "openai";
+  const defaultProvider: LlmProviderId = state.llmProvider ?? "opencode";
   const initialCatalog =
     providerCatalog.find((item) => item.id === defaultProvider) ?? providerCatalog[0];
   const [provider, setProvider] = useState<LlmProviderId>(defaultProvider);
   const [model, setModel] = useState(
-    state.llmModel ?? initialCatalog?.defaultModel ?? "gpt-4.1",
+    state.llmModel ?? initialCatalog?.defaultModel ?? "claude-sonnet-4-5",
   );
   const [apiKey, setApiKey] = useState("");
-  const [baseUrl, setBaseUrl] = useState(state.llmBaseUrl ?? "");
+  const [baseUrl, setBaseUrl] = useState(
+    state.llmBaseUrl ??
+      (defaultProvider === "opencode" || defaultProvider === "ollama"
+        ? initialCatalog?.defaultBaseUrl ?? ""
+        : ""),
+  );
   const [showAdvancedUrl, setShowAdvancedUrl] = useState(
-    Boolean(state.llmBaseUrl) || defaultProvider === "ollama",
+    Boolean(state.llmBaseUrl) ||
+      defaultProvider === "ollama" ||
+      defaultProvider === "opencode",
   );
   const [providerTestResult, setProviderTestResult] = useState<{
     ok: boolean;
     message: string;
+    availableModels?: string[];
   } | null>(null);
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
 
   // Step 3: Security, Persona & Channels
   const [passphrase, setPassphrase] = useState("");
@@ -119,13 +128,20 @@ export function OnboardingWizard({
   const activeCatalog =
     providerCatalog.find((item) => item.id === provider) ?? providerCatalog[0];
 
+  const activePreset = activeCatalog?.endpointPresets?.find(
+    (preset) =>
+      preset.baseUrl.replace(/\/+$/, "").toLowerCase() ===
+      (baseUrl.trim() || activeCatalog.defaultBaseUrl).replace(/\/+$/, "").toLowerCase(),
+  );
+
   function selectProvider(nextProvider: LlmProviderId) {
     setProvider(nextProvider);
     setProviderTestResult(null);
+    setDiscoveredModels([]);
     const catalog = providerCatalog.find((item) => item.id === nextProvider);
     if (catalog) {
       setModel(catalog.defaultModel);
-      if (nextProvider === "ollama") {
+      if (nextProvider === "ollama" || nextProvider === "opencode") {
         setBaseUrl(catalog.defaultBaseUrl);
         setShowAdvancedUrl(true);
       } else {
@@ -254,9 +270,12 @@ export function OnboardingWizard({
         throw new Error(await extractError(res));
       }
       const data = (await res.json()) as {
-        result: { ok: boolean; message: string };
+        result: { ok: boolean; message: string; availableModels?: string[] };
       };
       setProviderTestResult(data.result);
+      if (data.result.availableModels && data.result.availableModels.length > 0) {
+        setDiscoveredModels(data.result.availableModels);
+      }
     } catch (err) {
       setProviderTestResult({
         ok: false,
@@ -632,6 +651,8 @@ export function OnboardingWizard({
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {providerCatalog.map((entry) => {
                 const selected = entry.id === provider;
+                const badgeText =
+                  entry.badge ?? (!entry.requiresApiKey ? "Local" : undefined);
                 return (
                   <button
                     key={entry.id}
@@ -639,7 +660,7 @@ export function OnboardingWizard({
                     onClick={() => selectProvider(entry.id)}
                     className={`rounded-xl border p-3.5 text-left transition ${
                       selected
-                        ? "border-sky-500 bg-sky-500/10"
+                        ? "border-sky-500 bg-sky-500/10 shadow-[0_0_0_1px_rgba(14,165,233,0.25)]"
                         : "border-slate-800 bg-slate-950/60 hover:border-slate-700"
                     }`}
                   >
@@ -647,13 +668,19 @@ export function OnboardingWizard({
                       <span className="text-sm font-medium text-slate-100">
                         {entry.label}
                       </span>
-                      {!entry.requiresApiKey && (
-                        <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-300">
-                          Local
+                      {badgeText && (
+                        <span
+                          className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                            entry.id === "opencode"
+                              ? "bg-sky-500/20 text-sky-300"
+                              : "bg-emerald-500/15 text-emerald-300"
+                          }`}
+                        >
+                          {badgeText}
                         </span>
                       )}
                     </div>
-                    <p className="mt-1 text-[11px] text-slate-400">
+                    <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
                       {entry.description}
                     </p>
                   </button>
@@ -662,6 +689,47 @@ export function OnboardingWizard({
             </div>
 
             <div className="space-y-4 rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+              {activeCatalog?.endpointPresets && activeCatalog.endpointPresets.length > 0 && (
+                <div>
+                  <p className="text-xs font-medium text-slate-300">
+                    {activeCatalog.label} Connection Mode
+                  </p>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                    {activeCatalog.endpointPresets.map((preset) => {
+                      const presetSelected = activePreset?.id === preset.id;
+                      return (
+                        <button
+                          key={preset.id}
+                          type="button"
+                          onClick={() => {
+                            setBaseUrl(preset.baseUrl);
+                            setProviderTestResult(null);
+                            setDiscoveredModels([]);
+                          }}
+                          className={`rounded-lg border p-2.5 text-left transition ${
+                            presetSelected
+                              ? "border-sky-500/70 bg-sky-500/10 text-slate-100"
+                              : "border-slate-800 bg-slate-950/70 text-slate-300 hover:border-slate-700"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span className="text-xs font-medium">{preset.label}</span>
+                            {!preset.requiresApiKey && (
+                              <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] text-emerald-300">
+                                Optional key
+                              </span>
+                            )}
+                          </div>
+                          <p className="mt-1 text-[10.5px] leading-snug text-slate-400">
+                            {preset.description}
+                          </p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               <div className="grid gap-4 sm:grid-cols-2">
                 <div>
                   <label
@@ -679,12 +747,15 @@ export function OnboardingWizard({
                   />
                   {activeCatalog && (
                     <div className="mt-2 flex flex-wrap gap-1.5">
-                      {activeCatalog.suggestedModels.map((suggested) => (
+                      {(discoveredModels.length > 0
+                        ? discoveredModels.slice(0, 10)
+                        : activeCatalog.suggestedModels
+                      ).map((suggested) => (
                         <button
                           key={suggested}
                           type="button"
                           onClick={() => setModel(suggested)}
-                          className={`rounded px-2 py-0.5 text-[11px] ${
+                          className={`rounded px-2 py-0.5 font-mono text-[11px] ${
                             model === suggested
                               ? "bg-sky-600 text-white"
                               : "bg-slate-800 text-slate-300 hover:bg-slate-700"
@@ -697,39 +768,7 @@ export function OnboardingWizard({
                   )}
                 </div>
 
-                {activeCatalog?.requiresApiKey ? (
-                  <div>
-                    <div className="flex items-center justify-between">
-                      <label
-                        htmlFor="wizard-api-key"
-                        className="block text-xs font-medium text-slate-300"
-                      >
-                        API Key
-                      </label>
-                      {state.llmConfigured && state.llmProvider === provider && (
-                        <span className="text-[11px] text-emerald-300">
-                          Key saved securely on server
-                        </span>
-                      )}
-                    </div>
-                    <input
-                      id="wizard-api-key"
-                      type="password"
-                      autoComplete="off"
-                      value={apiKey}
-                      onChange={(e) => setApiKey(e.target.value)}
-                      placeholder={
-                        state.llmConfigured && state.llmProvider === provider
-                          ? "Leave blank to keep existing key"
-                          : activeCatalog.keyPlaceholder
-                      }
-                      className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
-                    />
-                    <p className="mt-1.5 text-[11px] text-slate-500">
-                      Stored with chmod 0600 on the server. Never sent back to the browser.
-                    </p>
-                  </div>
-                ) : (
+                {provider === "ollama" ? (
                   <div>
                     <label
                       htmlFor="wizard-ollama-url"
@@ -746,10 +785,47 @@ export function OnboardingWizard({
                       className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-500 focus:outline-none"
                     />
                   </div>
+                ) : (
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <label
+                        htmlFor="wizard-api-key"
+                        className="block text-xs font-medium text-slate-300"
+                      >
+                        {activePreset?.keyLabel ??
+                          (provider === "opencode"
+                            ? "OpenCode API Key / Password"
+                            : "API Key")}
+                      </label>
+                      {state.llmConfigured && state.llmProvider === provider && (
+                        <span className="text-[11px] text-emerald-300">
+                          Key saved securely on server
+                        </span>
+                      )}
+                    </div>
+                    <input
+                      id="wizard-api-key"
+                      type="password"
+                      autoComplete="off"
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      placeholder={
+                        state.llmConfigured && state.llmProvider === provider
+                          ? "Leave blank to keep existing key"
+                          : (activePreset?.keyPlaceholder ??
+                            activeCatalog?.keyPlaceholder ??
+                            "Enter API key")
+                      }
+                      className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
+                    />
+                    <p className="mt-1.5 text-[11px] text-slate-500">
+                      Stored with chmod 0600 on the server. Never sent back to the browser.
+                    </p>
+                  </div>
                 )}
               </div>
 
-              {activeCatalog?.requiresApiKey && (
+              {provider !== "ollama" && (
                 <div>
                   <button
                     type="button"
@@ -757,7 +833,7 @@ export function OnboardingWizard({
                     className="text-[11px] text-slate-400 underline hover:text-slate-200"
                   >
                     {showAdvancedUrl
-                      ? "Hide custom endpoint URL"
+                      ? "Hide endpoint URL"
                       : "Optional: use custom OpenAI-compatible endpoint URL"}
                   </button>
                   {showAdvancedUrl && (
@@ -765,12 +841,18 @@ export function OnboardingWizard({
                       type="url"
                       value={baseUrl}
                       onChange={(e) => setBaseUrl(e.target.value)}
-                      placeholder={activeCatalog.defaultBaseUrl}
-                      aria-label="Custom endpoint URL"
+                      placeholder={activeCatalog?.defaultBaseUrl}
+                      aria-label="Provider endpoint URL"
                       className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-500 focus:outline-none"
                     />
                   )}
                 </div>
+              )}
+
+              {activeCatalog?.setupHint && (
+                <p className="rounded-lg border border-slate-800/80 bg-slate-900/60 px-3 py-2 text-[11px] text-slate-400">
+                  {activeCatalog.setupHint}
+                </p>
               )}
 
               {providerTestResult && (

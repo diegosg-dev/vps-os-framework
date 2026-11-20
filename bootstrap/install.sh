@@ -46,7 +46,7 @@ VPS OS Framework — Ubuntu LTS Bootstrapper
 Options:
   --domain <host>         Public dashboard domain (e.g. os.yourdomain.com)
   --email <email>         ACME/Let's Encrypt notification email
-  --llm-provider <name>   Pre-configure LLM provider (openai|anthropic|openrouter|nous|ollama)
+  --llm-provider <name>   Pre-configure LLM provider (opencode|openai|anthropic|openrouter|nous|ollama)
   --llm-model <model>     Pre-configure LLM model identifier
   --llm-key <key>         Pre-configure LLM API key
   --rotate-setup-code     Generate a fresh single-use browser setup pairing code
@@ -632,10 +632,10 @@ EOF
     systemctl enable vps-os-hermes-cto.service
   fi
 
-  # Start gateway automatically once an LLM API key (or local Ollama) is configured.
+  # Start gateway automatically once an LLM API key (or local Ollama/OpenCode) is configured.
   # shellcheck source=/dev/null
   source "${VPS_OS_ROOT}/.env"
-  if [[ "${LLM_PROVIDER:-}" == "ollama" ]] || { [[ -n "${LLM_API_KEY:-}" ]] && [[ "${LLM_API_KEY}" != replace-with-* ]]; }; then
+  if [[ "${LLM_PROVIDER:-}" == "ollama" || "${LLM_PROVIDER:-}" == "opencode" ]] || { [[ -n "${LLM_API_KEY:-}" ]] && [[ "${LLM_API_KEY}" != replace-with-* ]]; }; then
     systemctl restart vps-os-hermes-cto.service
     log "Hermes CTO gateway is running on 127.0.0.1:8642."
   else

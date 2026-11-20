@@ -19,7 +19,7 @@ log() {
 
 is_allowed_key() {
   case "$1" in
-    VPS_OS_DOMAIN|VPS_OS_SITE_ADDRESS|VPS_OS_ACME_EMAIL|VPS_OS_PUBLIC_IP|LLM_PROVIDER|LLM_MODEL|LLM_API_KEY|LLM_BASE_URL|TELEGRAM_BOT_TOKEN|DISCORD_BOT_TOKEN)
+    VPS_OS_DOMAIN|VPS_OS_SITE_ADDRESS|VPS_OS_ACME_EMAIL|VPS_OS_PUBLIC_IP|LLM_PROVIDER|LLM_MODEL|LLM_API_KEY|LLM_BASE_URL|OPENCODE_API_KEY|OPENCODE_SERVER_PASSWORD|TELEGRAM_BOT_TOKEN|DISCORD_BOT_TOKEN)
       return 0
       ;;
     *)
@@ -183,7 +183,7 @@ main() {
     local llm_key llm_provider
     llm_key="$(read_env_value "LLM_API_KEY" "${MAIN_ENV}")"
     llm_provider="$(read_env_value "LLM_PROVIDER" "${MAIN_ENV}")"
-    if [[ "${llm_provider}" == "ollama" ]] || { [[ -n "${llm_key}" ]] && [[ "${llm_key}" != replace-with-* ]]; }; then
+    if [[ "${llm_provider}" == "ollama" || "${llm_provider}" == "opencode" ]] || { [[ -n "${llm_key}" ]] && [[ "${llm_key}" != replace-with-* ]]; }; then
       if systemctl restart vps-os-hermes-cto.service >/dev/null 2>&1; then
         hermes_restarted="true"
       fi
