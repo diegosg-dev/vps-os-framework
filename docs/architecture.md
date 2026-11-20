@@ -1,6 +1,6 @@
 # Architecture Overview & Detailed Model Breakdown
 
-The **VPS OS Framework** turns a standard Ubuntu Linux VPS into a plug-and-play, non-Linux-style server operating environment for non-coding and non-Linux users. Every component is designed around two core pillars—an **Auto-Provisioned Management Dashboard** and an **Autonomous AI Agent (CTO / Sysadmin / Dev)**—backed by strict folder and container isolation.
+The **VPS OS Framework** turns a standard Ubuntu Linux VPS into a plug-and-play, non-Linux-style server operating environment for non-coding and non-Linux users. Every component is designed around two core pillars—an **Auto-Provisioned Management Dashboard** and an **Autonomous AI Agent (CTO / Sysadmin / Dev)**—backed by strict folder and container isolation without ever exposing `/var/run/docker.sock` to containers.
 
 > **Interactive FigJam Board:** [VPS OS Framework — Architecture & Detailed Model Breakdown](https://www.figma.com/board/ZjpthWRSjpjHnu490klMjP)
 
@@ -20,51 +20,51 @@ The **VPS OS Framework** turns a standard Ubuntu Linux VPS into a plug-and-play,
 
 ```mermaid
 flowchart LR
-    subgraph client ["Non-Linux User Entry"]
-        browserUi["Management Web UI"]
-        chatInterface["Natural-Language CTO Chat"]
+    subgraph client ["Non-Linux User Entry (Steps 1–2)"]
+        browserUi["1. Management Web UI<br/>(dashboard/web)"]
+        chatInterface["2. Natural-Language CTO Chat<br/>(dashboard/web + Hermes)"]
     end
-    subgraph gateway ["Ingress & TLS"]
-        reverseProxy["Auto-TLS Reverse Proxy"]
+    subgraph gateway ["Ingress & TLS (Step 3)"]
+        reverseProxy["3. Caddy 2 Auto-TLS Reverse Proxy<br/>(bootstrap/Caddyfile)"]
     end
-    subgraph service ["VPS OS Core & Isolated Workloads"]
-        dashboardApi["Dashboard Control API (dashboard/)"]
-        aiOrchestrator["Autonomous AI Agent (agent/)"]
-        subagentRuntime["Isolated Subagent Runtime"]
-        appContainers["Isolated App Containers (apps/)"]
+    subgraph service ["VPS OS Core & Isolated Workloads (Steps 4–7)"]
+        dashboardApi["4. Dashboard Control API<br/>(dashboard/api :3001)"]
+        aiOrchestrator["5. Autonomous AI Agent & Hermes CTO<br/>(agent/ + systemd :8642)"]
+        subagentRuntime["6. Isolated Subagent Runtime<br/>(agent/src/subagent-runtime.ts)"]
+        appContainers["7. Isolated App Containers<br/>(/apps/&lt;slug&gt; via templates/)"]
     end
-    subgraph datastore ["State & Isolation Storage"]
-        systemState["System & App Registry"]
-        scopedVolumes["Per-App Volumes & .env Secrets"]
+    subgraph datastore ["State & Isolation Storage (Steps 8–9)"]
+        systemState["8. SQLite WAL Registry<br/>(/vps-os/data/registry.db)"]
+        scopedVolumes["9. Per-App Volumes & .env Secrets<br/>(./data, ./workspace, 0600 .env)"]
     end
-    subgraph external ["Host & External APIs"]
-        ubuntuHost["Ubuntu Linux VPS Host"]
-        llmProvider["LLM Provider API"]
+    subgraph external ["Host Substrate & External APIs (Steps 10–11)"]
+        runtimeBridge["Host Runtime Bridge<br/>(bootstrap/runtime-bridge.py · runtime.sock)"]
+        ubuntuHost["10. Ubuntu Linux VPS Host<br/>(Docker Engine + UFW + systemd)"]
+        llmProvider["11. LLM Provider API<br/>(OpenAI / Anthropic / OpenRouter / Nous / Ollama)"]
     end
 
     browserUi -->|"HTTPS"| reverseProxy
-    chatInterface <-->|"Real-time Stream"| reverseProxy
-    reverseProxy -->|"Routes UI & API"| dashboardApi
-    reverseProxy -->|"Routes Chat"| aiOrchestrator
-    reverseProxy -->|"Routes Apps"| appContainers
-    dashboardApi -->|"Triggers Tasks"| aiOrchestrator
-    aiOrchestrator -->|"Spawns Isolated"| subagentRuntime
-    aiOrchestrator -->|"Deploys & Manages"| appContainers
-    subagentRuntime -->|"Installs App"| appContainers
-    dashboardApi -->|"Reads Health & Status"| systemState
-    aiOrchestrator -->|"Updates Registry"| systemState
+    chatInterface <-->|"HTTPS / Plan Approvals"| reverseProxy
+    reverseProxy -->|"Routes UI & /api/*"| dashboardApi
+    reverseProxy -->|"Routes App Domains (apps.d/*.caddy)"| appContainers
+    dashboardApi -->|"Plan & Execute (:3002)"| aiOrchestrator
+    aiOrchestrator -->|"Provisions Scoped Folder"| subagentRuntime
+    subagentRuntime -->|"Renders Compose & .env"| scopedVolumes
+    dashboardApi -->|"Reads & Records State"| systemState
+    aiOrchestrator -->|"Updates Plans, Apps & Audit"| systemState
     appContainers -->|"Mounts Scoped"| scopedVolumes
-    subagentRuntime -->|"Writes Isolated"| scopedVolumes
-    dashboardApi -.->|"Ubuntu: Metrics & Docker Stats"| ubuntuHost
-    aiOrchestrator -.->|"LLM: Reasoning & Planning"| llmProvider
-    aiOrchestrator -.->|"Ubuntu: Provisioning & Docker"| ubuntuHost
+    dashboardApi -->|"Unix Socket (0660)"| runtimeBridge
+    aiOrchestrator -->|"Unix Socket (0660)"| runtimeBridge
+    runtimeBridge -->|"Validated Compose & Caddy Reload"| ubuntuHost
+    ubuntuHost -->|"Hosts"| appContainers
+    aiOrchestrator -.->|"LLM Reasoning & Connectivity Test"| llmProvider
 ```
 
 ---
 
 ## Step-by-Step Component Reference
 
-Every numbered badge (`1`–`11`) in the diagram above—along with Step `0` (Bootstrap) and Gate `V` (Verification)—is broken down into five parts: **Role & Purpose**, **Inputs & Triggers**, **Internal Parts & Mechanics**, **Outputs & Downstream Effects**, and **Safety & Stack Status**.
+Every numbered badge (`1`–`11`) in the diagram above—along with Step `0` (Bootstrap) and Gate `V` (Verification)—is broken down into five parts: **Role & Purpose**, **Inputs & Triggers**, **Internal Parts & Mechanics**, **Outputs & Downstream Effects**, and **Safety & Implementation**.
 
 ---
 
@@ -72,163 +72,163 @@ Every numbered badge (`1`–`11`) in the diagram above—along with Step `0` (Bo
 
 #### `0` — Plug-and-Play Bootstrapper (`bootstrap/`)
 
-- **0A. Role & Purpose:** Idempotent Ubuntu setup pipeline that turns a bare Linux VPS into a running VPS OS appliance with zero manual configuration.
-- **0B. Inputs & Triggers:** Fresh Ubuntu LTS VPS target, initial domain/admin configuration, and one-line installer invocation.
+- **0A. Role & Purpose:** Idempotent Ubuntu LTS setup pipeline that turns a bare Linux VPS into a running VPS OS appliance with zero manual configuration.
+- **0B. Inputs & Triggers:** Fresh Ubuntu 22.04/24.04 LTS VPS target, optional CLI flags (`--domain`, `--email`, `--llm-provider`, `--non-interactive`, `--rotate-setup-code`, `--force`), and one-line installer invocation.
 - **0C. Internal Parts & Mechanics:**
-  - Host Firewall & SSH Hardening
-  - Docker Engine & Isolated Bridge Network Setup
-  - Initial bring-up of Reverse Proxy (`3`), Dashboard (`4`), and AI Agent (`5`)
-- **0D. Outputs & Downstream Effects:** Produces a healthy, HTTPS-accessible Management Web UI (`1`) and Autonomous AI Agent (`5`) ready for first login.
-- **0E. Safety & Stack Status:** Shell scripts must pass `bash -n` and `shellcheck` before release. Never commits or hardcodes real credentials.
+  - SSH key-guarded hardening (`99-vps-os-hardening.conf` only when authorized SSH keys exist) & `ufw` firewall (`SSH`, `80/tcp`, `443/tcp`)
+  - Docker Engine + Compose v2 & Python 3 installation + isolated `vps-os-core` bridge network
+  - Secret generation (`VPS_OS_ADMIN_TOKEN`, `VPS_OS_RUNTIME_TOKEN`, `HERMES_API_SERVER_KEY`) and single-use SHA-256 setup pairing code (`/vps-os/data/setup-claim.json`)
+  - Bring-up of `vps-os-runtime.service`, core Docker stack (`caddy`, `dashboard-api`, `agent`), `vps-os-hermes-cto.service`, and `vps-os-onboarding-apply.path`
+- **0D. Outputs & Downstream Effects:** Produces a healthy Management Web UI (`1`) with a one-click `#claim=` setup URL and an Autonomous AI Agent (`5`) ready for onboarding.
+- **0E. Safety & Implementation:** Implemented in [`bootstrap/install.sh`](../bootstrap/install.sh) and [`bootstrap/apply-onboarding.sh`](../bootstrap/apply-onboarding.sh); validated with `bash -n` and LF line-ending guardrails in `tests/`.
 
 #### `V` — Verification & Guardrails (`tests/`)
 
-- **VA. Role & Purpose:** Automated test harness verifying provisioning scripts, Docker Compose templates, dashboard APIs, and agent isolation boundaries.
-- **VB. Inputs & Triggers:** Code changes in `bootstrap/`, `dashboard/`, `agent/`, or `apps/` templates before any feature branch merges.
+- **VA. Role & Purpose:** Automated test suite verifying provisioning scripts, Docker Compose templates, Host Runtime Bridge isolation, Dashboard Control APIs, onboarding flows, and agent boundaries.
+- **VB. Inputs & Triggers:** `corepack pnpm verify` (`build && typecheck && test`) run before any branch merges.
 - **VC. Internal Parts & Mechanics:**
-  - Shell Syntax & Linter Checks (`bash -n`, `shellcheck`)
-  - Compose Validation (`docker compose config`)
-  - Sandbox VM / Container Provisioning Integration Tests
-- **VD. Outputs & Downstream Effects:** Pass/fail verification gates ensuring host safety and zero broken templates reach end users.
-- **VE. Safety & Stack Status:** Enforces strict boundaries: zero secret leaks, no destructive host tests outside isolated VMs or containers.
+  - TypeScript build & strict `tsc --noEmit` checks across all workspace packages
+  - Node built-in test runner (`tests/src/*.test.ts`) covering safety guards, SQLite registry, Control API auth/rate-limiting, onboarding claim lockouts, Hermes pack limits, and `runtime-bridge.py` TOCTOU/Compose policies
+  - Shell syntax (`bash -n`), Python AST validation, and LF line-ending assertions
+- **VD. Outputs & Downstream Effects:** Pass/fail verification gates ensuring host safety and zero broken templates or security regressions.
+- **VE. Safety & Implementation:** Implemented in [`tests/src/`](../tests/src/); all tests run in isolated temp directories or loopback mocks with zero destructive host side effects.
 
 ---
 
 ### Step 1: Non-Linux User Entry Plane
 
-#### `1` — Management Web UI (`dashboard/` frontend)
+#### `1` — Management Web UI (`dashboard/web/`)
 
-- **1A. Role & Purpose:** Auto-provisioned web control panel giving non-coding users a visual OS-like overview of server health, running apps, domains, and logs.
-- **1B. Inputs & Triggers:** User clicks, form actions, and dashboard navigation routed over HTTPS through the Auto-TLS Reverse Proxy (`3`).
+- **1A. Role & Purpose:** Auto-provisioned web control panel giving non-coding users a visual OS-like overview of onboarding, server health, running apps, domains, logs, and audit history.
+- **1B. Inputs & Triggers:** Browser requests routed over HTTPS (or initial `:80` setup mode) through Caddy (`3`), plus `#claim=` one-click pairing URLs.
 - **1C. Internal Parts & Mechanics:**
-  - Live Telemetry Cards (CPU, RAM, disk, uptime)
-  - App Store & Installed Apps Grid (start, stop, restart, logs)
-  - Domain, TLS Certificate & Secrets Vault Panels
-- **1D. Outputs & Downstream Effects:** Sends authenticated REST/RPC commands to the Dashboard Control API (`4`) and receives live status streams.
-- **1E. Safety & Stack Status:** Never exposes raw shell access or plaintext `.env` secrets in browser responses. Frontend framework remains greenfield until explicitly confirmed.
+  - `AuthGate.tsx`: One-time Setup Code claim, Admin Passphrase login, or `VPS_OS_ADMIN_TOKEN` unlock
+  - `OnboardingWizard.tsx`: 5-step guided setup (`Domain & HTTPS`, `AI CTO Brain`, `Security & CTO`, `Baseline Scan`, `Launch`)
+  - `App.tsx`: Live telemetry cards (CPU, load, RAM, disk, uptime), Installed Workloads grid (`Start`, `Stop`, `Restart`, `View Logs`), Audit timeline, and CTO Plan preview/approval cards
+- **1D. Outputs & Downstream Effects:** Sends authenticated `Bearer` REST requests to the Dashboard Control API (`4`).
+- **1E. Safety & Implementation:** Built with **React 19 + Vite + Tailwind CSS v4** (`dashboard/web/`), served with a strict `Content-Security-Policy` and `X-Frame-Options: DENY`.
 
-#### `2` — Natural-Language CTO Chat (`dashboard/` + `agent/` UI)
+#### `2` — Natural-Language CTO Chat (`dashboard/web/` + `agent/`)
 
-- **2A. Role & Purpose:** Conversational interface where users ask for new apps, troubleshooting, or server changes in plain English instead of writing Linux commands.
-- **2B. Inputs & Triggers:** User prompts, approval confirmations, and real-time bidirectional streaming updates over WebSocket / SSE.
+- **2A. Role & Purpose:** Conversational interface where users request new apps, personal agents, lifecycle actions, or diagnostics in plain English instead of writing Linux commands.
+- **2B. Inputs & Triggers:** User goals submitted in the CTO Plan console (`POST /api/chat/plan`), interactive plan approvals (`POST /api/chat/approve`), and Hermes Gateway sessions (`127.0.0.1:8642`).
 - **2C. Internal Parts & Mechanics:**
-  - Intent & Plan Preview Cards (shows proposed steps before execution)
-  - Streaming Progress & Log Timeline
-  - Interactive Approval Gate for high-impact actions
-- **2D. Outputs & Downstream Effects:** Dispatches structured conversational requests through the reverse proxy (`3`) directly to the Autonomous AI Agent (`5`).
-- **2E. Safety & Stack Status:** Requires explicit user confirmation before destructive or host-level operations. Protocol and UI library remain stack-agnostic.
+  - Intent & Risk Plan Preview Cards showing every planned step before mutation (`ExecutionPlan`)
+  - One-way Approval Gate (`pending` -> `approved` / `rejected`) and execution trigger (`POST /api/chat/execute`)
+  - Plain-English execution summaries with redacted logs and audit trail records
+- **2D. Outputs & Downstream Effects:** Dispatches structured goals and approved plans through the Control API (`4`) to the Autonomous AI Agent (`5`).
+- **2E. Safety & Implementation:** Fail-closed risk classification (`agent/src/planner.ts`); ambiguous or destructive host requests route to `manual_review` and are blocked from automated execution.
 
 ---
 
 ### Step 2: Ingress & TLS
 
-#### `3` — Auto-TLS Reverse Proxy (`bootstrap/` + infra)
+#### `3` — Auto-TLS Reverse Proxy (`bootstrap/Caddyfile`)
 
-- **3A. Role & Purpose:** Terminates HTTPS/TLS automatically and routes external traffic to the dashboard, agent stream, or isolated user apps by hostname or path.
-- **3B. Inputs & Triggers:** Public HTTPS requests (Web UI), WebSocket streams (CTO Chat), and custom domain traffic for deployed apps.
+- **3A. Role & Purpose:** Terminates HTTPS/TLS automatically and routes external traffic to the dashboard or isolated user web apps by hostname.
+- **3B. Inputs & Triggers:** Public HTTP/HTTPS requests (`80`/`443`) and dynamic per-app `.caddy` files written by `vps-os-runtime` under `/vps-os/caddy/apps.d/*.caddy`.
 - **3C. Internal Parts & Mechanics:**
-  - Automatic ACME / Let's Encrypt TLS Provisioner
-  - Dynamic Route Table (updates as apps are added or removed)
-  - Auth & Rate-Limit Middleware
-- **3D. Outputs & Downstream Effects:** Forwards validated requests internally to Dashboard Control API (`4`), Autonomous AI Agent (`5`), or specific Isolated App Containers (`7`).
-- **3E. Safety & Stack Status:** Never exposes internal container ports or data stores directly to the public internet. Proxy engine (e.g., Caddy, Traefik, Nginx) is undecided.
+  - Automatic ACME / Let's Encrypt TLS provisioning (`VPS_OS_ACME_EMAIL`) and `zstd`/`gzip` compression
+  - Primary site block (`{$VPS_OS_SITE_ADDRESS:localhost}`) proxying `/` and `/api/*` to `dashboard-api:3001`
+  - Dynamic import of `/etc/caddy/apps.d/*.caddy` validated via `caddy validate` before every `caddy reload`
+- **3D. Outputs & Downstream Effects:** Forwards validated requests internally to Dashboard Control API (`4`) or connected `vps-os-app-<slug>` containers (`7`).
+- **3E. Safety & Implementation:** Implemented with **Caddy 2 (`caddy:2-alpine`)** dropping all capabilities except `NET_BIND_SERVICE`. Never proxies `/agent/*` or `127.0.0.1:8642` publicly.
 
 ---
 
 ### Step 3: VPS OS Core & Isolated Workloads
 
-#### `4` — Dashboard Control API (`dashboard/` backend)
+#### `4` — Dashboard Control API (`dashboard/api/`)
 
-- **4A. Role & Purpose:** Backend API powering the Management Web UI (`1`). Translates UI clicks into safe, audited server reads and lifecycle operations.
-- **4B. Inputs & Triggers:** Authenticated HTTP requests from the Management Web UI (`1`) via the Auto-TLS Reverse Proxy (`3`).
+- **4A. Role & Purpose:** Backend API powering the Management Web UI (`1`). Translates UI actions into authenticated, rate-limited telemetry reads, onboarding updates, plan approvals, and runtime bridge commands.
+- **4B. Inputs & Triggers:** Authenticated HTTP requests from the Management Web UI (`1`) via Caddy (`3`).
 - **4C. Internal Parts & Mechanics:**
-  - Telemetry Collector (reads host CPU, RAM, disk, Docker stats)
-  - Lifecycle Controller (start, stop, restart, log tailing)
-  - Task Bridge (delegates complex requests to the AI Agent)
-- **4D. Outputs & Downstream Effects:** Reads System & App Registry (`8`), queries Ubuntu host & Docker stats (`10`), and triggers tasks on the Autonomous AI Agent (`5`).
-- **4E. Safety & Stack Status:** Exposes typed endpoints rather than arbitrary shell execution. Backend language/framework remains open for confirmation.
+  - Telemetry Collector (`metrics.ts`): Reads CPU, load, Linux `MemAvailable`, uptime, and root disk usage via `node:os` / `fs.statfsSync` without shell calls
+  - Onboarding & Auth Engine (`onboarding.ts`, `onboarding-routes.ts`): Manages one-time claims, `scrypt` passphrases, HMAC session tokens (`vpsos_sess_*`), DNS verification, live LLM tests, and host-apply triggers
+  - Workload & Plan Controller (`app.ts`, `runtime.ts`): Syncs container statuses, triggers `start`/`stop`/`restart`/redacted `logs` over `runtime.sock`, and claims cross-process execution leases before calling `/agent/execute`
+- **4D. Outputs & Downstream Effects:** Reads/writes System & App Registry (`8`), communicates with `vps-os-agent` (`5`), and invokes `vps-os-runtime` (`10`).
+- **4E. Safety & Implementation:** Built with **TypeScript + Hono (`@hono/node-server`)**. Enforces fail-closed auth, sliding-window rate limits, `64 KiB` body limits, security headers, and secret redaction.
 
 #### `5` — Autonomous AI Agent (`agent/` + Hermes CTO Gateway)
 
-- **5A. Role & Purpose:** The CTO, Sysadmin, and Developer brain of VPS OS. Turns natural-language user goals into planned, verified server and app deployments. Uses **NousResearch Hermes Agent** (`vps-os-hermes-cto.service` on the Ubuntu host) backed by the typed **VPS OS MCP Server** (`agent/src/mcp-server.ts`) inside the `vps-os-agent` container.
-- **5B. Inputs & Triggers:** Conversational prompts from Natural-Language CTO Chat (`2`), Hermes gateway API (`/v1/responses`, `/v1/runs`), scheduled `cronjob` routines, and automated task triggers from Dashboard Control API (`4`).
+- **5A. Role & Purpose:** The CTO, Sysadmin, and Developer brain of VPS OS. Turns natural-language goals into planned, approval-gated server and app deployments. Pairs **NousResearch Hermes Agent** (`vps-os-hermes-cto.service` on the host) with the typed **VPS OS MCP & HTTP Agent Runtime** (`agent/`).
+- **5B. Inputs & Triggers:** HTTP requests from `dashboard-api` (`POST /agent/plan`, `POST /agent/execute`), MCP `stdio` JSON-RPC calls from Hermes (`agent/src/mcp-server.ts`), and scheduled Hermes `cronjob` routines.
 - **5C. Internal Parts & Mechanics:**
-  - Identity & Bounded Memory (`agent/hermes/SOUL.md`, `MEMORY.md`, `USER.md`, SQLite `FTS5`)
-  - Progressive-Disclosure CTO Skills (`agent/hermes/skills/vps-os-*/SKILL.md` + self-learned skills)
-  - Typed MCP Tool Execution & Approval Gate (`inspect_apps`, `list_audit_events`, `propose_plan`, `get_plan_status`, `prepare_app_workspace`, `update_app_status`)
-- **5D. Outputs & Downstream Effects:** Calls LLM Provider API (`11`) for reasoning, spawns Isolated Subagent Runtimes (`6`), deploys App Containers (`7`), updates Caddy routes (`3`), and updates System & App Registry (`8`).
-- **5E. Safety & Stack Status:** Never runs destructive host commands outside approved plans. Never prints or commits real secrets. Browser First-Boot Setup Wizard & `/v1/runs` UI proxy are planned for **Phase 2** (see [Hermes CTO Architecture & Onboarding](hermes-cto-onboarding.md)).
+  - Identity & Bounded Memory (`agent/hermes/SOUL.md`, `MEMORY.md` `<= 2,200` chars, `USER.md` `<= 1,375` chars, SQLite `FTS5`)
+  - Progressive-Disclosure CTO Skills (`agent/hermes/skills/vps-os-*/SKILL.md` + learned skills)
+  - Deterministic Planner & Executor (`planner.ts`, `executor.ts`) + **10 typed Zod/MCP tools** (`tools.ts`): `inspect_apps`, `list_audit_events`, `read_app_logs`, `propose_plan`, `get_plan_status`, `prepare_app_workspace`, `deploy_workload`, `control_app_lifecycle`, `configure_app_domain`, `update_app_status`
+- **5D. Outputs & Downstream Effects:** Consults LLM Provider API (`11`), invokes Isolated Subagent Runtime (`6`), coordinates `vps-os-runtime` (`10`) for Docker/Caddy changes, and updates System & App Registry (`8`).
+- **5E. Safety & Implementation:** Built with **TypeScript + Vercel AI SDK (`ai`) + Zod**. Enforces one-time plan approval, 300s cross-process execution leases, automatic deployment rollback, and recursive JSON secret redaction.
 
-#### `6` — Isolated Subagent Runtime (`agent/` + `apps/`)
+#### `6` — Isolated Subagent Runtime (`agent/src/subagent-runtime.ts`)
 
-- **6A. Role & Purpose:** Scoped worker environment created by the AI Agent (`5`) to install, configure, or build a specific app or personal agent without touching other workloads.
-- **6B. Inputs & Triggers:** Task briefs and scoped folder paths dispatched by the Autonomous AI Agent (`5`).
+- **6A. Role & Purpose:** Scoped workspace provisioner invoked by the AI Agent (`5`) to initialize a new app or personal-agent folder under `/apps/<slug>` without touching sibling workloads.
+- **6B. Inputs & Triggers:** Approved deployment specs (`slug`, `name`, `kind`, `domain`, `internalPort`) from `executeApprovedPlan` or MCP tools.
 - **6C. Internal Parts & Mechanics:**
-  - Scoped Workspace Directory (one dedicated folder per install)
-  - Template Renderer (hydrates Compose files & `.env.example`)
-  - Pre-flight Validator (`docker compose config` + health probe)
-- **6D. Outputs & Downstream Effects:** Writes isolated configs and secrets to Per-App Volumes & `.env` Secrets (`9`), then launches Isolated App Containers (`7`).
-- **6E. Safety & Stack Status:** Enforces least-privilege folder boundaries so a failing install cannot corrupt sibling apps or host OS configuration.
+  - Path Containment (`resolveScopedAppDir`): Rejects reserved slugs, traversal, and symlinks
+  - Template Hydration: Copies `templates/web-app` or `templates/personal-agent`, sets `APP_SLUG`/`APP_PORT`, writes starter `index.html` (for `web-app`), and creates `0600` `.env` + `.env.example`
+  - Registry Registration: Upserts `AppRecord` with `status: "provisioning"` and records an audit event, rolling back directory creation on any write error
+- **6D. Outputs & Downstream Effects:** Writes isolated configs to `/apps/<slug>/` (`9`) ready for `vps-os-runtime` to validate and launch (`7`).
+- **6E. Safety & Implementation:** Never overwrites existing `/apps/<slug>` workspaces and never writes plaintext secrets into `.env.example` or `docker-compose.yml`.
 
-#### `7` — Isolated App Containers (`apps/` or `templates/`)
+#### `7` — Isolated App Containers (`templates/` -> `/apps/<slug>`)
 
-- **7A. Role & Purpose:** Independent Docker / Compose application stacks deployed into separate folders so every service or personal agent runs cleanly side-by-side.
-- **7B. Inputs & Triggers:** User web traffic routed from Auto-TLS Reverse Proxy (`3`) and lifecycle commands from AI Agent (`5`) or Subagent Runtime (`6`).
+- **7A. Role & Purpose:** Independent Docker Compose v2 stacks deployed into separate `/apps/<slug>` folders so web apps and personal agents run side-by-side without interfering with each other.
+- **7B. Inputs & Triggers:** Public HTTPS traffic routed by Caddy (`3`) for `web-app` workloads, and lifecycle/status commands from `vps-os-runtime` (`10`).
 - **7C. Internal Parts & Mechanics:**
-  - Dedicated App Folder (`/apps/<app-name>/docker-compose.yml`)
-  - Isolated Docker Bridge Network & Resource Limits (CPU/RAM caps)
-  - Automated Healthcheck Endpoints
-- **7D. Outputs & Downstream Effects:** Serves user-facing web apps or autonomous agent workspaces and persists runtime data inside mounted Per-App Volumes (`9`).
-- **7E. Safety & Stack Status:** Every template is validated with `docker compose config`. Containers run without host-root privileges by default.
+  - Built-in templates: [`templates/web-app/docker-compose.yml`](../templates/web-app/docker-compose.yml) (`0.5` CPU, `512m` RAM, port `80`) and [`templates/personal-agent/docker-compose.yml`](../templates/personal-agent/docker-compose.yml) (`1.0` CPU, `1024m` RAM, `node:24-bookworm-slim` with `/workspace`)
+  - Isolated per-app `app_net` bridge network (`vps-os-<slug>_app_net`)
+  - Mandatory `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, and container healthchecks
+- **7D. Outputs & Downstream Effects:** Serves web apps or runs autonomous agent scripts inside mounted Per-App Volumes (`9`).
+- **7E. Safety & Implementation:** Every Compose file is structurally validated by `bootstrap/runtime-bridge.py` before execution; `/var/run/docker.sock` and host root mounts are strictly rejected.
 
 ---
 
 ### Step 4: State, Secrets & Storage
 
-#### `8` — System & App Registry (`dashboard/` + `agent/` state)
+#### `8` — System & App Registry (`packages/shared/src/store.ts`)
 
-- **8A. Role & Purpose:** Single source of truth tracking installed apps, domains, container statuses, agent action history, and health snapshots.
-- **8B. Inputs & Triggers:** State reads from Dashboard Control API (`4`) and atomic state updates from the Autonomous AI Agent (`5`).
+- **8A. Role & Purpose:** Single source of truth tracking registered workloads, domains, execution plans + cross-process leases, audit events, and onboarding/auth settings.
+- **8B. Inputs & Triggers:** Concurrent reads and atomic writes from Dashboard Control API (`4`) and Autonomous AI Agent (`5`).
 - **8C. Internal Parts & Mechanics:**
-  - App Catalog & Manifest Index (name, folder, domain, ports)
-  - Audit & Action Log (who changed what and when)
-  - Health & Resource History Cache
-- **8D. Outputs & Downstream Effects:** Provides instant, consistent state to the Web UI (`1`) and gives the AI Agent (`5`) accurate server memory across sessions.
-- **8E. Safety & Stack Status:** Stores metadata only—never plaintext credentials. Storage engine (e.g., SQLite, Postgres, JSON manifests) is greenfield.
+  - `apps` table (with unique case-insensitive `domain` index and `cleanup_pending` flag)
+  - `audit_events` table (immutable redacted trail)
+  - `execution_plans` table (`pending | approved | rejected | executed` + `execution_owner`/`execution_expires_at` leases)
+  - `system_settings` table (`onboarding_state`, `admin_passphrase_hash`, `session_epoch`)
+- **8D. Outputs & Downstream Effects:** Delivers consistent state to the Web UI (`1`) and gives the AI Agent (`5`) durable cross-session memory.
+- **8E. Safety & Implementation:** Built with Node's built-in **`node:sqlite` in WAL mode** (`PRAGMA busy_timeout = 5000`). Stores metadata and `scrypt` hashes only—never plaintext API keys or `.env` secrets.
 
-#### `9` — Per-App Volumes & `.env` Secrets (`/apps/<name>/` runtime)
+#### `9` — Per-App Volumes & `.env` Secrets (`/apps/<slug>/`)
 
-- **9A. Role & Purpose:** Provides persistent storage and isolated runtime secrets per application while keeping credentials out of Git and cross-app reach.
-- **9B. Inputs & Triggers:** Secret provisioning and volume setup from Isolated Subagent Runtime (`6`); runtime mounts from Isolated App Containers (`7`).
+- **9A. Role & Purpose:** Provides persistent storage and isolated runtime secrets per application while keeping credentials out of Git and sibling containers.
+- **9B. Inputs & Triggers:** Workspace provisioning from Subagent Runtime (`6`) and runtime mounts from Isolated App Containers (`7`).
 - **9C. Internal Parts & Mechanics:**
-  - Per-App Data Volumes (databases, uploads, workspaces, caches)
-  - Scoped `.env` Files (generated from `.env.example` templates)
-  - Backup & Snapshot Target Directories
-- **9D. Outputs & Downstream Effects:** Preserves user data safely across container upgrades, restarts, and rollbacks.
-- **9E. Safety & Stack Status:** Never read, print, hardcode, or commit `.env`, SSH keys, TLS private keys, or API tokens into the repository.
+  - Persistent directories: `./data` (for `web-app`) or `./workspace` (for `personal-agent`)
+  - Scoped `.env` (`chmod 0600`) validated against disallowed host/Docker variable prefixes (`VPS_OS_`, `DOCKER_`, `LD_`)
+- **9D. Outputs & Downstream Effects:** Preserves app data and credentials safely across container upgrades, restarts, and rollbacks.
+- **9E. Safety & Implementation:** Symlinks and `..` escapes in volume paths are blocked at both Node (`safety.ts`) and Python (`runtime-bridge.py`) boundaries.
 
 ---
 
 ### Step 5: Host Substrate & External APIs
 
-#### `10` — Ubuntu Linux VPS Host (`Ubuntu LTS + Docker Engine`)
+#### `10` — Ubuntu Linux VPS Host & Runtime Bridge (`bootstrap/runtime-bridge.py`)
 
-- **10A. Role & Purpose:** The physical or cloud Ubuntu Linux machine hidden beneath the VPS OS abstraction layer so non-Linux users never manage Linux directly.
-- **10B. Inputs & Triggers:** One-time hardening from Bootstrapper (`0`), stats queries from Dashboard Control API (`4`), and container commands from AI Agent (`5`).
+- **10A. Role & Purpose:** The underlying Ubuntu LTS machine and Docker Engine, insulated from containers by the narrow `vps-os-runtime.service` Unix socket bridge.
+- **10B. Inputs & Triggers:** Host hardening from Bootstrapper (`0`), onboarding sync triggers via `vps-os-onboarding-apply.path`, and authenticated JSON requests over `/vps-os/run/runtime.sock`.
 - **10C. Internal Parts & Mechanics:**
-  - Docker Engine & Container Daemon
-  - UFW / Host Firewall & TLS Ports (`80` / `443`)
-  - System Metrics Interface (CPU, RAM, Disk I/O)
-- **10D. Outputs & Downstream Effects:** Provides compute, networking, and container isolation guarantees to every layer above it.
-- **10E. Safety & Stack Status:** Strict host safety rule: never run destructive OS commands or test provisioning directly on an unisolated host.
+  - `vps-os-runtime.service`: Sandboxed `systemd` daemon (`ProtectSystem=strict`, `ProtectHome=true`, `PrivateDevices=true`) running `runtime-bridge.py`
+  - TOCTOU-safe Compose validator (`O_NOFOLLOW` + root-owned `0700` temp dir) + sanitized Docker subprocess env
+  - Atomic Caddy route writer (`/vps-os/caddy/apps.d/<slug>.caddy`) + `caddy validate` / `caddy reload`
+- **10D. Outputs & Downstream Effects:** Executes approved container lifecycle, routing, and cleanup operations safely without giving any container Docker socket access.
+- **10E. Safety & Implementation:** Strictly allowlisted endpoints (`/health`, `/v1/apps/lifecycle`, `/v1/apps/logs`, `/v1/apps/route-caddy`, `/v1/apps/remove`, `/v1/apps/statuses`); rejects unauthenticated or malformed requests.
 
-#### `11` — LLM Provider API (`External AI Model API`)
+#### `11` — LLM Provider API (`OpenAI` / `Anthropic` / `OpenRouter` / `Nous` / `Ollama`)
 
-- **11A. Role & Purpose:** Supplies reasoning, code/config synthesis, and diagnostic intelligence to the Autonomous AI Agent (`5`).
-- **11B. Inputs & Triggers:** Sanitized system context, tool schemas, and user intent prompts sent by the Autonomous AI Agent (`5`).
+- **11A. Role & Purpose:** Supplies reasoning, diagnostics, and plain-English planning to the Autonomous AI Agent (`5`).
+- **11B. Inputs & Triggers:** Sanitized context, MCP tool schemas, and prompts from Hermes CTO (`5`), plus live connectivity checks from Step 2 of the Onboarding Wizard (`POST /api/onboarding/provider/test`).
 - **11C. Internal Parts & Mechanics:**
-  - Structured Tool-Calling & Plan Generation
-  - Error Diagnosis & Safe Remediation Suggestions
-  - Streaming Token Output for Live CTO Chat (`2`)
-- **11D. Outputs & Downstream Effects:** Returns structured tool calls and plain-English explanations back to the Autonomous AI Agent (`5`).
-- **11E. Safety & Stack Status:** API tokens stay strictly in isolated runtime environment variables. Real `.env` secrets are never sent in prompts or committed to Git.
+  - Supports `openai`, `anthropic`, `openrouter`, `nous`, and self-hosted `ollama` (`LLM_BASE_URL` validated against SSRF metadata targets)
+  - Structured tool-calling through Hermes MCP (`vps-os-mcp`)
+- **11D. Outputs & Downstream Effects:** Returns structured tool calls and plain-English responses back to the CTO Agent (`5`).
+- **11E. Safety & Implementation:** Provider keys are stored only in `0600` `/vps-os/.env` (staged via `/vps-os/config/onboarding.env`), never in SQLite and never returned to the browser.
