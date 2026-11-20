@@ -1,6 +1,6 @@
-# Hermes CTO Agent — Architecture, Onboarding & Phase 2 Roadmap
+# Hermes CTO Agent — Architecture, Onboarding & Roadmap
 
-This document explains how **NousResearch Hermes Agent** acts as the **Autonomous AI CTO / Sysadmin / Dev (`Step 5`)** for the VPS OS Framework, how **Phase 1** provisions it automatically during server bootstrap, and what is planned for **Phase 2 (Browser First-Boot Setup Wizard)**.
+This document explains how **NousResearch Hermes Agent** acts as the **Autonomous AI CTO / Sysadmin / Dev (`Step 5`)** for the VPS OS Framework, how **Phase 1** provisions it automatically during server bootstrap, and how **Phase 2 (Browser First-Boot Setup Wizard)** configures it safely from the web UI.
 
 ---
 
@@ -12,9 +12,9 @@ To preserve container isolation while giving the CTO real sysadmin capabilities:
 
 1. **`hermes gateway` runs on the Ubuntu host** as a `systemd` service (`vps-os-hermes-cto.service`) bound to loopback (`127.0.0.1:8642`).
 2. **Typed VPS OS state and safety gates stay in TypeScript** inside the hardened `vps-os-agent` container (`agent/dist/mcp-server.js`).
-3. **Hermes connects to `vps-os-mcp` over `stdio`** (`docker exec -i vps-os-agent node /srv/vps-os/agent/dist/mcp-server.js`), so the Ubuntu host needs no standalone Node.js runtime and all registry/workspace mutations pass through Zod + SQLite + `ExecutionPlan` approval checks.
+3. **Hermes connects to `vps-os-mcp` over `stdio`** (`docker exec -i vps-os-agent node /srv/vps-os/agent/dist/mcp-server.js`), so the Ubuntu host needs no standalone Node.js runtime and all registry/workspace mutations pass through Zod + SQLite + `ExecutionPlan` approval checks and the `vps-os-runtime` Unix socket bridge.
 
-### Runtime & Isolation Topology (Phase 1)
+### Runtime & Isolation Topology
 
 ```mermaid
 flowchart TD
@@ -22,6 +22,7 @@ flowchart TD
         hermes["Hermes CTO Gateway (hermes gateway · 127.0.0.1:8642)"]
         hermesHome["/vps-os/hermes/ (SOUL.md · config.yaml · memories/ · skills/ · state.db)"]
         systemdUnit["vps-os-hermes-cto.service"]
+        runtimeBridge["vps-os-runtime.service (/vps-os/run/runtime.sock)"]
         systemdUnit -->|"Manages lifecycle"| hermes
         hermes <-->|"Reads & persists state"| hermesHome
     end
@@ -35,13 +36,15 @@ flowchart TD
         agentMcp <-->|"Typed Zod tools"| registry
     end
 
-    subgraph apps ["Isolated App Workloads (/apps/<slug>)"]
-        appA["/apps/my-app/ (docker-compose.yml · .env · data/)"]
+    subgraph apps ["Isolated App Workloads (/apps/&lt;slug&gt;)"]
+        appA["/apps/my-app/ (docker-compose.yml · 0600 .env · data/)"]
     end
 
     hermes <-->|"MCP JSON-RPC over stdio (docker exec -i)"| agentMcp
-    hermes -->|"Validates & starts Compose / Caddy routes"| apps
-    hermes -->|"Reloads dynamic routes"| caddy
+    agentMcp -->|"Unix Socket (0660)"| runtimeBridge
+    api -->|"Unix Socket (0660)"| runtimeBridge
+    runtimeBridge -->|"Validates & starts Compose / Caddy routes"| apps
+    runtimeBridge -->|"Reloads dynamic routes"| caddy
 ```
 
 ---
@@ -52,7 +55,7 @@ All CTO defaults live in [`agent/hermes/`](../agent/hermes/) and are validated b
 
 ### A. Personality (`SOUL.md` — Prompt Slot #1)
 
-[`agent/hermes/SOUL.md`](../agent/hermes/SOUL.md) is injected first into every Hermes session and cron run. It defines **who Hermes is for the owner** — a calm, honest, plain-English CTO persona layered in as *"Who You Are"* and *"How You Communicate"* — on top of six non-negotiable CTO behaviors:
+[`agent/hermes/SOUL.md`](../agent/hermes/SOUL.md) is injected first into every Hermes session and cron run. It defines **who Hermes is for the owner**—a calm, honest, plain-English CTO persona layered in as *"Who You Are"* and *"How You Communicate"*—on top of six non-negotiable CTO behaviors:
 
 1. **Plain English first** for non-Linux, non-coding server owners.
 2. **Typed VPS OS MCP tools first** before touching files or containers.
@@ -88,16 +91,22 @@ In addition, Hermes can author new custom skills under `/vps-os/hermes/skills/` 
 
 ### D. Typed VPS OS MCP Toolset (`agent/src/mcp-server.ts`)
 
-[`createMcpRequestHandler`](../agent/src/mcp-server.ts) exposes [`createAgentToolset`](../agent/src/tools.ts) over MCP JSON-RPC 2.0 (`initialize`, `ping`, `tools/list`, `tools/call`) with recursive leaf-string secret redaction (`redactJsonValue`) prior to JSON serialization:
+[`createMcpRequestHandler`](../agent/src/mcp-server.ts) exposes all 10 tools from [`createAgentToolset`](../agent/src/tools.ts) over MCP JSON-RPC 2.0 (`initialize`, `ping`, `tools/list`, `tools/call`) with recursive leaf-string secret redaction (`redactJsonValue`) prior to JSON serialization:
 
 | MCP Tool | Purpose | Approval / Safety Guard |
 |---|---|---|
-| `inspect_apps` | List registered apps, domains, ports, and resource limits | Read-only |
+| `inspect_apps` | Sync live statuses and list registered apps, domains, ports, and resource limits | Read-only |
 | `list_audit_events` | Inspect recent redacted audit trail entries | Read-only |
+| `read_app_logs` | Fetch bounded (`1–500` lines), secret-redacted container logs via Runtime Bridge | Read-only |
 | `propose_plan` | Classify risk (`low` / `medium` / `high`) and persist an `ExecutionPlan` | Redacts secrets in goal |
-| `get_plan_status` | Check whether a pending `ExecutionPlan` has been approved or rejected | Read-only |
-| `prepare_app_workspace` | Create `/apps/<slug>`, Compose file, `.env.example`, `.env` (`0600`), and `provisioning` record | **Blocked unless plan status is `approved`**; marks plan `executed` to prevent replay |
+| `get_plan_status` | Check whether a pending `ExecutionPlan` has been approved, rejected, or executed | Read-only |
+| `prepare_app_workspace` | Create `/apps/<slug>`, Compose file, `.env.example`, `.env` (`0600`), and `provisioning` record | **Blocked unless plan is `approved`**; acquires lease & marks `executed` |
+| `deploy_workload` | Provision workspace, start Compose stack via Runtime Bridge, bind Caddy TLS, or roll back | **Blocked unless plan is `approved`**; acquires lease & marks `executed` |
+| `control_app_lifecycle` | Run `start`, `stop`, or `restart` on an isolated app via Runtime Bridge & update status | **Blocked unless plan is `approved`**; acquires lease & marks `executed` |
+| `configure_app_domain` | Bind or remove a Caddy Auto-TLS domain route for a running app and update `apps.domain` | **Blocked unless plan is `approved`**; acquires lease & marks `executed` |
 | `update_app_status` | Record final lifecycle status (`provisioning`, `running`, `stopped`, `error`) + audit event | Validates slug (`validateAppSlug`) and status (`AppStatusSchema`) |
+
+For full parameter schemas and HTTP equivalents, see **[Control API, Agent Protocol, MCP Tools & Registry Reference](api-and-agent-reference.md)**.
 
 ### Approval-Gated Deployment Flow
 
@@ -107,11 +116,11 @@ sequenceDiagram
     participant Hermes as Hermes CTO Gateway
     participant MCP as vps-os-mcp (vps-os-agent)
     participant DB as registry.db (SQLite)
-    participant Host as Docker & Caddy on Host
+    participant Bridge as vps-os-runtime (Host)
 
     Owner->>Hermes: "Deploy analytics app at analytics.mydomain.com"
     Hermes->>MCP: inspect_apps()
-    MCP->>DB: SELECT * FROM apps
+    MCP->>DB: Sync & SELECT * FROM apps
     DB-->>Hermes: Existing apps & ports
 
     Hermes->>MCP: propose_plan(goal)
@@ -119,18 +128,15 @@ sequenceDiagram
     DB-->>Hermes: planId (requiresUserApproval: true)
     Hermes-->>Owner: Present plain-English deployment plan
 
-    Owner->>DB: Approve plan (via Control API / CLI)
+    Owner->>DB: Approve plan (via Control API / UI)
     Hermes->>MCP: get_plan_status(planId)
     MCP-->>Hermes: status = approved
 
-    Hermes->>MCP: prepare_app_workspace(planId, slug="analytics", ...)
-    MCP->>DB: Verify approved -> create /apps/analytics/ -> mark executed
-    MCP-->>Hermes: composePath, envPath, AppRecord(provisioning)
-
-    Hermes->>Host: docker compose config && docker compose up -d
-    Hermes->>Host: Write /vps-os/caddy/apps.d/analytics.caddy && reload Caddy
-    Hermes->>MCP: update_app_status(slug="analytics", status="running")
-    MCP->>DB: Update status + record audit event
+    Hermes->>MCP: deploy_workload(planId, slug="analytics", ...)
+    MCP->>DB: Claim lease -> create /apps/analytics/
+    MCP->>Bridge: Start Compose & configure Caddy route
+    Bridge-->>MCP: Container running & HTTPS validated
+    MCP->>DB: Mark plan executed + status="running" + audit event
     Hermes-->>Owner: "Analytics is live at https://analytics.mydomain.com"
 ```
 
@@ -140,12 +146,12 @@ sequenceDiagram
 
 During [`bootstrap/install.sh`](../bootstrap/install.sh):
 
-1. Creates `/vps-os/data`, `/vps-os/caddy/apps.d`, `/apps`, and `${HERMES_HOME}` (`/vps-os/hermes/{memories,skills}`).
-2. Generates random 32-byte hex secrets for `VPS_OS_ADMIN_TOKEN` and `HERMES_API_SERVER_KEY` in `/vps-os/.env` (`chmod 600`).
-3. Brings up the core Docker Compose stack (`vps-os-caddy`, `vps-os-dashboard-api`, `vps-os-agent`).
+1. Creates `/vps-os/data`, `/vps-os/config`, `/vps-os/run`, `/vps-os/caddy/apps.d`, `/apps`, and `${HERMES_HOME}` (`/vps-os/hermes/{memories,skills}`).
+2. Generates random 32-byte hex secrets for `VPS_OS_ADMIN_TOKEN`, `VPS_OS_RUNTIME_TOKEN`, and `HERMES_API_SERVER_KEY` in `/vps-os/.env` (`chmod 600`).
+3. Configures `vps-os-runtime.service` (`/vps-os/run/runtime.sock`) and brings up the core Docker Compose stack (`vps-os-caddy`, `vps-os-dashboard-api`, `vps-os-agent`).
 4. Installs Hermes Agent (`ensure_hermes`) unless `INSTALL_HERMES=false`.
 5. Runs `sync_hermes_pack` *after* installation so VPS OS defaults take precedence over upstream installer files.
-6. Writes and enables `/etc/systemd/system/vps-os-hermes-cto.service` (`API_SERVER_ENABLED=true`, `127.0.0.1:8642`). The service auto-starts immediately if `LLM_API_KEY` is configured, or waits cleanly until the key is set.
+6. Writes and enables `/etc/systemd/system/vps-os-hermes-cto.service` (`API_SERVER_ENABLED=true`, `127.0.0.1:8642`) and `vps-os-onboarding-apply.path`.
 
 ### Upgrade Ownership Model
 
@@ -177,11 +183,11 @@ flowchart LR
 
 ## 4. Phase 2: Browser First-Boot Setup Wizard (Implemented)
 
-Phase 2 moves final setup out of SSH into the Management Web UI (`dashboard/web/` + `dashboard/api/`) while preserving strict container isolation (`cap_drop: ALL`, no Docker socket mount):
+Phase 2 moves final setup out of SSH into the Management Web UI (`dashboard/web/` + `dashboard/api/`) while preserving strict container isolation (`cap_drop: ALL`, no Docker socket mount). See **[Getting Started, Installation & Onboarding](getting-started.md)** for full step-by-step usage and **[Runtime Bridge & Security](runtime-and-security.md)** for security controls:
 
 1. **One-Time Bootstrap Claim & Passphrase Login:**
    - [`bootstrap/install.sh`](../bootstrap/install.sh) prints a single-use setup pairing code (storing only its SHA-256 hash and 24-hour expiry in `/vps-os/data/setup-claim.json`, locked after 5 failed attempts) plus a `#claim=` link that the browser consumes and scrubs from the URL immediately.
-   - `POST /api/auth/claim` and `POST /api/auth/login` issue HMAC-signed session tokens (`vpsos_sess_...`) scoped to `session_epoch` in SQLite. Owners can configure a memorable Admin Passphrase (`scrypt`-hashed) during onboarding so they don't need to copy the raw 64-char `VPS_OS_ADMIN_TOKEN`.
+   - `POST /api/auth/claim` and `POST /api/auth/login` issue HMAC-signed session tokens (`vpsos_sess_...`) scoped to `session_epoch` in SQLite. Owners can configure a memorable Admin Passphrase (`scrypt`-hashed) during onboarding.
 2. **5-Step Browser First-Boot Wizard (`dashboard/web/src/components/OnboardingWizard.tsx`):**
    - **Step 1 — Domain & HTTPS:** Detects the server public IP, guides `A` record creation, verifies live DNS (`POST /api/onboarding/domain/verify`), or supports IP setup mode (`:80`) until DNS propagates.
    - **Step 2 — AI CTO Brain:** Connects OpenAI, Anthropic, OpenRouter, Nous Research, or local Ollama, tests connectivity (`POST /api/onboarding/provider/test`), and stores keys in `/vps-os/config/onboarding.env` (`0600`) without ever storing plaintext keys in SQLite or returning them to the browser.
