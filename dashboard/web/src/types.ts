@@ -1,3 +1,21 @@
+export type WorkspaceView =
+  | "overview"
+  | "chat"
+  | "apps"
+  | "activity"
+  | "settings";
+
+export type ThemeMode = "dark" | "light";
+
+export type ToastTone = "success" | "info" | "warning" | "error";
+
+export interface ToastItem {
+  id: string;
+  title: string;
+  description?: string | undefined;
+  tone: ToastTone;
+}
+
 export interface DiskMetricsView {
   mountPath: string;
   totalMb: number;
@@ -7,6 +25,7 @@ export interface DiskMetricsView {
 
 export interface SystemMetricsView {
   hostname: string;
+  platform?: string;
   cpuCount: number;
   loadAverage1m: number;
   memoryUsedMb: number;
@@ -17,6 +36,16 @@ export interface SystemMetricsView {
   disk?: DiskMetricsView;
 }
 
+export interface TelemetrySampleView {
+  collectedAt: string;
+  loadAverage1m: number;
+  cpuCount: number;
+  cpuLoadPercent: number;
+  memoryUsagePercent: number;
+  memoryUsedMb: number;
+  diskUsagePercent: number | null;
+}
+
 export interface AppCardView {
   slug: string;
   name: string;
@@ -25,6 +54,8 @@ export interface AppCardView {
   status: string;
   cpuLimit: string;
   memoryLimitMb: number;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface AuditEventView {
