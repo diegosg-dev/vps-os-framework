@@ -749,6 +749,28 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
       );
     }
 
+    const appendPlanFollowUpMessage = (
+      content: string,
+      status: "completed" | "error",
+    ) => {
+      const originMsg = deps.registry.findChatMessageByPlanId(existing.id);
+      if (!originMsg) return null;
+      return deps.registry.appendChatMessage({
+        id: crypto.randomUUID(),
+        threadId: originMsg.threadId,
+        role: "assistant",
+        content,
+        attachments: [],
+        reasoning: [],
+        toolCalls: [],
+        planId: null,
+        provider: originMsg.provider,
+        model: originMsg.model,
+        status,
+        createdAt: new Date().toISOString(),
+      });
+    };
+
     let execution: PlanExecutionResult;
     try {
       execution = await deps.executePlan(existing, { leaseOwnerId });
@@ -758,7 +780,17 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
         err,
         `Could not execute plan "${existing.id}".`,
       );
-      return c.json({ error: mapped.message }, mapped.status);
+      const followUpMessage = appendPlanFollowUpMessage(
+        `### Plan Execution Failed\n\n${redactSecrets(mapped.message)}`,
+        "error",
+      );
+      return c.json(
+        {
+          error: mapped.message,
+          ...(followUpMessage ? { followUpMessage } : {}),
+        },
+        mapped.status,
+      );
     }
 
     const transitioned = deps.registry.markPlanExecuted(existing.id, leaseOwnerId);
@@ -770,21 +802,34 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
       );
     }
 
+    const safeSummary = redactSecrets(execution.summary);
     deps.registry.recordAudit({
       id: crypto.randomUUID(),
       actor: "user",
       action: "chat.plan_executed",
       targetSlug: null,
-      summary: redactSecrets(`Executed plan ${existing.id}: ${execution.summary}`),
+      summary: redactSecrets(`Executed plan ${existing.id}: ${safeSummary}`),
       riskLevel: existing.requiresUserApproval ? "medium" : "low",
       createdAt: new Date().toISOString(),
     });
 
+    const followUpMessage = appendPlanFollowUpMessage(
+      [
+        "### Plan Executed",
+        "",
+        safeSummary,
+        "",
+        "Open **Workloads** to inspect container health, endpoints, and live logs.",
+      ].join("\n"),
+      "completed",
+    );
+
     return c.json({
       plan: deps.registry.getPlan(existing.id),
       execution: {
-        summary: redactSecrets(execution.summary),
+        summary: safeSummary,
       },
+      ...(followUpMessage ? { followUpMessage } : {}),
     });
   });
 

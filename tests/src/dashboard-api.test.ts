@@ -344,6 +344,28 @@ test("Dashboard Control API supports app detail, lifecycle, redacted logs, and p
     });
     const { plan } = (await planRes.json()) as { plan: { id: string } };
 
+    const chatThread = registry.createChatThread({
+      id: "plan-followup-thread",
+      title: "Plan Followup",
+      provider: "opencode",
+      model: "glm-5.3",
+      createdAt: new Date().toISOString(),
+    });
+    registry.appendChatMessage({
+      id: "plan-origin-msg",
+      threadId: chatThread.id,
+      role: "assistant",
+      content: "Review the plan below.",
+      attachments: [],
+      reasoning: [],
+      toolCalls: [],
+      planId: plan.id,
+      provider: "opencode",
+      model: "glm-5.3",
+      status: "completed",
+      createdAt: new Date().toISOString(),
+    });
+
     // Cannot execute while pending
     const earlyExec = await app.request("/api/chat/execute", {
       method: "POST",
@@ -374,8 +396,17 @@ test("Dashboard Control API supports app detail, lifecycle, redacted logs, and p
     assert.deepEqual(execStatuses, [200, 409]);
 
     const okExec = execResA.status === 200 ? execResA : execResB;
-    const execJson = (await okExec.json()) as { plan: { status: string } };
+    const execJson = (await okExec.json()) as {
+      plan: { status: string };
+      followUpMessage?: { id: string; threadId: string; role: string; content: string };
+    };
     assert.equal(execJson.plan.status, "executed");
+    assert.equal(execJson.followUpMessage?.threadId, chatThread.id);
+    assert.equal(execJson.followUpMessage?.role, "assistant");
+    assert.match(execJson.followUpMessage?.content ?? "", /Plan Executed/);
+    const threadMsgs = registry.listChatMessages(chatThread.id);
+    assert.equal(threadMsgs.length, 2);
+    assert.equal(threadMsgs[1]?.id, execJson.followUpMessage?.id);
 
     // Replay blocked
     const replayExec = await app.request("/api/chat/execute", {

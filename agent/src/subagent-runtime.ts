@@ -91,7 +91,7 @@ export function provisionIsolatedWorkspace(
     );
   }
 
-  const port = input.internalPort ?? (input.kind === "personal-agent" ? 3000 : 80);
+  const port = input.internalPort ?? (input.kind === "personal-agent" ? 3000 : 8080);
   const persistentSubdir = input.kind === "personal-agent" ? "workspace" : "data";
   const dataDir = path.join(appDir, persistentSubdir);
   const composePath = path.join(appDir, "docker-compose.yml");

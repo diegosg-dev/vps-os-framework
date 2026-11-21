@@ -708,3 +708,62 @@ test("SystemRegistryStore migrates a legacy chat_threads schema idempotently", (
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test("Agent mode skips bogus manual_review plans on conversational prompts and exposes publicIp telemetry", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-chat-convo-"));
+  const dataDir = path.join(tempDir, "data");
+  const registry = new SystemRegistryStore(path.join(dataDir, "registry.db"));
+  registry.saveOnboardingState({
+    publicIp: "109.199.127.133",
+    domainMode: "ip-only",
+  });
+
+  const app = createDashboardApp({
+    registry,
+    adminToken: "master-admin-token-for-convo-tests",
+    dataDir,
+    disableExternalLlm: true,
+  });
+  const authHeaders = {
+    authorization: "Bearer master-admin-token-for-convo-tests",
+  };
+
+  try {
+    const threadRes = await app.request("/api/chat/threads", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ title: "Conversational checks" }),
+    });
+    const { thread } = (await threadRes.json()) as { thread: { id: string } };
+
+    for (const prompt of ["whats the link", "via ip", "approve"]) {
+      const res = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders },
+        body: JSON.stringify({
+          content: prompt,
+          mode: "agent",
+          stream: false,
+        }),
+      });
+      assert.equal(res.status, 200);
+      const json = (await res.json()) as {
+        assistantMessage: {
+          planId: string | null;
+          toolCalls: Array<{ toolName: string; output?: Record<string, unknown> }>;
+        };
+        plan: unknown;
+      };
+      assert.equal(json.plan, null, `prompt "${prompt}" must not spawn a bogus plan`);
+      assert.equal(json.assistantMessage.planId, null);
+      const metricsTool = json.assistantMessage.toolCalls.find(
+        (tc) => tc.toolName === "inspect_system_metrics",
+      );
+      assert.equal(metricsTool?.output?.publicIp, "109.199.127.133");
+      assert.equal(metricsTool?.output?.dashboardUrl, "http://109.199.127.133");
+    }
+  } finally {
+    registry.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
