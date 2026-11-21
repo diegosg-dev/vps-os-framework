@@ -652,7 +652,10 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
     }
 
     const sanitizedGoal = redactSecrets(parsed.data.goal);
-    const storedPlan = deps.registry.savePlan(createExecutionPlan(sanitizedGoal));
+    const knownSlugs = deps.registry.listApps().map((app) => app.slug);
+    const storedPlan = deps.registry.savePlan(
+      createExecutionPlan(sanitizedGoal, knownSlugs),
+    );
 
     deps.registry.recordAudit({
       id: crypto.randomUUID(),

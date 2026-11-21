@@ -24,6 +24,9 @@ const PERSONAL_AGENT_PATTERN =
   /\b(personal\s+(?:life\s+)?agent|life\s+agent|personal-agent)\b/i;
 const LIFECYCLE_INTENT_PATTERN =
   /^\s*(start|stop|restart)\s+(?:the\s+)?(?:app\s+|container\s+|workload\s+)?([a-z0-9][a-z0-9-]{1,47})(?:\s+(?:app|container|workload))?\s*[.!]?\s*$/i;
+const REMOVE_INTENT_PATTERN = /\b(remove|delete|uninstall|teardown|tear\s+down|destroy)\b/i;
+const ROUTE_INTENT_PATTERN = /\b(route|attach|bind|map|point)\b/i;
+const HOST_ONLY_SAFETY_KEYWORDS = /\b(firewall|ufw|ssh|sudo|root|format|wipe\s+disk|erase\s+disk|kernel)\b/i;
 
 const FILE_OR_TECH_EXTENSIONS = new Set([
   "yml",
@@ -313,6 +316,90 @@ export function extractDeploySpecFromGoal(goal: string): DerivedDeploySpec | nul
 }
 
 /**
+ * Extracts explicit registered workload slugs to remove from a plain-English goal
+ * (or all known slugs if the goal explicitly asks to remove all workloads).
+ */
+export function extractRemoveSlugsFromGoal(
+  goal: string,
+  knownSlugs: string[] = [],
+): string[] {
+  if (!REMOVE_INTENT_PATTERN.test(goal) || HOST_ONLY_SAFETY_KEYWORDS.test(goal)) {
+    return [];
+  }
+  const trimmed = goal.trim();
+  if (/^[-*]\s+\*\*[^*]+\*\*/m.test(trimmed)) {
+    return [];
+  }
+
+  const normalizedKnown = knownSlugs
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (
+    normalizedKnown.length > 0 &&
+    /\b(?:all(?:\s+\d+)?(?:\s+current)?\s+(?:apps?|workloads?|containers?)|remove\s+them\s+all|delete\s+all)\b/i.test(
+      trimmed,
+    )
+  ) {
+    return Array.from(new Set(normalizedKnown));
+  }
+
+  const matched = new Set<string>();
+  const lower = trimmed.toLowerCase();
+  for (const slug of normalizedKnown) {
+    const escaped = slug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`(?:^|[^a-z0-9-])${escaped}(?:[^a-z0-9-]|$)`, "i").test(lower)) {
+      matched.add(slug);
+    }
+  }
+  if (matched.size > 0) {
+    return Array.from(matched);
+  }
+
+  const singleMatch = trimmed.match(
+    /\b(?:remove|delete|uninstall|teardown|tear\s+down|destroy)\s+(?:the\s+)?(?:app\s+|container\s+|workload\s+)?([a-z0-9][a-z0-9-]{1,47})\b/i,
+  );
+  if (singleMatch?.[1]) {
+    const candidate = singleMatch[1].toLowerCase();
+    if (!SLUG_STOP_WORDS.has(candidate) && candidate !== "all" && candidate !== "them") {
+      try {
+        return [validateAppSlug(candidate)];
+      } catch {
+        return [];
+      }
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Extracts an explicit Caddy route update (`slug` + `domain`) from a natural-language goal.
+ */
+export function extractRouteSpecFromGoal(
+  goal: string,
+  knownSlugs: string[] = [],
+): { slug: string; domain: string } | null {
+  if (!ROUTE_INTENT_PATTERN.test(goal) || HOST_ONLY_SAFETY_KEYWORDS.test(goal)) {
+    return null;
+  }
+  const domain = extractDomainFromGoal(goal);
+  if (!domain) {
+    return null;
+  }
+  const lower = goal.toLowerCase();
+  for (const rawSlug of knownSlugs) {
+    const slug = rawSlug.trim().toLowerCase();
+    if (!slug) continue;
+    const escaped = slug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`(?:^|[^a-z0-9-])${escaped}(?:[^a-z0-9-]|$)`, "i").test(lower)) {
+      return { slug, domain };
+    }
+  }
+  return null;
+}
+
+/**
  * Classifies the risk level of a natural-language CTO request using a
  * fail-closed policy: only explicit read-only queries are low risk.
  */
@@ -330,7 +417,10 @@ export function classifyGoalRisk(goal: string): RiskLevel {
  * Builds a structured, reviewable ExecutionPlan before any subagent or
  * container mutation is executed (Steps 2 & 5).
  */
-export function createExecutionPlan(goal: string): ExecutionPlan {
+export function createExecutionPlan(
+  goal: string,
+  knownSlugs: string[] = [],
+): ExecutionPlan {
   const trimmedGoal = goal.trim();
   if (!trimmedGoal) {
     throw new Error("Goal cannot be empty.");
@@ -356,6 +446,8 @@ export function createExecutionPlan(goal: string): ExecutionPlan {
     ];
   } else {
     const lifecycleMatch = trimmedGoal.match(LIFECYCLE_INTENT_PATTERN);
+    const removeSlugs = extractRemoveSlugsFromGoal(trimmedGoal, knownSlugs);
+    const routeSpec = extractRouteSpecFromGoal(trimmedGoal, knownSlugs);
     const deploySpec = extractDeploySpecFromGoal(trimmedGoal);
 
     if (lifecycleMatch?.[1] && lifecycleMatch[2]) {
@@ -400,6 +492,46 @@ export function createExecutionPlan(goal: string): ExecutionPlan {
           },
         ];
       }
+    } else if (removeSlugs.length > 0) {
+      steps = [
+        {
+          id: "step-1",
+          title: "Inspect workloads before removal",
+          description: `Verify ${removeSlugs.map((s) => `"${s}"`).join(", ")} before tearing down containers and routes.`,
+          toolName: "inspect_apps",
+          riskLevel: "low",
+          requiresApproval: false,
+        },
+        ...removeSlugs.map((slug, idx) => ({
+          id: `step-${idx + 2}`,
+          title: `Remove workload "${slug}"`,
+          description: `Stop container, detach Caddy route, delete /apps/${slug}, and remove registry entry.`,
+          toolName: "remove_workload",
+          riskLevel: "high" as const,
+          requiresApproval: true,
+          args: { slug, removeFiles: true },
+        })),
+      ];
+    } else if (routeSpec) {
+      steps = [
+        {
+          id: "step-1",
+          title: "Verify target workload and domain uniqueness",
+          description: `Confirm "${routeSpec.slug}" is running and bind ${routeSpec.domain}.`,
+          toolName: "inspect_apps",
+          riskLevel: "low",
+          requiresApproval: false,
+        },
+        {
+          id: "step-2",
+          title: `Route HTTPS for "${routeSpec.slug}" at ${routeSpec.domain}`,
+          description: `Connect Caddy to "${routeSpec.slug}" isolated network and configure TLS for ${routeSpec.domain}.`,
+          toolName: "route_caddy",
+          riskLevel: "medium",
+          requiresApproval: true,
+          args: { slug: routeSpec.slug, domain: routeSpec.domain },
+        },
+      ];
     } else if (deploySpec) {
       const routeNote = deploySpec.domain
         ? ` and route HTTPS for ${deploySpec.domain}`
@@ -462,6 +594,230 @@ export function createExecutionPlan(goal: string): ExecutionPlan {
       : `Read-only inspection plan for "${excerpt}".`,
     steps,
     requiresUserApproval: requiresApproval,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Validates an LLM-proposed ```vps-plan``` payload against the strict allowlist of
+ * safe, typed runtime bridge tools. Returns null if empty, malformed, or unsafe.
+ */
+export function buildValidatedLlmPlan(
+  raw: unknown,
+  fallbackGoal: string,
+): ExecutionPlan | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const record = raw as {
+    goal?: unknown;
+    summary?: unknown;
+    steps?: unknown;
+  };
+  if (!Array.isArray(record.steps) || record.steps.length === 0) {
+    return null;
+  }
+
+  const normalizedSteps: PlanStep[] = [];
+  for (const item of record.steps.slice(0, 8)) {
+    if (!item || typeof item !== "object") return null;
+    const rawStep = item as {
+      title?: unknown;
+      description?: unknown;
+      toolName?: unknown;
+      args?: unknown;
+    };
+    const toolName =
+      typeof rawStep.toolName === "string" ? rawStep.toolName.trim() : "";
+    const args =
+      rawStep.args && typeof rawStep.args === "object"
+        ? (rawStep.args as Record<string, unknown>)
+        : {};
+    const stepId = `step-${normalizedSteps.length + 1}`;
+    const rawTitle =
+      typeof rawStep.title === "string" && rawStep.title.trim()
+        ? rawStep.title.trim().slice(0, 160)
+        : null;
+    const rawDesc =
+      typeof rawStep.description === "string" && rawStep.description.trim()
+        ? rawStep.description.trim().slice(0, 500)
+        : null;
+
+    if (toolName === "inspect_apps") {
+      normalizedSteps.push({
+        id: stepId,
+        title: rawTitle ?? "Inspect workloads and system state",
+        description:
+          rawDesc ?? "Read current workload statuses before mutating state.",
+        toolName: "inspect_apps",
+        riskLevel: "low",
+        requiresApproval: false,
+      });
+    } else if (toolName === "prepare_app_workspace") {
+      const rawSlug = typeof args.slug === "string" ? args.slug : "";
+      const kind =
+        args.kind === "personal-agent" ? "personal-agent" : "web-app";
+      const safeSlug = normalizeSlugCandidate(rawSlug, kind);
+      if (!safeSlug) return null;
+      let safeDomain: string | null = null;
+      if (typeof args.domain === "string" && args.domain.trim()) {
+        try {
+          safeDomain = validateDomain(args.domain);
+        } catch {
+          return null;
+        }
+      }
+      const rawPort =
+        typeof args.internalPort === "number" &&
+        Number.isInteger(args.internalPort) &&
+        args.internalPort >= 1 &&
+        args.internalPort <= 65535
+          ? args.internalPort
+          : kind === "personal-agent"
+            ? 3000
+            : 8080;
+      const appName =
+        typeof args.name === "string" && args.name.trim()
+          ? args.name.trim().slice(0, 100)
+          : toDisplayName(safeSlug);
+
+      normalizedSteps.push({
+        id: stepId,
+        title: rawTitle ?? `Provision isolated ${kind} "${safeSlug}"`,
+        description:
+          rawDesc ??
+          `Create /apps/${safeSlug} and start isolated container${
+            safeDomain ? ` with Caddy route https://${safeDomain}` : ""
+          }.`,
+        toolName: "prepare_app_workspace",
+        riskLevel: "high",
+        requiresApproval: true,
+        args: {
+          slug: safeSlug,
+          name: appName,
+          kind,
+          domain: safeDomain,
+          internalPort: rawPort,
+        },
+      });
+    } else if (toolName === "control_app_lifecycle") {
+      let safeSlug: string;
+      try {
+        safeSlug = validateAppSlug(String(args.slug ?? ""));
+      } catch {
+        return null;
+      }
+      const action =
+        args.action === "start" ||
+        args.action === "stop" ||
+        args.action === "restart"
+          ? args.action
+          : null;
+      if (!action) return null;
+      normalizedSteps.push({
+        id: stepId,
+        title:
+          rawTitle ??
+          `${action.slice(0, 1).toUpperCase()}${action.slice(1)} workload "${safeSlug}"`,
+        description:
+          rawDesc ?? `Run Docker Compose ${action} for "${safeSlug}".`,
+        toolName: "control_app_lifecycle",
+        riskLevel: "medium",
+        requiresApproval: true,
+        args: { slug: safeSlug, action },
+      });
+    } else if (toolName === "remove_workload") {
+      let safeSlug: string;
+      try {
+        safeSlug = validateAppSlug(String(args.slug ?? ""));
+      } catch {
+        return null;
+      }
+      const removeFiles = args.removeFiles !== false;
+      normalizedSteps.push({
+        id: stepId,
+        title: rawTitle ?? `Remove workload "${safeSlug}"`,
+        description:
+          rawDesc ??
+          `Stop container, clear Caddy route${removeFiles ? `, delete /apps/${safeSlug}` : ""}, and unregister "${safeSlug}".`,
+        toolName: "remove_workload",
+        riskLevel: "high",
+        requiresApproval: true,
+        args: { slug: safeSlug, removeFiles },
+      });
+    } else if (toolName === "route_caddy") {
+      let safeSlug: string;
+      try {
+        safeSlug = validateAppSlug(String(args.slug ?? ""));
+      } catch {
+        return null;
+      }
+      let safeDomain: string | null = null;
+      if (typeof args.domain === "string" && args.domain.trim()) {
+        try {
+          safeDomain = validateDomain(args.domain);
+        } catch {
+          return null;
+        }
+      }
+      normalizedSteps.push({
+        id: stepId,
+        title:
+          rawTitle ??
+          (safeDomain
+            ? `Route "${safeSlug}" to ${safeDomain}`
+            : `Clear Caddy route for "${safeSlug}"`),
+        description:
+          rawDesc ??
+          (safeDomain
+            ? `Configure Caddy Auto-TLS reverse proxy for https://${safeDomain}.`
+            : `Disconnect Caddy public route for "${safeSlug}".`),
+        toolName: "route_caddy",
+        riskLevel: "medium",
+        requiresApproval: true,
+        args: { slug: safeSlug, domain: safeDomain },
+      });
+    } else if (toolName === "update_app_status") {
+      let safeSlug: string;
+      try {
+        safeSlug = validateAppSlug(String(args.slug ?? ""));
+      } catch {
+        return null;
+      }
+      normalizedSteps.push({
+        id: stepId,
+        title: rawTitle ?? `Update registry status for "${safeSlug}"`,
+        description:
+          rawDesc ?? `Record updated metadata for "${safeSlug}" in the registry.`,
+        toolName: "update_app_status",
+        riskLevel: "medium",
+        requiresApproval: true,
+        args: { slug: safeSlug },
+      });
+    } else {
+      // Fail closed on unrecognized or host-shell tools
+      return null;
+    }
+  }
+
+  const requiresUserApproval = normalizedSteps.some((s) => s.requiresApproval);
+  const goal =
+    typeof record.goal === "string" && record.goal.trim()
+      ? record.goal.trim().slice(0, 1000)
+      : fallbackGoal.trim().slice(0, 1000) || "Agent action plan";
+  const summary =
+    typeof record.summary === "string" && record.summary.trim()
+      ? record.summary.trim().slice(0, 500)
+      : `Planned ${normalizedSteps.length} steps for "${truncateExcerpt(goal, 120)}"${
+          requiresUserApproval ? " (approval required before execution)." : "."
+        }`;
+
+  return ExecutionPlanSchema.parse({
+    id: crypto.randomUUID(),
+    goal,
+    summary,
+    steps: normalizedSteps,
+    requiresUserApproval,
     createdAt: new Date().toISOString(),
   });
 }
