@@ -105,6 +105,19 @@ const SLUG_STOP_WORDS = new Set([
   "password",
   "secret",
   "port",
+  "what",
+  "should",
+  "could",
+  "would",
+  "how",
+  "why",
+  "when",
+  "where",
+  "which",
+  "who",
+  "i",
+  "we",
+  "you",
 ]);
 
 export interface DerivedDeploySpec {
@@ -193,6 +206,16 @@ function toDisplayName(slug: string): string {
  */
 export function extractDeploySpecFromGoal(goal: string): DerivedDeploySpec | null {
   if (!DEPLOY_VERB_PATTERN.test(goal) || DISALLOWED_AUTO_DEPLOY_KEYWORDS.test(goal)) {
+    return null;
+  }
+  const trimmed = goal.trim();
+  if (
+    /^(?:what|whats|what's|how|why|when|where|which|who|should|do|does|is|are)\b/i.test(
+      trimmed,
+    ) ||
+    (trimmed.endsWith("?") &&
+      !/\b(?:named|called|slug)\b/i.test(trimmed))
+  ) {
     return null;
   }
 

@@ -95,6 +95,13 @@ export interface ChatEngineDeps {
     | ((slugs: string[]) => Promise<Record<string, AppRecord["status"]>> | Record<string, AppRecord["status"]>)
     | undefined;
   getLogs?: ((slug: string, tail: number) => Promise<string[]> | string[]) | undefined;
+  /** Optional plan executor used when YOLO Sandbox mode auto-executes safe plans. */
+  executePlan?:
+    | ((
+        plan: StoredPlan,
+        options: { leaseOwnerId: string },
+      ) => Promise<{ summary: string }> | { summary: string })
+    | undefined;
   /** Optional custom fetch override (used by tests to mock OpenCode/OpenAI streams). */
   fetchFn?: typeof fetch | undefined;
   /** Disables outbound provider calls (useful in isolated offline tests). */
@@ -242,14 +249,64 @@ function buildSystemPrompt(
     `Approval guardrail: ${persona.approvalMode}. ${modeRule}`,
     effortRule,
     "Never print or ask to paste raw private keys or unredacted secrets.",
+    "Respond naturally and conversationally like a helpful CTO in chat — keep follow-ups and answers concise without dumping huge boilerplate tables unless telemetry was requested.",
     "Use clean Markdown formatting (short headings, bullet points, tables, fenced code blocks when helpful).",
     "NEVER claim a plan was approved, executed, or deployed unless that exact state appears in Live Inspected Server Context or executed tool results — typing 'approve' in chat does not approve or execute a pending Execution Plan card.",
-    "When an Execution Plan card is attached to your turn, NEVER ask the user to type 'approve' in chat — instead direct them to click Approve Plan (and Execute Approved Plan) on the Execution Plan card below your message.",
+    "When an Execution Plan card is attached to your turn with status 'pending', NEVER ask the user to type 'approve' in chat — instead direct them to click Approve & Execute on the Execution Plan card below your message.",
     "When an app has domain=null, state clearly that it is currently internal-network-only (listening on its internal port) and needs a domain/route attached before it has a public HTTP(S) link.",
+    "If key details are missing or you want the user to pick between options before acting (and no Execution Plan card is attached), ask concisely and optionally append at the very end a single fenced block:\n```vps-questions\n{\"questions\":[{\"question\":\"...\",\"options\":[\"...\",\"...\"]}]}\n```",
     "",
     "### Live Inspected Server Context",
     toolContext,
   ].join("\n");
+}
+
+/**
+ * Formats a detailed, secret-redacted Markdown execution report for a plan
+ * (shared between `POST /api/chat/execute` and YOLO Sandbox auto-execution).
+ */
+export function formatPlanExecutionMarkdown(
+  plan: StoredPlan,
+  rawSummary: string,
+  registry: SystemRegistryStore,
+): string {
+  const safeSummary = redactSecrets(rawSummary);
+  const lines: string[] = [
+    "### Plan Executed",
+    "",
+    safeSummary,
+    "",
+    "**Steps completed:**",
+  ];
+
+  for (const [idx, step] of plan.steps.entries()) {
+    lines.push(`${idx + 1}. ✅ **${step.title}** — ${step.description}`);
+  }
+
+  const stepWithSlug = plan.steps.find(
+    (s) => s.args && typeof s.args.slug === "string" && s.args.slug.trim(),
+  );
+  const slug =
+    stepWithSlug && typeof stepWithSlug.args?.slug === "string"
+      ? stepWithSlug.args.slug.trim()
+      : null;
+  const app = slug ? registry.getAppBySlug(slug) : null;
+
+  if (app) {
+    lines.push("");
+    lines.push("**Workload details:**");
+    lines.push(`- **Slug:** \`${app.slug}\` (${app.kind})`);
+    lines.push(`- **Status:** \`${app.status}\``);
+    lines.push(`- **Folder:** \`${app.folderPath}\``);
+    lines.push(`- **Internal Port:** \`${app.internalPort}\``);
+    lines.push(
+      `- **Access:** ${app.domain ? `https://${app.domain}` : "Internal network only (attach a domain to expose via HTTPS)"}`,
+    );
+  }
+
+  lines.push("");
+  lines.push("Open **Workloads** to inspect container health, endpoints, and live logs.");
+  return lines.join("\n");
 }
 
 function buildUserContentWithAttachments(
@@ -743,18 +800,25 @@ export async function runAgentChatTurn(
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
   const riskLevel = classifyGoalRisk(sanitizedGoal);
-  const hasExecutableOrExplicitMutationIntent =
+  const isConversationalQuestion =
+    /^(what|whats|what's|how|why|when|where|which|who|can|could|would|should|do|does|is|are|explain|tell)\b/i.test(
+      sanitizedGoal,
+    ) || sanitizedGoal.endsWith("?");
+  const hasExecutableDeployOrLifecycle =
     extractDeploySpecFromGoal(sanitizedGoal) !== null ||
     /^\s*(start|stop|restart)\s+(?:the\s+)?(?:app\s+|container\s+|workload\s+)?[a-z0-9][a-z0-9-]{1,47}/i.test(
       sanitizedGoal,
-    ) ||
+    );
+  const hasExplicitMutationVerb =
     riskLevel === "high" ||
     /\b(deploy|install|create|provision|restart|stop|start|domain|backup|plan|route|expose|remove|delete)\b/i.test(
       sanitizedGoal,
     );
   const shouldProposePlan =
     input.mode !== "ask" &&
-    (input.mode === "plan" || hasExecutableOrExplicitMutationIntent);
+    (input.mode === "plan" ||
+      hasExecutableDeployOrLifecycle ||
+      (hasExplicitMutationVerb && !isConversationalQuestion));
 
   appendInitialThought(
     `Classified request risk as **${riskLevel}** in \`${input.mode}\` mode (effort: \`${effort}\`)${
@@ -959,6 +1023,9 @@ export async function runAgentChatTurn(
   }
 
   // Tool 6: Propose approval-gated ExecutionPlan when requested or mutating
+  let yoloExecutionSummary: string | null = null;
+  let yoloExecutionError: string | null = null;
+
   if (shouldProposePlan) {
     const planOutcome = await runTool(
       "propose_plan",
@@ -988,12 +1055,76 @@ export async function runAgentChatTurn(
           emit({ type: "tool_done", toolCall: { ...lastTool } });
         }
       }
+
+      const canYoloAutoExecute =
+        onboarding.persona.approvalMode === "yolo" &&
+        input.mode === "agent" &&
+        Boolean(deps.executePlan) &&
+        !createdPlan.steps.some((step) => step.toolName === "manual_review");
+
+      if (canYoloAutoExecute && deps.executePlan) {
+        if (createdPlan.status === "pending") {
+          createdPlan = deps.registry.recordApproval({
+            planId: createdPlan.id,
+            approved: true,
+            decidedBy: "yolo-mode",
+          });
+        }
+        const proposeTool = toolCalls.at(-1);
+        if (proposeTool && proposeTool.toolName === "propose_plan") {
+          proposeTool.status = "success";
+          emit({ type: "tool_done", toolCall: { ...proposeTool } });
+        }
+        appendInitialThought(
+          `YOLO Sandbox mode active: auto-approved ${createdPlan.steps.length}-step plan and executing immediately.`,
+        );
+
+        const leaseOwnerId = `yolo:${crypto.randomUUID()}`;
+        if (deps.registry.claimPlanExecution(createdPlan.id, leaseOwnerId)) {
+          const execRes = await runTool(
+            "execute_plan",
+            "Auto-execute plan (YOLO Sandbox mode)",
+            { planId: createdPlan.id, steps: createdPlan.steps.map((s) => s.title) },
+            async () => {
+              try {
+                const outcome = await deps.executePlan!(createdPlan!, { leaseOwnerId });
+                deps.registry.markPlanExecuted(createdPlan!.id, leaseOwnerId);
+                const safeSummary = redactSecrets(outcome.summary);
+                deps.registry.recordAudit({
+                  id: crypto.randomUUID(),
+                  actor: "agent",
+                  action: "chat.plan_executed",
+                  targetSlug: null,
+                  summary: redactSecrets(`YOLO executed plan ${createdPlan!.id}: ${safeSummary}`),
+                  riskLevel: "medium",
+                  createdAt: new Date().toISOString(),
+                });
+                createdPlan = deps.registry.getPlan(createdPlan!.id) ?? createdPlan;
+                yoloExecutionSummary = safeSummary;
+                return { summary: safeSummary };
+              } catch (err) {
+                deps.registry.releasePlanExecution(createdPlan!.id, leaseOwnerId);
+                const errMsg = redactSecrets(
+                  err instanceof Error ? err.message : "YOLO execution failed.",
+                );
+                yoloExecutionError = errMsg;
+                throw new Error(errMsg);
+              }
+            },
+          );
+          if (execRes) {
+            appendInitialThought(`YOLO execution succeeded: ${execRes.summary}`);
+          }
+        }
+      } else {
+        appendInitialThought(
+          `Generated ${createdPlan.steps.length}-step plan (${createdPlan.status}) with approval gate ${
+            createdPlan.requiresUserApproval ? "enabled" : "auto-approved (read-only)"
+          }.`,
+        );
+      }
+
       emit({ type: "plan_created", plan: createdPlan });
-      appendInitialThought(
-        `Generated ${createdPlan.steps.length}-step plan (${createdPlan.status}) with approval gate ${
-          createdPlan.requiresUserApproval ? "enabled" : "auto-approved (read-only)"
-        }.`,
-      );
     }
   }
 
@@ -1050,6 +1181,12 @@ export async function runAgentChatTurn(
                 status: createdPlan.status,
                 requiresUserApproval: createdPlan.requiresUserApproval,
                 summary: createdPlan.summary,
+                ...(yoloExecutionSummary
+                  ? { autoExecutedSummary: yoloExecutionSummary }
+                  : {}),
+                ...(yoloExecutionError
+                  ? { autoExecutionError: yoloExecutionError }
+                  : {}),
                 steps: createdPlan.steps.map((s) => ({
                   title: s.title,
                   toolName: s.toolName,

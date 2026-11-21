@@ -14,6 +14,7 @@ import {
 } from "../lib/format";
 import type {
   AppCardView,
+  ApprovalMode,
   AuditEventView,
   ChatAttachmentView,
   ChatMessageView,
@@ -1074,8 +1075,8 @@ export function AgentChat({
     ],
   );
 
-  function handleSendOrQueue() {
-    const text = input.trim();
+  function dispatchUserText(rawText: string) {
+    const text = rawText.trim();
     if (!text || uploadingFiles) return;
 
     recordPromptHistory(text);
@@ -1110,6 +1111,10 @@ export function AgentChat({
     }
 
     void dispatchTurn(payload);
+  }
+
+  function handleSendOrQueue() {
+    dispatchUserText(input);
   }
 
   function handleStopStream() {
@@ -1289,6 +1294,37 @@ export function AgentChat({
     }
   }
 
+  async function handleChangeApprovalMode(nextMode: ApprovalMode) {
+    setChatError(null);
+    try {
+      const res = await fetch("/api/onboarding/approval-mode", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ approvalMode: nextMode }),
+      });
+      if (!res.ok) {
+        const payload = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(payload.error ?? `Failed to switch approval mode (${res.status})`);
+      }
+      onNotify(
+        nextMode === "yolo"
+          ? "YOLO Sandbox mode enabled"
+          : nextMode === "smart"
+            ? "Smart approval mode enabled"
+            : "Manual approval mode enabled",
+        nextMode === "yolo" ? "warning" : "info",
+        nextMode === "yolo"
+          ? "Safe deploys & lifecycle actions auto-execute immediately without pausing."
+          : undefined,
+      );
+      await onRefreshDashboard();
+    } catch (err) {
+      setChatError(
+        err instanceof Error ? err.message : "Could not update approval mode.",
+      );
+    }
+  }
+
   async function handlePlanDecision(planId: string, approved: boolean) {
     setPlanBusyId(planId);
     setChatError(null);
@@ -1308,10 +1344,11 @@ export function AgentChat({
       }
       const data = (await res.json()) as { plan: ExecutionPlanView };
       setPlansById((prev) => ({ ...prev, [data.plan.id]: data.plan }));
-      onNotify(
-        approved ? "Execution plan approved" : "Execution plan rejected",
-        approved ? "success" : "info",
-      );
+      if (approved) {
+        await handleExecutePlan(planId);
+        return;
+      }
+      onNotify("Execution plan rejected", "info");
       void onRefreshDashboard();
     } catch (err) {
       setChatError(err instanceof Error ? err.message : "Could not record approval.");
@@ -1677,6 +1714,7 @@ export function AgentChat({
                     onApprovePlan={(id) => void handlePlanDecision(id, true)}
                     onRejectPlan={(id) => void handlePlanDecision(id, false)}
                     onExecutePlan={(id) => void handleExecutePlan(id)}
+                    onQuickReply={(text) => dispatchUserText(text)}
                   />
                 );
               })
@@ -1737,6 +1775,8 @@ export function AgentChat({
           onChangeInput={setInput}
           onChangeMode={setMode}
           onChangeEffort={setEffort}
+          approvalMode={onboardingPayload?.state.persona.approvalMode ?? "manual"}
+          onChangeApprovalMode={(next) => void handleChangeApprovalMode(next)}
           onAddMention={addMention}
           onRemoveMention={removeMention}
           onSelectProviderModel={handleSelectProviderModel}

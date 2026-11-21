@@ -911,6 +911,51 @@ export function registerOnboardingRoutes(app: Hono, deps: OnboardingRouteDeps): 
     return c.json({ state: updated, hostApply });
   });
 
+  app.post("/api/onboarding/approval-mode", async (c) => {
+    let body: unknown;
+    try {
+      body = await readJsonBody(c, deps.maxBodyBytes);
+    } catch (err) {
+      return handleBodyReadError(c, err);
+    }
+
+    const parsed = z
+      .object({ approvalMode: ApprovalModeSchema })
+      .safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        { error: "Validation failed.", issues: parsed.error.issues },
+        400,
+      );
+    }
+
+    const existing = deps.registry.getOnboardingState();
+    const persona = {
+      ...existing.persona,
+      approvalMode: parsed.data.approvalMode,
+    };
+
+    syncHermesOnboardingFiles({
+      hermesHome: deps.hermesHome,
+      dataDir: deps.dataDir,
+      persona,
+      domain: existing.domain,
+    });
+
+    const updated = deps.registry.saveOnboardingState({ persona });
+    deps.registry.recordAudit({
+      id: crypto.randomUUID(),
+      actor: "user",
+      action: "onboarding.approval_mode_updated",
+      targetSlug: null,
+      summary: `Switched approval guardrail mode to ${persona.approvalMode}.`,
+      riskLevel: "low",
+      createdAt: new Date().toISOString(),
+    });
+
+    return c.json({ state: updated, approvalMode: persona.approvalMode });
+  });
+
   app.post("/api/onboarding/baseline-scan", async (c) => {
     const existing = deps.registry.getOnboardingState();
     const metrics = deps.getMetrics();

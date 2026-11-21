@@ -236,7 +236,7 @@ export const CommunicationStyleSchema = z.enum([
 ]);
 export type CommunicationStyle = z.infer<typeof CommunicationStyleSchema>;
 
-export const ApprovalModeSchema = z.enum(["manual", "smart"]);
+export const ApprovalModeSchema = z.enum(["manual", "smart", "yolo"]);
 export type ApprovalMode = z.infer<typeof ApprovalModeSchema>;
 
 export const PersonaPreferencesSchema = z.object({
@@ -393,9 +393,11 @@ export function renderUserMemoryMarkdown(persona: PersonaPreferences): string {
         ? "Short, direct status updates with actionable next steps."
         : "Calm, plain-English, reassuring summaries with clear next actions.";
   const approvalLine =
-    persona.approvalMode === "manual"
-      ? "Manual confirmation for every server or app change; explain risk clearly and wait for explicit approval."
-      : "Smart approvals: run read-only diagnostics automatically, always confirm before installing, modifying, or removing workloads.";
+    persona.approvalMode === "yolo"
+      ? "YOLO Sandbox Mode: auto-approve and execute safe container deploys & lifecycle actions immediately (destructive host actions still blocked)."
+      : persona.approvalMode === "manual"
+        ? "Manual confirmation for every server or app change; explain risk clearly and wait for explicit approval."
+        : "Smart approvals: run read-only diagnostics automatically, always confirm before installing, modifying, or removing workloads.";
 
   const content = [
     "# Server Owner Profile",
