@@ -4,8 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { createExecutionPlan, executeApprovedPlan } from "@vps-os/agent";
 import { createDashboardApp } from "@vps-os/dashboard-api";
-import { SystemRegistryStore } from "@vps-os/shared";
+import { SystemRegistryStore, type RuntimeBridge } from "@vps-os/shared";
 
 test("Agentic Chat API supports threads, file uploads with secret redaction, reasoning traces, tool calls, and inline plans", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-chat-"));
@@ -916,7 +917,284 @@ test("YOLO Sandbox mode auto-approves and executes safe deploys while blocking m
     };
     assert.equal(executedCount, 2);
     assert.equal(wipeJson.plan?.status, "pending");
+
+    // 6. Complaint mentioning "plan" ("you havent sent any plan") does NOT create a fake manual_review plan
+    const complaintRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        content: "you havent sent any plan",
+        mode: "agent",
+        stream: false,
+      }),
+    });
+    assert.equal(complaintRes.status, 200);
+    const complaintJson = (await complaintRes.json()) as { plan: unknown };
+    assert.equal(complaintJson.plan, null);
+    assert.equal(executedCount, 2);
+
+    // 7. "remove all 2 current workloads" generates real multi-step remove_workload steps (not manual_review)
+    const nowIso = new Date().toISOString();
+    registry.upsertApp({
+      slug: "hello-v2",
+      name: "Hello V2",
+      kind: "web-app",
+      domain: null,
+      internalPort: 8080,
+      folderPath: "/apps/hello-v2",
+      status: "error",
+      cpuLimit: "0.5",
+      memoryLimitMb: 512,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+    registry.upsertApp({
+      slug: "hello-beta",
+      name: "Hello Beta",
+      kind: "web-app",
+      domain: null,
+      internalPort: 8080,
+      folderPath: "/apps/hello-beta",
+      status: "error",
+      cpuLimit: "0.5",
+      memoryLimitMb: 512,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+    const removeAllRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        content: "remove all 2 current workloads",
+        mode: "agent",
+        stream: false,
+      }),
+    });
+    assert.equal(removeAllRes.status, 200);
+    const removeAllJson = (await removeAllRes.json()) as {
+      plan: { status: string; steps: Array<{ toolName: string }> } | null;
+    };
+    assert.equal(removeAllJson.plan?.status, "executed");
+    assert.equal(
+      removeAllJson.plan?.steps.filter((s) => s.toolName === "remove_workload").length,
+      2,
+    );
+    assert.equal(executedCount, 3);
   } finally {
+    registry.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("LLM-emitted vps-plan creates executable card, strips JSON block, passes truthful null proposedPlan, and executes multi-step remove + route plans", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-chat-vpsplan-"));
+  const dataDir = path.join(tempDir, "data");
+  const envPath = path.join(tempDir, "config", "onboarding.env");
+  const registry = new SystemRegistryStore(path.join(dataDir, "registry.db"));
+
+  const nowIso = new Date().toISOString();
+  registry.upsertApp({
+    slug: "legacy-app",
+    name: "Legacy App",
+    kind: "web-app",
+    domain: null,
+    internalPort: 8080,
+    folderPath: "/apps/legacy-app",
+    status: "running",
+    cpuLimit: "0.5",
+    memoryLimitMb: 512,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  });
+
+  const removedCalls: string[] = [];
+  const routedCalls: Array<{ slug: string; domain: string | null }> = [];
+  const fakeBridge: RuntimeBridge = {
+    async health() {
+      return { ok: true };
+    },
+    async lifecycle() {
+      return { ok: true, slug: "legacy-app", status: "running" };
+    },
+    async getLogs() {
+      return [];
+    },
+    async routeCaddy(input) {
+      routedCalls.push({ slug: input.slug, domain: input.domain });
+      return { ok: true, slug: input.slug, domain: input.domain, routed: Boolean(input.domain) };
+    },
+    async removeWorkload(slug) {
+      removedCalls.push(slug);
+      return { ok: true, slug };
+    },
+    async getStatuses() {
+      return { "legacy-app": "running" };
+    },
+  };
+
+  let capturedSystemPrompt = "";
+  const mockFetch: typeof fetch = async (_url, init) => {
+    const parsedBody = JSON.parse(String(init?.body ?? "{}")) as {
+      messages?: Array<{ role: string; content: string }>;
+    };
+    capturedSystemPrompt =
+      parsedBody.messages?.find((m) => m.role === "system")?.content ?? "";
+
+    const llmReply = [
+      "I prepared a removal plan for `legacy-app` below.",
+      "",
+      "```vps-plan",
+      JSON.stringify({
+        goal: "Remove legacy-app cleanly",
+        summary: "Stop and delete legacy-app container and files.",
+        steps: [
+          {
+            title: "Remove legacy-app",
+            description: "Tear down container, Caddy route, and files.",
+            toolName: "remove_workload",
+            args: { slug: "legacy-app", removeFiles: true },
+          },
+        ],
+      }),
+      "```",
+    ].join("\n");
+
+    return new Response(
+      JSON.stringify({
+        choices: [{ message: { content: llmReply, reasoning_content: "Checking workloads." } }],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+
+  const app = createDashboardApp({
+    registry,
+    adminToken: "vps-plan-test-admin-token-1234",
+    dataDir,
+    onboardingEnvPath: envPath,
+    chatFetch: mockFetch,
+    executePlan: (plan) =>
+      executeApprovedPlan(plan, {
+        registry,
+        appsRoot: path.join(tempDir, "apps"),
+        templatesRoot: path.join(tempDir, "templates"),
+        runtimeBridge: fakeBridge,
+      }),
+  });
+
+  const authHeaders = {
+    authorization: "Bearer vps-plan-test-admin-token-1234",
+  };
+
+  try {
+    // Configure provider in registry + env file
+    const provRes = await app.request("/api/onboarding/provider", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        provider: "opencode",
+        model: "glm-5.3",
+        apiKey: "test-zen-key-secret-value",
+      }),
+    });
+    assert.equal(provRes.status, 200);
+    registry.saveOnboardingState({
+      persona: {
+        ownerName: "Tester",
+        technicalLevel: "non-technical",
+        communicationStyle: "plain-english",
+        approvalMode: "manual",
+      },
+    });
+
+    const threadRes = await app.request("/api/chat/threads", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ title: "Follow-up Plan Test" }),
+    });
+    const { thread } = (await threadRes.json()) as { thread: { id: string } };
+
+    // "can you do it?" has no pre-turn regex match -> LLM receives proposedPlan: null and emits ```vps-plan```
+    const msgRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        content: "can you do it?",
+        mode: "agent",
+        stream: false,
+      }),
+    });
+    assert.equal(msgRes.status, 200);
+    const msgJson = (await msgRes.json()) as {
+      assistantMessage: { content: string; planId: string | null };
+      plan: { id: string; status: string; steps: Array<{ toolName: string }> } | null;
+    };
+
+    assert.match(capturedSystemPrompt, /"proposedPlan": null/);
+    assert.doesNotMatch(msgJson.assistantMessage.content, /```vps-plan/);
+    assert.ok(msgJson.plan);
+    assert.equal(msgJson.plan.status, "pending");
+    assert.equal(msgJson.plan.steps[0]?.toolName, "remove_workload");
+    assert.equal(msgJson.assistantMessage.planId, msgJson.plan.id);
+
+    // Approve & execute via executeApprovedPlan -> actually calls runtimeBridge.removeWorkload + removes registry row
+    await app.request("/api/chat/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        planId: msgJson.plan.id,
+        approved: true,
+        decidedBy: "admin",
+      }),
+    });
+    const execRes = await app.request("/api/chat/execute", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ planId: msgJson.plan.id }),
+    });
+    assert.equal(execRes.status, 200);
+    assert.deepEqual(removedCalls, ["legacy-app"]);
+    assert.equal(registry.getAppBySlug("legacy-app"), null);
+
+    // Also verify route_caddy plan works end-to-end
+    registry.upsertApp({
+      slug: "landing",
+      name: "Landing",
+      kind: "web-app",
+      domain: null,
+      internalPort: 8080,
+      folderPath: "/apps/landing",
+      status: "running",
+      cpuLimit: "0.5",
+      memoryLimitMb: 512,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+    const routePlan = registry.savePlan(
+      createExecutionPlan("route landing to landing.109-199-127-133.sslip.io", [
+        "landing",
+      ]),
+    );
+    const approvedRoute = registry.recordApproval({
+      planId: routePlan.id,
+      approved: true,
+      decidedBy: "admin",
+    });
+    await executeApprovedPlan(approvedRoute, {
+      registry,
+      appsRoot: path.join(tempDir, "apps"),
+      templatesRoot: path.join(tempDir, "templates"),
+      runtimeBridge: fakeBridge,
+    });
+    assert.deepEqual(routedCalls, [
+      { slug: "landing", domain: "landing.109-199-127-133.sslip.io" },
+    ]);
+    assert.equal(
+      registry.getAppBySlug("landing")?.domain,
+      "landing.109-199-127-133.sslip.io",
+    );
+  } finally {
+    delete process.env.OPENCODE_API_KEY;
     registry.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

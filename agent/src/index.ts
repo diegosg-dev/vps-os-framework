@@ -166,7 +166,10 @@ export function createAgentHttpServer(options: AgentServerOptions = {}): {
           return;
         }
         const sanitizedGoal = redactSecrets(parsed.goal);
-        const storedPlan = registry.savePlan(createExecutionPlan(sanitizedGoal));
+        const knownSlugs = registry.listApps().map((app) => app.slug);
+        const storedPlan = registry.savePlan(
+          createExecutionPlan(sanitizedGoal, knownSlugs),
+        );
         sendJson(res, 200, {
           plan: storedPlan,
           registeredApps: registry.listApps().length,

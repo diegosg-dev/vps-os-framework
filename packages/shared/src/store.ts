@@ -361,6 +361,22 @@ export class SystemRegistryStore {
     return result.changes > 0;
   }
 
+  /** Updates an existing app's routed public domain (or clears it to null) and timestamp. */
+  updateAppDomain(
+    slug: string,
+    domain: string | null,
+    updatedAt?: string,
+  ): boolean {
+    const safeSlug = validateAppSlug(slug);
+    const safeDomain = domain ? validateDomain(domain) : null;
+    const ts = updatedAt ?? new Date().toISOString();
+    const stmt = this.db.prepare(
+      "UPDATE apps SET domain = ?, updated_at = ? WHERE slug = ?",
+    );
+    const result = stmt.run(safeDomain, ts, safeSlug);
+    return result.changes > 0;
+  }
+
   /** Marks or clears the cleanup-pending flag on a failed-deploy app record. */
   setAppCleanupPending(slug: string, pending: boolean): boolean {
     const safeSlug = validateAppSlug(slug);
