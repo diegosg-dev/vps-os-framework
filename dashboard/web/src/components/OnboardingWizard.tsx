@@ -1125,7 +1125,7 @@ export function OnboardingWizard({
                 </button>
               </div>
 
-              <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-3 sm:grid-cols-3">
                 <button
                   type="button"
                   onClick={() => setApprovalMode("manual")}
@@ -1152,6 +1152,20 @@ export function OnboardingWizard({
                   <span className="font-semibold">Smart Mode</span>
                   <p className="mt-1 text-[11px] text-[var(--text-muted)]">
                     Auto-run read-only health checks; confirm all installs &amp; edits.
+                  </p>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setApprovalMode("yolo")}
+                  className={`rounded-xl border p-3 text-left text-xs transition ${
+                    approvalMode === "yolo"
+                      ? "border-[var(--warning)] bg-[var(--warning-soft)] text-[var(--text-primary)]"
+                      : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)]"
+                  }`}
+                >
+                  <span className="font-semibold">YOLO (Sandbox)</span>
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">
+                    Auto-execute safe container deploys &amp; restarts without pausing.
                   </p>
                 </button>
               </div>
@@ -1365,9 +1379,11 @@ export function OnboardingWizard({
                 <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-3">
                   <dt className="text-[var(--text-muted)]">Approval Guardrail</dt>
                   <dd className="mt-1 font-semibold text-[var(--text-primary)]">
-                    {state.persona.approvalMode === "manual"
-                      ? "Manual confirmation before every change"
-                      : "Smart (auto-read, confirm mutations)"}
+                    {state.persona.approvalMode === "yolo"
+                      ? "YOLO (auto-execute safe container deploys)"
+                      : state.persona.approvalMode === "manual"
+                        ? "Manual confirmation before every change"
+                        : "Smart (auto-read, confirm mutations)"}
                   </dd>
                 </div>
                 <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-3">

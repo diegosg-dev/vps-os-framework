@@ -39,6 +39,7 @@ import {
   verifySessionToken,
 } from "./onboarding.js";
 import { registerChatRoutes } from "./chat-routes.js";
+import { formatPlanExecutionMarkdown } from "./chat-engine.js";
 import { registerOnboardingRoutes } from "./onboarding-routes.js";
 import { readStaticUiAssetAsync } from "./static.js";
 
@@ -372,6 +373,7 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
     getDisk,
     syncStatuses: deps.workloadController?.syncStatuses,
     getLogs: deps.workloadController?.getLogs,
+    executePlan: deps.executePlan,
     fetchFn: deps.chatFetch,
     disableExternalLlm: deps.disableExternalLlm,
   });
@@ -814,13 +816,7 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
     });
 
     const followUpMessage = appendPlanFollowUpMessage(
-      [
-        "### Plan Executed",
-        "",
-        safeSummary,
-        "",
-        "Open **Workloads** to inspect container health, endpoints, and live logs.",
-      ].join("\n"),
+      formatPlanExecutionMarkdown(existing, safeSummary, deps.registry),
       "completed",
     );
 

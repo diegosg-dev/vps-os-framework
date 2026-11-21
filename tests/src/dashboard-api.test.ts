@@ -404,6 +404,7 @@ test("Dashboard Control API supports app detail, lifecycle, redacted logs, and p
     assert.equal(execJson.followUpMessage?.threadId, chatThread.id);
     assert.equal(execJson.followUpMessage?.role, "assistant");
     assert.match(execJson.followUpMessage?.content ?? "", /Plan Executed/);
+    assert.match(execJson.followUpMessage?.content ?? "", /Steps completed:/);
     const threadMsgs = registry.listChatMessages(chatThread.id);
     assert.equal(threadMsgs.length, 2);
     assert.equal(threadMsgs[1]?.id, execJson.followUpMessage?.id);

@@ -736,7 +736,7 @@ test("Agent mode skips bogus manual_review plans on conversational prompts and e
     });
     const { thread } = (await threadRes.json()) as { thread: { id: string } };
 
-    for (const prompt of ["whats the link", "via ip", "approve"]) {
+    for (const prompt of ["whats the link", "via ip", "approve", "what should I deploy?"]) {
       const res = await app.request(`/api/chat/threads/${thread.id}/messages`, {
         method: "POST",
         headers: { "content-type": "application/json", ...authHeaders },
@@ -762,6 +762,90 @@ test("Agent mode skips bogus manual_review plans on conversational prompts and e
       assert.equal(metricsTool?.output?.publicIp, "109.199.127.133");
       assert.equal(metricsTool?.output?.dashboardUrl, "http://109.199.127.133");
     }
+  } finally {
+    registry.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("YOLO Sandbox mode auto-approves and executes safe deploys while blocking manual_review goals", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-chat-yolo-"));
+  const dataDir = path.join(tempDir, "data");
+  const registry = new SystemRegistryStore(path.join(dataDir, "registry.db"));
+
+  let executedCount = 0;
+  const app = createDashboardApp({
+    registry,
+    adminToken: "master-admin-token-for-yolo-tests",
+    dataDir,
+    disableExternalLlm: true,
+    executePlan: async (plan) => {
+      executedCount += 1;
+      return {
+        summary: `Provisioned workload for ${plan.goal}`,
+      };
+    },
+  });
+  const authHeaders = {
+    authorization: "Bearer master-admin-token-for-yolo-tests",
+  };
+
+  try {
+    // 1. Toggle YOLO mode via onboarding/approval-mode route
+    const modeRes = await app.request("/api/onboarding/approval-mode", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ approvalMode: "yolo" }),
+    });
+    assert.equal(modeRes.status, 200);
+    assert.equal(registry.getOnboardingState().persona.approvalMode, "yolo");
+
+    const threadRes = await app.request("/api/chat/threads", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ title: "YOLO tests" }),
+    });
+    const { thread } = (await threadRes.json()) as { thread: { id: string } };
+
+    // 2. Safe deploy auto-approves & executes immediately without pausing
+    const deployRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        content: "Deploy hello-yolo web app in its own isolated container",
+        mode: "agent",
+        stream: false,
+      }),
+    });
+    assert.equal(deployRes.status, 200);
+    const deployJson = (await deployRes.json()) as {
+      assistantMessage: { toolCalls: Array<{ toolName: string; status: string }> };
+      plan: { status: string } | null;
+    };
+    assert.equal(executedCount, 1);
+    assert.equal(deployJson.plan?.status, "executed");
+    assert.ok(
+      deployJson.assistantMessage.toolCalls.some(
+        (tc) => tc.toolName === "execute_plan" && tc.status === "success",
+      ),
+    );
+
+    // 3. Destructive manual_review goal still stays pending and never auto-executes
+    const wipeRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        content: "Disable ufw firewall on the host",
+        mode: "agent",
+        stream: false,
+      }),
+    });
+    assert.equal(wipeRes.status, 200);
+    const wipeJson = (await wipeRes.json()) as {
+      plan: { status: string } | null;
+    };
+    assert.equal(executedCount, 1);
+    assert.equal(wipeJson.plan?.status, "pending");
   } finally {
     registry.close();
     fs.rmSync(tempDir, { recursive: true, force: true });

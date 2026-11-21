@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { formatRelativeTime, providerDisplayName } from "../lib/format";
 import type {
+  ApprovalMode,
   DnsCheckView,
   OnboardingPayload,
   ThemeMode,
@@ -48,7 +49,38 @@ export function SettingsView({
 }: SettingsViewProps) {
   const [scanning, setScanning] = useState(false);
   const [verifyingDns, setVerifyingDns] = useState(false);
+  const [savingApproval, setSavingApproval] = useState(false);
   const [dnsMessage, setDnsMessage] = useState<string | null>(null);
+
+  async function handleChangeApprovalMode(nextMode: ApprovalMode) {
+    setSavingApproval(true);
+    try {
+      const res = await fetch("/api/onboarding/approval-mode", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ approvalMode: nextMode }),
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error ?? `HTTP ${res.status}`);
+      }
+      await onRefreshState();
+      onNotify(
+        nextMode === "yolo"
+          ? "YOLO Sandbox mode enabled"
+          : `Approval mode set to ${nextMode}`,
+        nextMode === "yolo" ? "warning" : "success",
+      );
+    } catch (err) {
+      onNotify(
+        "Failed to update approval mode",
+        "error",
+        err instanceof Error ? err.message : undefined,
+      );
+    } finally {
+      setSavingApproval(false);
+    }
+  }
 
   const state = onboardingPayload?.state;
   const hermes = onboardingPayload?.hermesStatus;
@@ -320,12 +352,35 @@ export function SettingsView({
                   {hermes?.reachable ? "Online & Connected" : hermes?.detail ?? "Standby"}
                 </dd>
               </div>
-              <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] px-3.5 py-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] px-3.5 py-2.5">
                 <dt className="text-[var(--text-muted)]">Approval Guardrail</dt>
-                <dd className="capitalize text-[var(--text-primary)]">
-                  {state?.persona.approvalMode === "smart"
-                    ? "Smart (auto-read)"
-                    : "Manual (strict)"}
+                <dd className="flex items-center gap-1">
+                  {(
+                    [
+                      { id: "manual", label: "Manual" },
+                      { id: "smart", label: "Smart" },
+                      { id: "yolo", label: "YOLO" },
+                    ] as const
+                  ).map((opt) => {
+                    const active = (state?.persona.approvalMode ?? "manual") === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        disabled={savingApproval}
+                        onClick={() => void handleChangeApprovalMode(opt.id)}
+                        className={`rounded-lg border px-2 py-0.5 text-[11px] font-semibold transition ${
+                          active
+                            ? opt.id === "yolo"
+                              ? "border-[var(--warning-border)] bg-[var(--warning-soft)] text-[var(--warning)]"
+                              : "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                            : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
                 </dd>
               </div>
               <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] px-3.5 py-2.5">

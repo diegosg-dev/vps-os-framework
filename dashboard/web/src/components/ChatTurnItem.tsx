@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   formatBytes,
   formatDuration,
@@ -47,6 +47,50 @@ interface ChatTurnItemProps {
   onApprovePlan: (planId: string) => void;
   onRejectPlan: (planId: string) => void;
   onExecutePlan: (planId: string) => void;
+  onQuickReply?: (text: string) => void;
+}
+
+interface ClarifyingQuestion {
+  question: string;
+  options: string[];
+}
+
+function parseClarifyingQuestions(content: string): {
+  cleanContent: string;
+  questions: ClarifyingQuestion[];
+} {
+  const match = content.match(/```vps-questions\s*\n([\s\S]*?)\n```\s*$/);
+  if (!match?.[1]) {
+    return { cleanContent: content, questions: [] };
+  }
+  try {
+    const parsed = JSON.parse(match[1]) as {
+      questions?: Array<{ question?: unknown; options?: unknown }>;
+    };
+    const questions: ClarifyingQuestion[] = [];
+    if (Array.isArray(parsed.questions)) {
+      for (const item of parsed.questions.slice(0, 3)) {
+        if (typeof item?.question !== "string" || !item.question.trim()) continue;
+        const options = Array.isArray(item.options)
+          ? item.options
+              .filter((o): o is string => typeof o === "string" && o.trim().length > 0)
+              .slice(0, 5)
+          : [];
+        if (options.length > 0) {
+          questions.push({ question: item.question.trim(), options });
+        }
+      }
+    }
+    if (questions.length === 0) {
+      return { cleanContent: content, questions: [] };
+    }
+    return {
+      cleanContent: content.slice(0, match.index).trimEnd(),
+      questions,
+    };
+  } catch {
+    return { cleanContent: content, questions: [] };
+  }
 }
 
 /** Loads an authenticated attachment image via Bearer headers and caches a blob URL. */
@@ -360,7 +404,7 @@ function InlinePlanCard({
               className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
             >
               <CheckCircleIcon className="h-3.5 w-3.5" />
-              {busy ? "Saving..." : "Approve Plan"}
+              {busy ? "Approving & executing..." : "Approve & Execute"}
             </button>
             <button
               type="button"
@@ -421,11 +465,16 @@ export function ChatTurnItem({
   onApprovePlan,
   onRejectPlan,
   onExecutePlan,
+  onQuickReply,
 }: ChatTurnItemProps) {
   const [copied, setCopied] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draftEdit, setDraftEdit] = useState(message.content);
   const [timelineExpanded, setTimelineExpanded] = useState(true);
+  const { cleanContent, questions } = useMemo(
+    () => parseClarifyingQuestions(message.content),
+    [message.content],
+  );
 
   useEffect(() => {
     if (message.status === "streaming") {
@@ -680,9 +729,35 @@ export function ChatTurnItem({
         )}
 
         {/* Markdown Answer Body */}
-        {message.content && (
+        {cleanContent && (
           <div className="pt-0.5">
-            <MarkdownContent content={message.content} />
+            <MarkdownContent content={cleanContent} />
+          </div>
+        )}
+
+        {/* Interactive Clarifying Questions (clickable quick replies) */}
+        {questions.length > 0 && !linkedPlan && (
+          <div className="vps-card space-y-2.5 rounded-2xl border-[var(--accent-border)] bg-[var(--bg-inset)] p-3.5">
+            {questions.map((q) => (
+              <div key={q.question} className="space-y-1.5">
+                <p className="text-xs font-medium text-[var(--text-primary)]">
+                  {q.question}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {q.options.map((opt) => (
+                    <button
+                      key={opt}
+                      type="button"
+                      disabled={streaming || !onQuickReply}
+                      onClick={() => onQuickReply?.(opt)}
+                      className="rounded-xl border border-[var(--border-default)] bg-[var(--bg-surface)] px-2.5 py-1 text-xs font-medium text-[var(--text-primary)] transition hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)] disabled:opacity-40"
+                    >
+                      {opt}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
         )}
 

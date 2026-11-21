@@ -37,6 +37,7 @@ export interface ChatRouteDeps {
   getDisk: () => DiskMetrics | null;
   syncStatuses?: ChatEngineDeps["syncStatuses"];
   getLogs?: ChatEngineDeps["getLogs"];
+  executePlan?: ChatEngineDeps["executePlan"];
   fetchFn?: typeof fetch | undefined;
   disableExternalLlm?: boolean | undefined;
 }
@@ -124,6 +125,7 @@ export function registerChatRoutes(app: Hono, deps: ChatRouteDeps): void {
     onboardingEnvPath: deps.onboardingEnvPath,
     syncStatuses: deps.syncStatuses,
     getLogs: deps.getLogs,
+    executePlan: deps.executePlan,
     fetchFn: deps.fetchFn,
     disableExternalLlm: deps.disableExternalLlm,
   };

@@ -236,6 +236,8 @@ export interface BaselineScanView {
   summary: string;
 }
 
+export type ApprovalMode = "manual" | "smart" | "yolo";
+
 export interface OnboardingStateView {
   completed: boolean;
   completedAt: string | null;
@@ -255,7 +257,7 @@ export interface OnboardingStateView {
     ownerName: string;
     technicalLevel: "non-technical" | "developer";
     communicationStyle: "plain-english" | "concise" | "detailed";
-    approvalMode: "manual" | "smart";
+    approvalMode: ApprovalMode;
   };
   baselineScan: BaselineScanView | null;
   updatedAt: string;

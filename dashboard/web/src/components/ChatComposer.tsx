@@ -10,6 +10,7 @@ import {
 import { formatBytes, providerDisplayName } from "../lib/format";
 import type {
   AppCardView,
+  ApprovalMode,
   ChatAttachmentView,
   ChatMode,
   LlmProviderId,
@@ -152,6 +153,8 @@ interface ChatComposerProps {
   onChangeInput: (value: string) => void;
   onChangeMode: (mode: ChatMode) => void;
   onChangeEffort: (effort: ReasoningEffort) => void;
+  approvalMode: ApprovalMode;
+  onChangeApprovalMode: (mode: ApprovalMode) => void;
   onAddMention: (slug: string) => void;
   onRemoveMention: (slug: string) => void;
   onSelectProviderModel: (provider: LlmProviderId, model: string) => void;
@@ -186,6 +189,8 @@ export function ChatComposer({
   onChangeInput,
   onChangeMode,
   onChangeEffort,
+  approvalMode,
+  onChangeApprovalMode,
   onAddMention,
   onRemoveMention,
   onSelectProviderModel,
@@ -953,6 +958,27 @@ export function ChatComposer({
                   </div>
                 )}
               </div>
+
+              {/* YOLO Sandbox Auto-Execute Toggle */}
+              <button
+                type="button"
+                onClick={() =>
+                  onChangeApprovalMode(approvalMode === "yolo" ? "manual" : "yolo")
+                }
+                title={
+                  approvalMode === "yolo"
+                    ? "YOLO Sandbox mode ON: safe deploys & lifecycle actions auto-execute immediately (click to restore Manual approvals)"
+                    : "Enable YOLO Sandbox mode: skip approval prompts for safe container deploys & lifecycle actions"
+                }
+                className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-semibold transition ${
+                  approvalMode === "yolo"
+                    ? "border-[var(--warning-border)] bg-[var(--warning-soft)] text-[var(--warning)]"
+                    : "border-[var(--border-subtle)] bg-[var(--bg-inset)] text-[var(--text-secondary)] hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]"
+                }`}
+              >
+                <ZapIcon className="h-3 w-3" />
+                <span>{approvalMode === "yolo" ? "YOLO ON" : "YOLO"}</span>
+              </button>
 
               {/* Multi-Provider & Model Switcher */}
               <div className="relative">
