@@ -26,11 +26,14 @@ import type { DiskMetrics } from "./metrics.js";
 import {
   type DnsVerificationResult,
   type HermesHealthStatus,
+  type ProviderModelsInput,
+  type ProviderModelsResult,
   type ProviderTestInput,
   type ProviderTestResult,
   buildBaselineScan,
   checkHermesGatewayHealth,
   detectPublicIp,
+  discoverLlmProviderModels,
   isSetupClaimAvailable,
   issueSessionToken,
   readHostApplyStatus,
@@ -65,6 +68,9 @@ export interface OnboardingRouteDeps {
     | undefined;
   testProviderConnection?:
     | ((input: ProviderTestInput) => Promise<ProviderTestResult>)
+    | undefined;
+  discoverProviderModels?:
+    | ((input: ProviderModelsInput) => Promise<ProviderModelsResult>)
     | undefined;
   checkHermesHealth?: (() => Promise<HermesHealthStatus>) | undefined;
   triggerHostApply?:
@@ -115,6 +121,18 @@ const DomainSetupRequestSchema = z
 
 const DomainVerifyRequestSchema = z.object({
   domain: optionalTrimmedString(z.string().trim().max(253)),
+});
+
+const ProviderModelsRequestSchema = z.object({
+  provider: LlmProviderSchema,
+  apiKey: optionalTrimmedString(
+    z
+      .string()
+      .trim()
+      .max(512)
+      .refine((val) => !/[\r\n\0]/.test(val), "Invalid characters in API key."),
+  ),
+  baseUrl: optionalTrimmedString(z.string().trim().max(300)),
 });
 
 const ProviderConfigRequestSchema = z.object({
@@ -264,6 +282,7 @@ export function registerOnboardingRoutes(app: Hono, deps: OnboardingRouteDeps): 
     (async () => (deps.publicIp !== undefined ? deps.publicIp : detectPublicIp()));
   const verifyDnsFn = deps.verifyDns ?? verifyDomainDns;
   const testProviderFn = deps.testProviderConnection ?? testLlmProviderConnection;
+  const discoverModelsFn = deps.discoverProviderModels ?? discoverLlmProviderModels;
   const checkHermesFn =
     deps.checkHermesHealth ??
     (() => checkHermesGatewayHealth(deps.hermesGatewayUrl, deps.hermesApiServerKey));
@@ -603,6 +622,69 @@ export function registerOnboardingRoutes(app: Hono, deps: OnboardingRouteDeps): 
     return c.json({ state: updated, dnsCheck });
   });
 
+  const resolveStoredProviderApiKey = (
+    provider: z.infer<typeof LlmProviderSchema>,
+    providedKey?: string,
+  ): string | undefined => {
+    if (providedKey || !deps.onboardingEnvPath) return providedKey;
+    const existing = deps.registry.getOnboardingState();
+    if (existing.llmConfigured && existing.llmProvider === provider) {
+      const savedEnv = readOnboardingEnvValues(deps.onboardingEnvPath);
+      return (
+        savedEnv.LLM_API_KEY ||
+        savedEnv.OPENCODE_API_KEY ||
+        savedEnv.OPENCODE_SERVER_PASSWORD ||
+        undefined
+      );
+    }
+    return undefined;
+  };
+
+  app.post("/api/onboarding/provider/models", async (c) => {
+    let body: unknown;
+    try {
+      body = await readJsonBody(c, deps.maxBodyBytes);
+    } catch (err) {
+      return handleBodyReadError(c, err);
+    }
+
+    const parsed = ProviderModelsRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        { error: "Validation failed.", issues: parsed.error.issues },
+        400,
+      );
+    }
+
+    if (parsed.data.baseUrl) {
+      try {
+        validateHttpBaseUrl(parsed.data.baseUrl);
+      } catch (err) {
+        return c.json(
+          { error: err instanceof Error ? err.message : "Invalid base URL." },
+          400,
+        );
+      }
+    }
+
+    const effectiveApiKey = resolveStoredProviderApiKey(
+      parsed.data.provider,
+      parsed.data.apiKey,
+    );
+
+    const discovered = await discoverModelsFn({
+      provider: parsed.data.provider,
+      apiKey: effectiveApiKey,
+      baseUrl: parsed.data.baseUrl,
+    });
+
+    return c.json({
+      models: discovered.models,
+      source: discovered.source,
+      ...(discovered.message ? { message: redactSecrets(discovered.message) } : {}),
+    });
+  });
+
   app.post("/api/onboarding/provider/test", async (c) => {
     let body: unknown;
     try {
@@ -630,18 +712,10 @@ export function registerOnboardingRoutes(app: Hono, deps: OnboardingRouteDeps): 
       }
     }
 
-    let effectiveApiKey = parsed.data.apiKey;
-    if (!effectiveApiKey && deps.onboardingEnvPath) {
-      const existing = deps.registry.getOnboardingState();
-      if (existing.llmConfigured && existing.llmProvider === parsed.data.provider) {
-        const savedEnv = readOnboardingEnvValues(deps.onboardingEnvPath);
-        effectiveApiKey =
-          savedEnv.LLM_API_KEY ||
-          savedEnv.OPENCODE_API_KEY ||
-          savedEnv.OPENCODE_SERVER_PASSWORD ||
-          undefined;
-      }
-    }
+    const effectiveApiKey = resolveStoredProviderApiKey(
+      parsed.data.provider,
+      parsed.data.apiKey,
+    );
 
     const result = await testProviderFn({
       provider: parsed.data.provider,

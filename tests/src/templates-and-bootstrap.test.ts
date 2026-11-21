@@ -362,14 +362,39 @@ test("bootstrap/install.sh harden_ssh guards against password-only VPS lockout",
   }
 });
 
-test("bootstrap/install.sh ensure_hermes installs headless and preserves INSTALL_HERMES opt-out", () => {
+test("bootstrap/install.sh uses non-interactive apt_get with lock timeout and verbose Hermes install", () => {
   const scriptPath = path.join(REPO_ROOT, "bootstrap", "install.sh");
   const script = fs.readFileSync(scriptPath, "utf8");
 
   assert.match(
     script,
-    /curl -fsSL https:\/\/hermes-agent\.nousresearch\.com\/install\.sh \|\s*HERMES_HOME="\$\{HERMES_HOME\}" bash -s -- --non-interactive --skip-browser --skip-computer-use/,
-    "ensure_hermes must invoke Hermes installer with headless non-interactive flags",
+    /export DEBIAN_FRONTEND="\$\{DEBIAN_FRONTEND:-noninteractive\}"/,
+    "install.sh must export DEBIAN_FRONTEND=noninteractive",
+  );
+  assert.match(
+    script,
+    /export NEEDRESTART_MODE="\$\{NEEDRESTART_MODE:-a\}"/,
+    "install.sh must export NEEDRESTART_MODE=a",
+  );
+  assert.match(
+    script,
+    /export NEEDRESTART_SUSPEND="\$\{NEEDRESTART_SUSPEND:-1\}"/,
+    "install.sh must export NEEDRESTART_SUSPEND=1",
+  );
+  assert.match(
+    script,
+    /apt-get -o DPkg::Lock::Timeout=120 "\$@"/,
+    "apt_get helper must wait up to 120s for dpkg lock",
+  );
+  assert.doesNotMatch(
+    script,
+    /^\s*apt-get\s+(update|install)\b/m,
+    "install.sh should route apt-get calls through apt_get helper",
+  );
+  assert.match(
+    script,
+    /curl -fsSL https:\/\/hermes-agent\.nousresearch\.com\/install\.sh \|\s*HERMES_HOME="\$\{HERMES_HOME\}" bash -s -- --non-interactive --skip-browser --skip-computer-use --verbose/,
+    "ensure_hermes must invoke Hermes installer with headless non-interactive and verbose flags",
   );
   assert.match(
     script,

@@ -15,6 +15,10 @@ VPS_OS_REPO_URL="${VPS_OS_REPO_URL:-https://github.com/diegosg-dev/vps-os-framew
 VPS_OS_REPO_REF="${VPS_OS_REPO_REF:-main}"
 VPS_OS_REPO_DIR="${VPS_OS_REPO_DIR:-/opt/vps-os-framework}"
 
+export DEBIAN_FRONTEND="${DEBIAN_FRONTEND:-noninteractive}"
+export NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}"
+export NEEDRESTART_SUSPEND="${NEEDRESTART_SUSPEND:-1}"
+
 FORCE_OVERWRITE=""
 NON_INTERACTIVE="false"
 ARG_DOMAIN=""
@@ -37,6 +41,13 @@ fi
 
 log() {
   printf '[vps-os-bootstrap] %s\n' "$1"
+}
+
+apt_get() {
+  DEBIAN_FRONTEND=noninteractive \
+  NEEDRESTART_MODE=a \
+  NEEDRESTART_SUSPEND=1 \
+    apt-get -o DPkg::Lock::Timeout=120 "$@"
 }
 
 usage() {
@@ -132,8 +143,8 @@ ensure_repo_checkout() {
 
   if ! command -v git >/dev/null 2>&1; then
     log "Installing git to fetch VPS OS repository..."
-    apt-get update -y
-    apt-get install -y git ca-certificates curl
+    apt_get update -y
+    apt_get install -y git ca-certificates curl
   fi
 
   if [[ -d "${VPS_OS_REPO_DIR}/.git" ]]; then
@@ -156,8 +167,8 @@ ensure_docker() {
   fi
 
   log "Installing Docker Engine and Docker Compose v2 from official apt repository..."
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg openssl ufw
+  apt_get update -y
+  apt_get install -y ca-certificates curl gnupg openssl ufw
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
   chmod a+r /etc/apt/keyrings/docker.asc
@@ -167,8 +178,8 @@ ensure_docker() {
   printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
     "$(dpkg --print-architecture)" "${VERSION_CODENAME}" > /etc/apt/sources.list.d/docker.list
 
-  apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  apt_get update -y
+  apt_get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   systemctl enable --now docker
 }
 
@@ -177,8 +188,8 @@ ensure_python3() {
     return
   fi
   log "Installing Python 3 for the VPS OS Host Runtime Bridge..."
-  apt-get update -y
-  apt-get install -y python3
+  apt_get update -y
+  apt_get install -y python3
 }
 
 detect_ssh_port() {
@@ -271,7 +282,7 @@ harden_ssh() {
 
 configure_firewall() {
   if ! command -v ufw >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y ufw
+    apt_get update -y && apt_get install -y ufw
   fi
 
   local ssh_port
@@ -586,7 +597,9 @@ ensure_hermes() {
   fi
 
   log "Installing NousResearch Hermes Agent (headless, non-interactive) into ${HERMES_HOME}..."
-  HERMES_HOME="${HERMES_HOME}" curl -fsSL https://hermes-agent.nousresearch.com/install.sh | HERMES_HOME="${HERMES_HOME}" bash -s -- --non-interactive --skip-browser --skip-computer-use
+  log "First-time Hermes dependency install downloads ~2 GB and may take several minutes (log: ${HERMES_HOME}/logs/install.log)..."
+  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 HERMES_HOME="${HERMES_HOME}" \
+    curl -fsSL https://hermes-agent.nousresearch.com/install.sh | HERMES_HOME="${HERMES_HOME}" bash -s -- --non-interactive --skip-browser --skip-computer-use --verbose
 }
 
 configure_hermes_service() {

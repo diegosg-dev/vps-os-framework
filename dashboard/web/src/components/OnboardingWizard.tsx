@@ -87,7 +87,7 @@ export function OnboardingWizard({
     providerCatalog.find((item) => item.id === defaultProvider) ?? providerCatalog[0];
   const [provider, setProvider] = useState<LlmProviderId>(defaultProvider);
   const [model, setModel] = useState(
-    state.llmModel ?? initialCatalog?.defaultModel ?? "claude-sonnet-4-5",
+    state.llmModel ?? initialCatalog?.defaultModel ?? "glm-5.3",
   );
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(
@@ -107,6 +107,8 @@ export function OnboardingWizard({
     availableModels?: string[];
   } | null>(null);
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
+  const [modelsSource, setModelsSource] = useState<"live" | "fallback" | null>(null);
+  const [loadingModels, setLoadingModels] = useState(false);
 
   // Step 3: Security, Persona & Channels
   const [passphrase, setPassphrase] = useState("");
@@ -139,6 +141,7 @@ export function OnboardingWizard({
     setProvider(nextProvider);
     setProviderTestResult(null);
     setDiscoveredModels([]);
+    setModelsSource(null);
     const catalog = providerCatalog.find((item) => item.id === nextProvider);
     if (catalog) {
       setModel(catalog.defaultModel);
@@ -151,6 +154,49 @@ export function OnboardingWizard({
       }
     }
   }
+
+  const refreshProviderModels = useCallback(
+    async (
+      targetProvider: LlmProviderId,
+      targetBaseUrl: string,
+      targetApiKey: string,
+      signal?: AbortSignal,
+    ) => {
+      setLoadingModels(true);
+      try {
+        const res = await fetch("/api/onboarding/provider/models", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...authHeaders(),
+          },
+          body: JSON.stringify({
+            provider: targetProvider,
+            baseUrl: targetBaseUrl.trim() || undefined,
+            apiKey: targetApiKey.trim() || undefined,
+          }),
+          ...(signal ? { signal } : {}),
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          models?: string[];
+          source?: "live" | "fallback";
+        };
+        if (signal?.aborted) return;
+        if (Array.isArray(data.models) && data.models.length > 0) {
+          setDiscoveredModels(data.models);
+          setModelsSource(data.source ?? "fallback");
+        }
+      } catch {
+        // Keep static preset suggestions if discovery fails or is aborted
+      } finally {
+        if (!signal?.aborted) {
+          setLoadingModels(false);
+        }
+      }
+    },
+    [authHeaders],
+  );
 
   const runBaselineScan = useCallback(async () => {
     setBusy(true);
@@ -185,6 +231,19 @@ export function OnboardingWizard({
       void runBaselineScan();
     }
   }, [step, scanResult, autoScanned, busy, runBaselineScan]);
+
+  useEffect(() => {
+    if (step !== "provider" || provider !== "opencode") {
+      return;
+    }
+    // Skip live discovery for local serve until the user clicks Test or Refresh
+    if (activePreset?.id === "local") {
+      return;
+    }
+    const controller = new AbortController();
+    void refreshProviderModels(provider, baseUrl, apiKey, controller.signal);
+    return () => controller.abort();
+  }, [step, provider, baseUrl, activePreset?.id, refreshProviderModels]);
 
   async function handleSaveDomain(event: FormEvent) {
     event.preventDefault();
@@ -276,6 +335,7 @@ export function OnboardingWizard({
       setProviderTestResult(data.result);
       if (data.result.availableModels && data.result.availableModels.length > 0) {
         setDiscoveredModels(data.result.availableModels);
+        setModelsSource("live");
       }
     } catch (err) {
       setProviderTestResult({
@@ -716,9 +776,20 @@ export function OnboardingWizard({
                           key={preset.id}
                           type="button"
                           onClick={() => {
+                            const prevModels = new Set<string>([
+                              ...(activeCatalog.suggestedModels ?? []),
+                              activeCatalog.defaultModel,
+                              ...(activePreset?.suggestedModels ?? []),
+                              ...(activePreset?.defaultModel ? [activePreset.defaultModel] : []),
+                              ...discoveredModels,
+                            ]);
                             setBaseUrl(preset.baseUrl);
                             setProviderTestResult(null);
                             setDiscoveredModels([]);
+                            setModelsSource(null);
+                            if (!model.trim() || prevModels.has(model.trim())) {
+                              setModel(preset.defaultModel ?? activeCatalog.defaultModel);
+                            }
                           }}
                           className={`rounded-xl border p-2.5 text-left transition ${
                             presetSelected
@@ -746,12 +817,26 @@ export function OnboardingWizard({
 
               <div className="grid gap-4 sm:grid-cols-2">
                 <div>
-                  <label
-                    htmlFor="wizard-model"
-                    className="block text-xs font-medium text-[var(--text-secondary)]"
-                  >
-                    Model
-                  </label>
+                  <div className="flex items-center justify-between gap-2">
+                    <label
+                      htmlFor="wizard-model"
+                      className="block text-xs font-medium text-[var(--text-secondary)]"
+                    >
+                      Model
+                    </label>
+                    <button
+                      type="button"
+                      disabled={loadingModels}
+                      onClick={() => void refreshProviderModels(provider, baseUrl, apiKey)}
+                      className="text-[11px] text-[var(--accent)] hover:underline disabled:opacity-50"
+                    >
+                      {loadingModels
+                        ? "Loading models…"
+                        : modelsSource === "live"
+                          ? "Live catalog · Refresh"
+                          : "Refresh models"}
+                    </button>
+                  </div>
                   <input
                     id="wizard-model"
                     type="text"
@@ -762,8 +847,8 @@ export function OnboardingWizard({
                   {activeCatalog && (
                     <div className="mt-2 flex flex-wrap gap-1.5">
                       {(discoveredModels.length > 0
-                        ? discoveredModels.slice(0, 10)
-                        : activeCatalog.suggestedModels
+                        ? discoveredModels.slice(0, 12)
+                        : (activePreset?.suggestedModels ?? activeCatalog.suggestedModels)
                       ).map((suggested) => (
                         <button
                           key={suggested}

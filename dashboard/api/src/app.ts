@@ -31,6 +31,8 @@ import {
 import {
   type DnsVerificationResult,
   type HermesHealthStatus,
+  type ProviderModelsInput,
+  type ProviderModelsResult,
   type ProviderTestInput,
   type ProviderTestResult,
   seedInitialOnboardingStateFromEnv,
@@ -96,6 +98,9 @@ export interface DashboardAppDeps {
   testProviderConnection?: (
     input: ProviderTestInput,
   ) => Promise<ProviderTestResult>;
+  discoverProviderModels?: (
+    input: ProviderModelsInput,
+  ) => Promise<ProviderModelsResult>;
   checkHermesHealth?: () => Promise<HermesHealthStatus>;
   triggerHostApply?: (
     reason: string,
@@ -353,6 +358,7 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
     detectPublicIp: deps.detectPublicIp,
     verifyDns: deps.verifyDns,
     testProviderConnection: deps.testProviderConnection,
+    discoverProviderModels: deps.discoverProviderModels,
     checkHermesHealth: deps.checkHermesHealth,
     triggerHostApply: deps.triggerHostApply,
   });

@@ -9,9 +9,17 @@ import {
   HERMES_USER_MAX_CHARS,
   provisionHermesHome,
 } from "@vps-os/agent";
-import { createDashboardApp } from "@vps-os/dashboard-api";
 import {
+  createDashboardApp,
+  discoverLlmProviderModels,
+  extractModelIdsFromPayload,
+} from "@vps-os/dashboard-api";
+import {
+  LLM_PROVIDER_CATALOG,
+  OPENCODE_GO_BASE_URL,
+  OPENCODE_ZEN_BASE_URL,
   SystemRegistryStore,
+  findProviderEndpointPreset,
   hashPassphrase,
   hashSetupCode,
   normalizeSetupCode,
@@ -491,6 +499,94 @@ test("OpenCode provider supports Zen, Go, and local opencode serve setup & env p
     const hermesCfg = fs.readFileSync(path.join(hermesHome, "config.yaml"), "utf8");
     assert.match(hermesCfg, /provider: "opencode"/);
     assert.match(hermesCfg, /name: "gpt-5\.2"/);
+  } finally {
+    registry.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode presets provide accurate per-mode models and live /models discovery filters chat-completions", async () => {
+  const opencodeEntry = LLM_PROVIDER_CATALOG.find((entry) => entry.id === "opencode");
+  assert.ok(opencodeEntry);
+
+  const zenPreset = findProviderEndpointPreset(opencodeEntry, OPENCODE_ZEN_BASE_URL);
+  const goPreset = findProviderEndpointPreset(opencodeEntry, OPENCODE_GO_BASE_URL);
+  assert.ok(zenPreset?.suggestedModels?.length);
+  assert.ok(goPreset?.suggestedModels?.length);
+  assert.equal(goPreset.defaultModel, "glm-5.3");
+  assert.equal(goPreset.suggestedModels.includes("claude-sonnet-4-5"), false);
+  assert.equal(goPreset.suggestedModels.includes("gpt-5.2"), false);
+  assert.ok(goPreset.suggestedModels.includes("kimi-k3.1-pro"));
+
+  const filtered = extractModelIdsFromPayload(
+    {
+      data: [
+        { id: "glm-5.3", type: "chat", recommended_api: "chat-completions" },
+        { id: "claude-sonnet-4-5", type: "chat", recommended_api: "messages" },
+        { id: "gpt-5.2", type: "chat", recommended_api: "responses" },
+        { id: "text-embedding-3-small", type: "embeddings", recommended_api: "embeddings" },
+        { id: "kimi-k3.1-pro", type: "chat", recommended_api: "chat-completions" },
+      ],
+    },
+    { preferChatCompletions: true },
+  );
+  assert.deepEqual(filtered, ["glm-5.3", "kimi-k3.1-pro"]);
+
+  const liveResult = await discoverLlmProviderModels(
+    { provider: "opencode", baseUrl: OPENCODE_GO_BASE_URL, apiKey: "sk-test" },
+    async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            { id: "glm-5.3", type: "chat", recommended_api: "chat-completions" },
+            { id: "qwen4-max", type: "chat", recommended_api: "messages" },
+            { id: "deepseek-v4-pro", type: "chat", recommended_api: "chat-completions" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+  );
+  assert.equal(liveResult.source, "live");
+  assert.deepEqual(liveResult.models, ["glm-5.3", "deepseek-v4-pro"]);
+
+  const fallbackResult = await discoverLlmProviderModels(
+    { provider: "opencode", baseUrl: OPENCODE_GO_BASE_URL, apiKey: "sk-test" },
+    async () => {
+      throw new Error("offline");
+    },
+  );
+  assert.equal(fallbackResult.source, "fallback");
+  assert.deepEqual(fallbackResult.models, goPreset.suggestedModels);
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-models-route-"));
+  const registry = new SystemRegistryStore(path.join(tempDir, "registry.db"));
+  const app = createDashboardApp({
+    registry,
+    adminToken: "master-admin-token-for-models-route",
+    discoverProviderModels: async (input) => ({
+      models:
+        input.baseUrl === OPENCODE_GO_BASE_URL
+          ? ["glm-5.3", "kimi-k3.1-pro"]
+          : ["glm-5.3", "kimi-k3"],
+      source: "live",
+    }),
+  });
+  try {
+    const res = await app.request("/api/onboarding/provider/models", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer master-admin-token-for-models-route",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        provider: "opencode",
+        baseUrl: OPENCODE_GO_BASE_URL,
+      }),
+    });
+    assert.equal(res.status, 200);
+    const json = (await res.json()) as { models: string[]; source: string };
+    assert.equal(json.source, "live");
+    assert.deepEqual(json.models, ["glm-5.3", "kimi-k3.1-pro"]);
   } finally {
     registry.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
