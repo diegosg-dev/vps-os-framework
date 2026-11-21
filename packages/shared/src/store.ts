@@ -997,6 +997,18 @@ export class SystemRegistryStore {
     return rows.map((row) => this.mapChatMessageRow(row));
   }
 
+  /** Finds the latest chat message linked to an execution plan ID, if any. */
+  findChatMessageByPlanId(planId: string): ChatMessage | null {
+    const stmt = this.db.prepare(`
+      SELECT * FROM chat_messages
+      WHERE plan_id = ?
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT 1
+    `);
+    const row = stmt.get(planId) as ChatMessageRow | undefined;
+    return row ? this.mapChatMessageRow(row) : null;
+  }
+
   /** Persists uploaded attachment metadata (and redacted text preview / storage pointer). */
   saveChatAttachment(record: {
     id: string;

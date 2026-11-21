@@ -45,7 +45,7 @@ test("createExecutionPlan handles 1000-char goals and fails closed on unknown ac
     name: "Billing",
     kind: "web-app",
     domain: "billing.example.com",
-    internalPort: 80,
+    internalPort: 8080,
   });
 
   const personalPlan = createExecutionPlan(
@@ -60,7 +60,7 @@ test("createExecutionPlan handles 1000-char goals and fails closed on unknown ac
   );
   assert.equal(filenamePlan.steps[1]?.args?.slug, "my-portal");
   assert.equal(filenamePlan.steps[1]?.args?.domain, "portal.example.com");
-  assert.equal(filenamePlan.steps[1]?.args?.internalPort, 80);
+  assert.equal(filenamePlan.steps[1]?.args?.internalPort, 8080);
   assert.equal(filenamePlan.steps[2]?.toolName, "update_app_status");
 
   const genericSubdomainPlan = createExecutionPlan(

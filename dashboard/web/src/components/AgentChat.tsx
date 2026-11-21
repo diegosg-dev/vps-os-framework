@@ -1329,17 +1329,29 @@ export function AgentChat({
         headers: { "content-type": "application/json", ...authHeaders() },
         body: JSON.stringify({ planId }),
       });
+      const payload = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        plan?: ExecutionPlanView;
+        execution?: { summary: string };
+        followUpMessage?: ChatMessageView;
+      };
+      if (payload.followUpMessage) {
+        const followUp = payload.followUpMessage;
+        setMessages((prev) =>
+          prev.some((m) => m.id === followUp.id) ? prev : [...prev, followUp],
+        );
+        scrollToLatest("smooth");
+      }
       if (!res.ok) {
-        const payload = (await res.json().catch(() => ({}))) as { error?: string };
         throw new Error(payload.error ?? `Execution failed (${res.status})`);
       }
-      const data = (await res.json()) as {
-        plan: ExecutionPlanView;
-        execution: { summary: string };
-      };
-      setPlansById((prev) => ({ ...prev, [data.plan.id]: data.plan }));
-      setExecutionNotes((prev) => ({ ...prev, [planId]: data.execution.summary }));
-      onNotify("Plan executed", "success", data.execution.summary);
+      if (payload.plan) {
+        setPlansById((prev) => ({ ...prev, [payload.plan!.id]: payload.plan! }));
+      }
+      if (payload.execution) {
+        setExecutionNotes((prev) => ({ ...prev, [planId]: payload.execution!.summary }));
+        onNotify("Plan executed", "success", payload.execution.summary);
+      }
       void onRefreshDashboard();
     } catch (err) {
       setChatError(err instanceof Error ? err.message : "Could not execute plan.");

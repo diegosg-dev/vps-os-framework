@@ -203,12 +203,12 @@ export function extractDeploySpecFromGoal(goal: string): DerivedDeploySpec | nul
   // Built-in personal-agent template runs a headless worker (`sleep infinity`),
   // so only bind public HTTPS domains automatically for web-app workloads.
   const domain = kind === "web-app" ? extractDomainFromGoal(goal) : null;
-  // Built-in web-app template serves HTTP on port 80 (nginx:alpine), matching
-  // its container healthcheck; avoid overriding to an unbound port from prose.
+  // Built-in web-app template serves HTTP on port 8080 (nginx-unprivileged:alpine),
+  // matching its container healthcheck and cap_drop: ALL isolation.
   const internalPort =
     kind === "personal-agent"
       ? (extractPortFromGoal(goal) ?? 3000)
-      : 80;
+      : 8080;
 
   let slugCandidate: string | null = null;
   let explicitName: string | null = null;

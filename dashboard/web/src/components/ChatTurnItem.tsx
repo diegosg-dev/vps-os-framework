@@ -679,7 +679,14 @@ export function ChatTurnItem({
           </div>
         )}
 
-        {/* Inline Execution Plan Card */}
+        {/* Markdown Answer Body */}
+        {message.content && (
+          <div className="pt-0.5">
+            <MarkdownContent content={message.content} />
+          </div>
+        )}
+
+        {/* Inline Execution Plan Card (always at the end of the turn) */}
         {linkedPlan && (
           <InlinePlanCard
             plan={linkedPlan}
@@ -689,13 +696,6 @@ export function ChatTurnItem({
             onReject={onRejectPlan}
             onExecute={onExecutePlan}
           />
-        )}
-
-        {/* Markdown Answer Body */}
-        {message.content && (
-          <div className="pt-0.5">
-            <MarkdownContent content={message.content} />
-          </div>
         )}
       </div>
     </div>

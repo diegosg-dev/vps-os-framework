@@ -1,5 +1,9 @@
 import crypto from "node:crypto";
-import { classifyGoalRisk, createExecutionPlan } from "@vps-os/agent";
+import {
+  classifyGoalRisk,
+  createExecutionPlan,
+  extractDeploySpecFromGoal,
+} from "@vps-os/agent";
 import {
   type AppRecord,
   type ChatAttachment,
@@ -239,6 +243,9 @@ function buildSystemPrompt(
     effortRule,
     "Never print or ask to paste raw private keys or unredacted secrets.",
     "Use clean Markdown formatting (short headings, bullet points, tables, fenced code blocks when helpful).",
+    "NEVER claim a plan was approved, executed, or deployed unless that exact state appears in Live Inspected Server Context or executed tool results — typing 'approve' in chat does not approve or execute a pending Execution Plan card.",
+    "When an Execution Plan card is attached to your turn, NEVER ask the user to type 'approve' in chat — instead direct them to click Approve Plan (and Execute Approved Plan) on the Execution Plan card below your message.",
+    "When an app has domain=null, state clearly that it is currently internal-network-only (listening on its internal port) and needs a domain/route attached before it has a public HTTP(S) link.",
     "",
     "### Live Inspected Server Context",
     toolContext,
@@ -736,13 +743,18 @@ export async function runAgentChatTurn(
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
   const riskLevel = classifyGoalRisk(sanitizedGoal);
+  const hasExecutableOrExplicitMutationIntent =
+    extractDeploySpecFromGoal(sanitizedGoal) !== null ||
+    /^\s*(start|stop|restart)\s+(?:the\s+)?(?:app\s+|container\s+|workload\s+)?[a-z0-9][a-z0-9-]{1,47}/i.test(
+      sanitizedGoal,
+    ) ||
+    riskLevel === "high" ||
+    /\b(deploy|install|create|provision|restart|stop|start|domain|backup|plan|route|expose|remove|delete)\b/i.test(
+      sanitizedGoal,
+    );
   const shouldProposePlan =
     input.mode !== "ask" &&
-    (input.mode === "plan" ||
-      riskLevel !== "low" ||
-      /\b(deploy|install|create|provision|restart|stop|start|domain|backup|plan)\b/i.test(
-        sanitizedGoal,
-      ));
+    (input.mode === "plan" || hasExecutableOrExplicitMutationIntent);
 
   appendInitialThought(
     `Classified request risk as **${riskLevel}** in \`${input.mode}\` mode (effort: \`${effort}\`)${
@@ -800,6 +812,11 @@ export async function runAgentChatTurn(
   }
 
   // Tool 1: Inspect live host metrics
+  const dashboardUrl = onboarding.domain
+    ? `https://${onboarding.domain}`
+    : onboarding.publicIp
+      ? `http://${onboarding.publicIp}`
+      : null;
   const telemetry = await runTool(
     "inspect_system_metrics",
     "Inspect live host CPU, RAM & disk",
@@ -809,6 +826,9 @@ export async function runAgentChatTurn(
       const disk = deps.getDisk();
       return {
         hostname: metrics.hostname,
+        publicIp: onboarding.publicIp,
+        dashboardDomain: onboarding.domain,
+        dashboardUrl,
         cpuCount: metrics.cpuCount,
         loadAverage1m: metrics.loadAverage1m,
         memoryUsedMb: metrics.memoryUsedMb,
@@ -837,6 +857,9 @@ export async function runAgentChatTurn(
           kind: app.kind,
           status: app.status,
           domain: app.domain,
+          url: app.domain ? `https://${app.domain}` : null,
+          internalPort: app.internalPort,
+          folderPath: app.folderPath,
           cpuLimit: app.cpuLimit,
           memoryLimitMb: app.memoryLimitMb,
         })),
