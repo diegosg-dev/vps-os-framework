@@ -55,50 +55,107 @@ interface ClarifyingQuestion {
   options: string[];
 }
 
-function parseClarifyingQuestions(content: string): {
+function tryParseQuestionsPayload(
+  rawJson: string,
+): ClarifyingQuestion[] {
+  const repaired = rawJson.trim().replace(/,\s*([}\]])/g, "$1");
+  const parseItems = (parsed: unknown): ClarifyingQuestion[] => {
+    if (!parsed || typeof parsed !== "object") return [];
+    const list = (parsed as { questions?: unknown }).questions;
+    if (!Array.isArray(list)) return [];
+    const out: ClarifyingQuestion[] = [];
+    for (const item of list.slice(0, 5)) {
+      if (typeof (item as { question?: unknown })?.question !== "string") continue;
+      const question = ((item as { question: string }).question).trim();
+      if (!question) continue;
+      const rawOptions = (item as { options?: unknown }).options;
+      const options = Array.isArray(rawOptions)
+        ? rawOptions
+            .filter(
+              (o): o is string => typeof o === "string" && o.trim().length > 0,
+            )
+            .slice(0, 6)
+        : [];
+      out.push({ question, options });
+    }
+    return out;
+  };
+
+  try {
+    return parseItems(JSON.parse(repaired));
+  } catch {
+    // Salvage individual {"question":...,"options":[...]} objects if JSON array was truncated
+    const salvaged: ClarifyingQuestion[] = [];
+    const objRegex = /\{\s*"question"\s*:\s*"((?:[^"\\]|\\.)*)"\s*(?:,\s*"options"\s*:\s*(\[[\s\S]*?\]))?\s*\}/g;
+    let objMatch: RegExpExecArray | null = null;
+    while ((objMatch = objRegex.exec(repaired)) !== null && salvaged.length < 5) {
+      try {
+        const question = JSON.parse(`"${objMatch[1]}"`) as string;
+        const rawOpts = objMatch[2] ? (JSON.parse(objMatch[2]) as unknown) : [];
+        const options = Array.isArray(rawOpts)
+          ? rawOpts.filter(
+              (o): o is string => typeof o === "string" && o.trim().length > 0,
+            ).slice(0, 6)
+          : [];
+        if (question.trim()) {
+          salvaged.push({ question: question.trim(), options });
+        }
+      } catch {
+        // skip malformed item
+      }
+    }
+    return salvaged;
+  }
+}
+
+export function parseClarifyingQuestions(
+  content: string,
+  isStreaming = false,
+): {
   cleanContent: string;
   questions: ClarifyingQuestion[];
 } {
-  // Strip any completed or in-progress ```vps-plan block so raw plan JSON never flashes in chat.
-  let sanitized = content
-    .replace(/```vps-plan\s*\n[\s\S]*?\n```\s*/g, "")
-    .replace(/```vps-plan[\s\S]*$/g, "")
-    .trimEnd();
-
-  const match = sanitized.match(/```vps-questions\s*\n([\s\S]*?)\n```\s*$/);
-  if (!match?.[1]) {
-    // Also hide incomplete trailing ```vps-questions while still streaming.
-    sanitized = sanitized.replace(/```vps-questions[\s\S]*$/g, "").trimEnd();
-    return { cleanContent: sanitized, questions: [] };
+  // Strip any completed (or streaming) ```vps-plan block so raw plan JSON never flashes in chat.
+  let sanitized = content.replace(
+    /```vps-plan[^\n\r]*(?:\r?\n|\s+)[\s\S]*?```/g,
+    "",
+  );
+  if (isStreaming) {
+    sanitized = sanitized.replace(/```vps-plan[\s\S]*$/g, "");
   }
-  try {
-    const parsed = JSON.parse(match[1]) as {
-      questions?: Array<{ question?: unknown; options?: unknown }>;
-    };
-    const questions: ClarifyingQuestion[] = [];
-    if (Array.isArray(parsed.questions)) {
-      for (const item of parsed.questions.slice(0, 3)) {
-        if (typeof item?.question !== "string" || !item.question.trim()) continue;
-        const options = Array.isArray(item.options)
-          ? item.options
-              .filter((o): o is string => typeof o === "string" && o.trim().length > 0)
-              .slice(0, 5)
-          : [];
-        if (options.length > 0) {
-          questions.push({ question: item.question.trim(), options });
-        }
-      }
-    }
-    if (questions.length === 0) {
+  sanitized = sanitized.trimEnd();
+
+  const match = sanitized.match(
+    /```vps-questions[^\n\r]*(?:\r?\n|\s+)([\s\S]*?)```/,
+  );
+  if (!match?.[1]) {
+    if (isStreaming) {
+      sanitized = sanitized.replace(/```vps-questions[\s\S]*$/g, "").trimEnd();
       return { cleanContent: sanitized, questions: [] };
     }
-    return {
-      cleanContent: sanitized.slice(0, match.index).trimEnd(),
-      questions,
-    };
-  } catch {
+    const openMatch = sanitized.match(/```vps-questions[^\n\r]*[\r\n]+([\s\S]*)$/);
+    if (openMatch?.[1]) {
+      const salvaged = tryParseQuestionsPayload(openMatch[1]);
+      if (salvaged.length > 0) {
+        return {
+          cleanContent: sanitized.slice(0, openMatch.index).trimEnd(),
+          questions: salvaged,
+        };
+      }
+    }
     return { cleanContent: sanitized, questions: [] };
   }
+
+  const questions = tryParseQuestionsPayload(match[1]);
+  if (questions.length === 0) {
+    return { cleanContent: sanitized, questions: [] };
+  }
+  const before = sanitized.slice(0, match.index ?? 0).trimEnd();
+  const after = sanitized.slice((match.index ?? 0) + match[0].length).trim();
+  return {
+    cleanContent: [before, after].filter(Boolean).join("\n\n"),
+    questions,
+  };
 }
 
 /** Interactive multi-question form allowing multi-select pills, custom text, or skipped fields before sending. */
@@ -158,26 +215,28 @@ function ClarifyingQuestionsCard({
             <p className="text-xs font-medium text-[var(--text-primary)]">
               {q.question}
             </p>
-            <div className="flex flex-wrap gap-1.5">
-              {q.options.map((opt) => {
-                const isSelected = picks.includes(opt);
-                return (
-                  <button
-                    key={opt}
-                    type="button"
-                    disabled={disabled || submitted}
-                    onClick={() => toggleOption(idx, opt)}
-                    className={`rounded-xl border px-2.5 py-1 text-xs font-medium transition disabled:opacity-50 ${
-                      isSelected
-                        ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--text-inverse)]"
-                        : "border-[var(--border-default)] bg-[var(--bg-surface)] text-[var(--text-primary)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)]"
-                    }`}
-                  >
-                    {opt}
-                  </button>
-                );
-              })}
-            </div>
+            {q.options.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {q.options.map((opt) => {
+                  const isSelected = picks.includes(opt);
+                  return (
+                    <button
+                      key={opt}
+                      type="button"
+                      disabled={disabled || submitted}
+                      onClick={() => toggleOption(idx, opt)}
+                      className={`rounded-xl border px-2.5 py-1 text-xs font-medium transition disabled:opacity-50 ${
+                        isSelected
+                          ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--text-inverse)]"
+                          : "border-[var(--border-default)] bg-[var(--bg-surface)] text-[var(--text-primary)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)]"
+                      }`}
+                    >
+                      {opt}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
             <input
               type="text"
               value={customValue}
@@ -191,7 +250,11 @@ function ClarifyingQuestionsCard({
                   handleSend();
                 }
               }}
-              placeholder="Or type a custom answer (optional)..."
+              placeholder={
+                q.options.length > 0
+                  ? "Or type a custom answer (optional)..."
+                  : "Type your answer (optional)..."
+              }
               className="vps-input w-full rounded-xl px-2.5 py-1.5 text-xs"
             />
           </div>
@@ -622,8 +685,12 @@ export function ChatTurnItem({
       (isLatestAssistant && (hasExecutionTrace || message.toolCalls.length > 0)),
   );
   const { cleanContent, questions } = useMemo(
-    () => parseClarifyingQuestions(message.content),
-    [message.content],
+    () =>
+      parseClarifyingQuestions(
+        message.content,
+        streaming || message.status === "streaming",
+      ),
+    [message.content, streaming, message.status],
   );
 
   useEffect(() => {
