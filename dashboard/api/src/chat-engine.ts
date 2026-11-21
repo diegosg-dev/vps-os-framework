@@ -6,6 +6,7 @@ import {
   extractDeploySpecFromGoal,
   extractRemoveSlugsFromGoal,
   extractRouteSpecFromGoal,
+  loadCtoGuidanceContext,
 } from "@vps-os/agent";
 import {
   type AppRecord,
@@ -246,21 +247,33 @@ function buildSystemPrompt(
           ? "Reasoning depth: LOW — respond concisely and directly."
           : "Reasoning depth: MEDIUM — balanced thoroughness and brevity.";
 
+  const guidance = loadCtoGuidanceContext();
+  const skillsBlock =
+    guidance.skills.length > 0
+      ? guidance.skills
+          .map((s) => `- **${s.name}**: ${s.description}`)
+          .join("\n")
+      : "";
+
   return [
     "You are the VPS OS Autonomous CTO Agent managing an Ubuntu VPS with Locked Apartment Docker workloads.",
     `Owner: ${persona.ownerName || "Server Owner"}. ${tone}`,
     `Approval guardrail: ${persona.approvalMode}. ${modeRule}`,
     effortRule,
     "Never print or ask to paste raw private keys or unredacted secrets.",
-    "Respond naturally and conversationally like a helpful CTO in chat — keep follow-ups and answers concise without dumping huge boilerplate tables unless telemetry was requested.",
+    "NEUTRAL WORKLOAD STANCE: VPS OS is a general-purpose container host for websites, web applications, APIs, databases, background workers, and scheduled jobs. Keep recommendations and `vps-questions` options strictly neutral and technical — NEVER suggest, promote, or steer the user toward 'AI agents', 'chatbots', or 'personal assistants' unless the user explicitly asks to build one.",
+    "Respond naturally and concisely like a technical CTO in chat — do not dump huge boilerplate tables unless telemetry was requested.",
     "Use clean Markdown formatting (short headings, bullet points, tables, fenced code blocks when helpful).",
     "NEVER claim a plan was approved, executed, or deployed unless that exact state appears in Live Inspected Server Context or executed tool results — typing 'approve' in chat does not approve or execute a pending Execution Plan card.",
     "When proposedPlan is non-null with status 'pending', direct the user to click Approve & Execute on the Execution Plan card below your message (never ask them to type 'approve').",
     "CRITICAL HONESTY RULE: When proposedPlan is null AND you do NOT append a valid ```vps-plan``` block at the end of your reply, NO Execution Plan card is attached below your reply — NEVER write 'pending below', 'card below this message', or tell the user to click Approve & Execute below!",
-    "When proposedPlan is null, mode is NOT 'ask', and the user asks you to act (deploy, remove, start/stop/restart, attach/detach a domain, or follow up with 'can you do it?' / 'go ahead' / 'yes'), emit a single trailing fenced block so a real interactive Execution Plan card is created (and auto-executed in YOLO mode):\n```vps-plan\n{\"goal\":\"...\",\"summary\":\"...\",\"steps\":[{\"title\":\"...\",\"description\":\"...\",\"toolName\":\"prepare_app_workspace|control_app_lifecycle|remove_workload|route_caddy\",\"args\":{...}}]}\n```\nSupported args: prepare_app_workspace({slug,name,kind:'web-app'|'personal-agent',domain:string|null,internalPort}), control_app_lifecycle({slug,action:'start'|'stop'|'restart'}), remove_workload({slug,removeFiles:true}), route_caddy({slug,domain:string|null}). NEVER put shell, ufw, or raw host port '-p 8080:8080' steps in vps-plan — if a request asks for an unsupported host port or OS firewall edit, explain plainly what runtimeCapabilities allows (e.g. Caddy HTTPS domain routing on ports 80/443, including `<slug>.<ip-with-dashes>.sslip.io` when publicIp is set and no custom domain exists yet).",
+    "When proposedPlan is null, mode is NOT 'ask', and the user asks you to act (deploy, remove, start/stop/restart, attach/detach a domain, or follow up with 'can you do it?' / 'go ahead' / 'yes'), emit a single trailing fenced block so a real interactive Execution Plan card is created (and auto-executed in YOLO mode):\n```vps-plan\n{\"goal\":\"...\",\"summary\":\"...\",\"steps\":[{\"title\":\"...\",\"description\":\"...\",\"toolName\":\"prepare_app_workspace|control_app_lifecycle|remove_workload|route_caddy\",\"args\":{...}}]}\n```\nSupported args: prepare_app_workspace({slug,name,kind:'web-app'|'personal-agent',domain:string|null,internalPort}), control_app_lifecycle({slug,action:'start'|'stop'|'restart'}), remove_workload({slug,removeFiles:true}), route_caddy({slug,domain:string|null}). Default `kind` to `'web-app'` for websites/apps/APIs/services; only use `'personal-agent'` internally if the user explicitly requests a headless worker template. NEVER put shell, ufw, or raw host port '-p 8080:8080' steps in vps-plan — if a request asks for an unsupported host port or OS firewall edit, explain plainly what runtimeCapabilities allows (e.g. Caddy HTTPS domain routing on ports 80/443, including `<slug>.<ip-with-dashes>.sslip.io` when publicIp is set and no custom domain exists yet).",
     "When proposedPlan.status is 'executed' (auto-executed in YOLO mode), confirm that it ALREADY ran, report the live workload status, folder, port, and public/internal URL from workloads & autoExecutedSummary, and state any next step clearly.",
     "When an app has domain=null, state clearly that it is currently internal-network-only (listening on its internal port) and needs a domain/route attached via Caddy (ports 80/443) before it has a public HTTP(S) link.",
-    "If key details are missing or you want the user to pick between options before acting (and neither proposedPlan nor vps-plan is attached), ask concisely and optionally append at the very end a single fenced block:\n```vps-questions\n{\"questions\":[{\"question\":\"...\",\"options\":[\"...\",\"...\"]}]}\n```",
+    "If key details are missing or you want the user to pick between options before acting (and neither proposedPlan nor vps-plan is attached), ask concisely with neutral technical/product options and optionally append at the very end a single fenced block:\n```vps-questions\n{\"questions\":[{\"question\":\"...\",\"options\":[\"...\",\"...\"]}]}\n```",
+    ...(guidance.soul ? ["", "### CTO Operating Identity & Architecture Rules", guidance.soul] : []),
+    ...(skillsBlock ? ["", "### Registered Operational Playbooks (Skills)", skillsBlock] : []),
+    ...(guidance.memory ? ["", "### Curated Host Memory", guidance.memory] : []),
     "",
     "### Live Inspected Server Context",
     toolContext,
@@ -584,28 +597,54 @@ async function callOpenAiCompatibleStream(
         ]
       : userPrompt;
 
-  const recentHistory = history.slice(-8).map((msg) => ({
-    role: msg.role,
-    content: msg.content,
-  }));
+  const recentHistory = history
+    .slice(-8)
+    .filter((msg) => typeof msg.content === "string" && msg.content.trim().length > 0)
+    .map((msg) => ({
+      role: msg.role === "assistant" ? "assistant" : "user",
+      content: msg.content,
+    }));
 
-  const res = await fetchFn(endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model: cfg.model,
-      stream: true,
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...recentHistory,
-        { role: "user", content: userContent },
-      ],
-    }),
-    signal: signal ?? AbortSignal.timeout(45_000),
-  });
+  const postCompletion = (content: unknown) =>
+    fetchFn(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: cfg.model,
+        stream: true,
+        messages: [
+          { role: "system", content: systemPrompt },
+          ...recentHistory,
+          { role: "user", content },
+        ],
+      }),
+      signal: signal ?? AbortSignal.timeout(45_000),
+    });
+
+  let res = await postCompletion(userContent);
+
+  // Some text-only OpenCode/OpenAI-compatible models reject multipart `image_url` payloads with HTTP 400/415/422.
+  // Retry once with plain-text prompt + attachment notice so the user still gets a live CTO reply.
+  if (
+    !res.ok &&
+    imageAttachments.length > 0 &&
+    (res.status === 400 || res.status === 415 || res.status === 422)
+  ) {
+    const textOnlyFallback = `${userPrompt}\n\n[Note: ${imageAttachments.length} image attachment(s) omitted from binary payload because model "${cfg.model}" rejected multimodal image_url input. Ask the user to paste any relevant text/error lines if needed.]`;
+    res = await postCompletion(textOnlyFallback);
+  }
 
   if (!res.ok) {
-    throw new Error(`${cfg.provider} returned HTTP ${res.status}`);
+    let detail = "";
+    try {
+      const errText = redactSecrets((await res.text()).trim());
+      if (errText) {
+        detail = `: ${errText.slice(0, 220)}`;
+      }
+    } catch {
+      // ignore unread error body
+    }
+    throw new Error(`${cfg.provider} returned HTTP ${res.status}${detail}`);
   }
 
   const contentType = res.headers.get("content-type") ?? "";
@@ -1422,6 +1461,7 @@ export async function runAgentChatTurn(
             "route_caddy",
             "inspect_apps",
           ],
+          defaultWorkloadTemplate: "web-app (HTTP/static/API/full-stack service on port 8080)",
           ingressModel:
             "Apps run on private container port 8080 inside app_net. Public access uses Caddy TLS on ports 80/443 via route_caddy (including <slug>.<ip-with-dashes>.sslip.io when publicIp is known and no custom domain exists). Direct host port publishing (-p 8080:8080) and host UFW/SSH commands are NOT supported.",
         },

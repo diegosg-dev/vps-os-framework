@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { redactSecrets } from "@vps-os/shared";
 
 /** Hermes built-in curated memory file character bounds. */
 export const HERMES_MEMORY_MAX_CHARS = 2200;
@@ -242,5 +243,92 @@ export function provisionHermesHome(
     updatedFiles,
     preservedFiles,
     syncedSkills: validation.skillNames,
+  };
+}
+
+export interface CtoSkillGuidance {
+  name: string;
+  description: string;
+}
+
+export interface CtoGuidanceContext {
+  sourceDir: string;
+  soul: string;
+  memory: string;
+  skills: CtoSkillGuidance[];
+}
+
+/**
+ * Loads `SOUL.md`, `memories/MEMORY.md`, and skill metadata from `hermesHome`
+ * (or the versioned pack fallback) so Dashboard CTO Chat and CLI agents share
+ * identical technical operating rules and curated memory context.
+ */
+export function loadCtoGuidanceContext(
+  hermesHome?: string,
+): CtoGuidanceContext {
+  const candidates = [
+    ...(hermesHome?.trim() ? [path.resolve(hermesHome.trim())] : []),
+    ...(process.env.HERMES_HOME?.trim()
+      ? [path.resolve(process.env.HERMES_HOME.trim())]
+      : []),
+    DEFAULT_HERMES_PACK_DIR,
+  ];
+  const sourceDir =
+    candidates.find((dir) => fs.existsSync(path.join(dir, "SOUL.md"))) ??
+    DEFAULT_HERMES_PACK_DIR;
+
+  const readSafe = (filePath: string, maxChars: number): string => {
+    try {
+      if (!fs.existsSync(filePath)) return "";
+      return redactSecrets(fs.readFileSync(filePath, "utf8").trim()).slice(
+        0,
+        maxChars,
+      );
+    } catch {
+      return "";
+    }
+  };
+
+  const soul =
+    readSafe(path.join(sourceDir, "SOUL.md"), 2800) ||
+    readSafe(path.join(DEFAULT_HERMES_PACK_DIR, "SOUL.md"), 2800);
+  const memory =
+    readSafe(path.join(sourceDir, "memories", "MEMORY.md"), HERMES_MEMORY_MAX_CHARS) ||
+    readSafe(
+      path.join(DEFAULT_HERMES_PACK_DIR, "memories", "MEMORY.md"),
+      HERMES_MEMORY_MAX_CHARS,
+    );
+
+  const skillsDir = fs.existsSync(path.join(sourceDir, "skills"))
+    ? path.join(sourceDir, "skills")
+    : path.join(DEFAULT_HERMES_PACK_DIR, "skills");
+  const skills: CtoSkillGuidance[] = [];
+
+  try {
+    for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const skillFile = path.join(skillsDir, entry.name, "SKILL.md");
+      if (!fs.existsSync(skillFile)) continue;
+      try {
+        const meta = parseSkillFrontmatter(fs.readFileSync(skillFile, "utf8"));
+        skills.push({
+          name: meta.name,
+          description: redactSecrets(meta.description),
+        });
+      } catch {
+        // skip custom skills with invalid frontmatter
+      }
+    }
+  } catch {
+    // ignore unreadable skills directory
+  }
+
+  skills.sort((a, b) => a.name.localeCompare(b.name));
+
+  return {
+    sourceDir,
+    soul,
+    memory,
+    skills,
   };
 }

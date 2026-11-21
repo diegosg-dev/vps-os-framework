@@ -1,20 +1,21 @@
 ---
 name: vps-os-domain-tls
-description: Verify DNS resolution and safely bind or update an automatic HTTPS domain route in Caddy for a VPS OS app without triggering ACME rate limits.
+description: Validate DNS resolution, domain uniqueness, and isolated bridge network attachments before binding Caddy 2 Auto-TLS routes on ports 80/443.
 ---
 
 # Configure Domain & Auto-TLS Routing
 
 ## Preconditions
-- Domain is a valid hostname (no spaces, paths, schemes, or Caddyfile control characters).
-- Ports `80/tcp` and `443/tcp` are open in UFW and reachable from the public internet.
+- Hostname passes strict domain validation (lowercase RFC hostname, no paths/schemes/whitespace/Caddy control chars).
+- Ports `80/tcp` and `443/tcp` are open in UFW; target app container is `running` so `vps-os-<slug>_app_net` bridge network exists.
+- If the owner lacks a custom domain and `publicIp` is known, `<slug>.<ip-with-dashes>.sslip.io` provides DNS-resolved HTTPS via Caddy without custom registrar setup.
 
 ## Procedure
-1. **Verify DNS before touching Caddy:** Resolve the target hostname (`getent hosts <domain>` or `dig +short <domain>`) and compare against the VPS public IP. If DNS does not point to this server yet, warn the user in plain English and ask them to update their A/AAAA record before enabling HTTPS.
-2. **Require approved plan:** Ensure an approved `ExecutionPlan` exists before writing `/vps-os/caddy/apps.d/<slug>.caddy`.
-3. **Write scoped route file:** Create `/vps-os/caddy/apps.d/<slug>.caddy` proxying `<domain>` over TLS to the app container's internal service name and port on its shared bridge. Never expose internal `/agent/*` or `127.0.0.1:8642` endpoints.
-4. **Validate & reload Caddy:** Run `docker exec vps-os-caddy caddy validate --config /etc/caddy/Caddyfile` before reloading (`caddy reload --config /etc/caddy/Caddyfile`).
-5. **Confirm HTTPS:** Verify TLS handshake and HTTP status, then report the live `https://<domain>` link to the user.
+1. **Verify DNS & collisions:** Resolve target hostname (`getent hosts` / `dig +short`) against VPS `publicIp` and verify no other `.caddy` file in `/vps-os/caddy/apps.d/` owns that hostname (`route_caddy` enforces `409` uniqueness).
+2. **Require approved plan:** Propose and approve a `route_caddy` (`{ slug, domain }`) or `prepare_app_workspace` step before modifying Caddy.
+3. **Attach bridge & write route:** `runtime-bridge.py` connects `vps-os-caddy` to `vps-os-<slug>_app_net` and writes `/vps-os/caddy/apps.d/<slug>.caddy` proxying to `vps-os-app-<slug>:<internalPort>`.
+4. **Atomic validate & reload:** Run `caddy validate --config /etc/caddy/Caddyfile` before `caddy reload`. On validation error, restore previous route file and disconnect newly attached bridge.
+5. **Verify HTTPS & sync registry:** Confirm TLS handshake and HTTP response (`https://<domain>`), and verify `registry.db` reflects updated `domain`.
 
 ## Failure & Recovery
-- If the TLS handshake or certificate issuance fails, never hammer retries — repeated failed attempts can trigger longer ACME rate limits. Explain in plain English the confirmed or most likely cause (DNS not pointing here yet, port `80`/`443` blocked, or an ACME rate limit), what remains uncertain, and what you will check next. Offer a safe retry interval only when the observed ACME response supports one.
+- Never rapid-retry failing ACME issuance (risks Let's Encrypt rate limits). Report confirmed DNS/firewall/upstream failure causes accurately and wait for DNS propagation or upstream health before retrying.
