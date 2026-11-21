@@ -24,6 +24,8 @@ export interface ProviderEndpointPreset {
   requiresApiKey: boolean;
   keyLabel?: string;
   keyPlaceholder?: string;
+  defaultModel?: string;
+  suggestedModels?: string[];
 }
 
 export interface LlmProviderCatalogEntry {
@@ -43,6 +45,22 @@ export interface LlmProviderCatalogEntry {
 export const OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen/v1";
 export const OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1";
 export const OPENCODE_LOCAL_BASE_URL = "http://host.docker.internal:4096";
+
+/**
+ * Resolves the endpoint preset for a provider catalog entry matching `baseUrl`.
+ */
+export function findProviderEndpointPreset(
+  entry: LlmProviderCatalogEntry | undefined,
+  baseUrl: string | null | undefined,
+): ProviderEndpointPreset | undefined {
+  if (!entry?.endpointPresets?.length) return undefined;
+  const normalizedTarget = (baseUrl?.trim() || entry.defaultBaseUrl)
+    .replace(/\/+$/, "")
+    .toLowerCase();
+  return entry.endpointPresets.find(
+    (preset) => preset.baseUrl.replace(/\/+$/, "").toLowerCase() === normalizedTarget,
+  );
+}
 
 /**
  * Returns true when an OpenCode base URL points to a self-hosted `opencode serve`
@@ -74,13 +92,13 @@ export const LLM_PROVIDER_CATALOG: readonly LlmProviderCatalogEntry[] = [
     badge: "Direct",
     description:
       "Connect directly to OpenCode Zen, OpenCode Go, or a local opencode serve daemon with agentic coding & reasoning models.",
-    defaultModel: "claude-sonnet-4-5",
+    defaultModel: "glm-5.3",
     suggestedModels: [
-      "claude-sonnet-4-5",
-      "gpt-5.2",
-      "gemini-2.5-pro",
-      "deepseek-r1",
-      "big-pickle",
+      "glm-5.3",
+      "kimi-k3",
+      "deepseek-v4-pro",
+      "deepseek-v4.1-flash-free",
+      "mimo-v2.6-flash-free",
     ],
     requiresApiKey: false,
     keyPlaceholder: "opencode-... (from opencode.ai/auth or optional for local serve)",
@@ -94,6 +112,14 @@ export const LLM_PROVIDER_CATALOG: readonly LlmProviderCatalogEntry[] = [
         requiresApiKey: false,
         keyLabel: "OpenCode API Key (OPENCODE_API_KEY)",
         keyPlaceholder: "sk-... (from opencode.ai/auth; optional for free models)",
+        defaultModel: "glm-5.3",
+        suggestedModels: [
+          "glm-5.3",
+          "kimi-k3",
+          "deepseek-v4-pro",
+          "deepseek-v4.1-flash-free",
+          "mimo-v2.6-flash-free",
+        ],
       },
       {
         id: "go",
@@ -103,6 +129,15 @@ export const LLM_PROVIDER_CATALOG: readonly LlmProviderCatalogEntry[] = [
         requiresApiKey: true,
         keyLabel: "OpenCode API Key (OPENCODE_API_KEY)",
         keyPlaceholder: "sk-... (from opencode.ai/auth)",
+        defaultModel: "glm-5.3",
+        suggestedModels: [
+          "glm-5.3",
+          "kimi-k3.1-pro",
+          "deepseek-v4-pro",
+          "deepseek-v4.1-flash",
+          "mimo-v2.6-pro",
+          "minimax-m3.1-flash",
+        ],
       },
       {
         id: "local",
@@ -112,6 +147,14 @@ export const LLM_PROVIDER_CATALOG: readonly LlmProviderCatalogEntry[] = [
         requiresApiKey: false,
         keyLabel: "Server Password (optional)",
         keyPlaceholder: "OPENCODE_SERVER_PASSWORD (leave blank if unauthenticated)",
+        defaultModel: "glm-5.3",
+        suggestedModels: [
+          "glm-5.3",
+          "kimi-k3.1-pro",
+          "deepseek-v4-pro",
+          "claude-sonnet-4-5",
+          "gpt-5.2",
+        ],
       },
     ],
     setupHint:

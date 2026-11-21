@@ -16,6 +16,7 @@ import {
   SetupClaimRecordSchema,
   type SetupClaimRecord,
   type SystemMetrics,
+  findProviderEndpointPreset,
   hashSetupCode,
   isOpenCodeLocalServerUrl,
   normalizeSetupCode,
@@ -556,34 +557,168 @@ export async function verifyDomainDns(
   };
 }
 
-function extractModelIdsFromPayload(payload: unknown): string[] {
+export interface ProviderModelsInput {
+  provider: LlmProvider;
+  apiKey?: string | undefined;
+  baseUrl?: string | undefined;
+}
+
+export interface ProviderModelsResult {
+  models: string[];
+  source: "live" | "fallback";
+  message?: string;
+}
+
+const NON_CHAT_MODEL_APIS = new Set(["embeddings", "images", "live", "systemone"]);
+
+function isChatCompatibleModelItem(
+  item: Record<string, unknown>,
+  preferChatCompletions: boolean,
+): boolean {
+  if (typeof item.type === "string" && item.type !== "chat") {
+    return false;
+  }
+  const recommendedApi =
+    typeof item.recommended_api === "string" ? item.recommended_api : null;
+  if (recommendedApi && NON_CHAT_MODEL_APIS.has(recommendedApi)) {
+    return false;
+  }
+  if (!preferChatCompletions) {
+    return true;
+  }
+  const apiObj =
+    item.api && typeof item.api === "object"
+      ? (item.api as Record<string, unknown>)
+      : null;
+  // Simple OpenAI-style { id } records without OpenCode metadata pass through unchanged.
+  if (!recommendedApi && !apiObj) {
+    return true;
+  }
+  return (
+    recommendedApi === "chat-completions" ||
+    Boolean(apiObj && "chat-completions" in apiObj)
+  );
+}
+
+export function extractModelIdsFromPayload(
+  payload: unknown,
+  options?: { preferChatCompletions?: boolean },
+): string[] {
   if (!payload || typeof payload !== "object") return [];
   const obj = payload as Record<string, unknown>;
   const collected: string[] = [];
+  const preferChatCompletions = options?.preferChatCompletions ?? false;
 
   if (Array.isArray(obj.data)) {
     for (const item of obj.data) {
-      if (item && typeof item === "object" && typeof (item as { id?: unknown }).id === "string") {
-        collected.push((item as { id: string }).id);
-      }
+      if (!item || typeof item !== "object") continue;
+      const record = item as Record<string, unknown>;
+      if (typeof record.id !== "string") continue;
+      if (!isChatCompatibleModelItem(record, preferChatCompletions)) continue;
+      collected.push(record.id);
     }
   } else if (Array.isArray(obj.models)) {
     for (const item of obj.models) {
       if (typeof item === "string") {
         collected.push(item);
       } else if (item && typeof item === "object") {
+        const record = item as Record<string, unknown>;
+        if (!isChatCompatibleModelItem(record, preferChatCompletions)) continue;
         const candidate =
-          typeof (item as { name?: unknown }).name === "string"
-            ? (item as { name: string }).name
-            : typeof (item as { id?: unknown }).id === "string"
-              ? (item as { id: string }).id
+          typeof record.name === "string"
+            ? record.name
+            : typeof record.id === "string"
+              ? record.id
               : null;
         if (candidate) collected.push(candidate);
       }
     }
   }
 
-  return Array.from(new Set(collected)).slice(0, 25);
+  return Array.from(new Set(collected)).slice(0, 40);
+}
+
+function buildModelsRequestConfig(
+  provider: LlmProvider,
+  baseUrl: string,
+  trimmedKey: string,
+): { targetUrl: string; headers: Record<string, string>; preferChatCompletions: boolean } {
+  let targetUrl = `${baseUrl}/models`;
+  const headers: Record<string, string> = {};
+  let preferChatCompletions = false;
+
+  if (provider === "ollama") {
+    targetUrl = `${baseUrl}/api/tags`;
+  } else if (provider === "anthropic") {
+    if (trimmedKey) headers["x-api-key"] = trimmedKey;
+    headers["anthropic-version"] = "2023-06-01";
+  } else if (provider === "opencode") {
+    if (isOpenCodeLocalServerUrl(baseUrl)) {
+      if (trimmedKey) {
+        headers.authorization = `Basic ${Buffer.from(`opencode:${trimmedKey}`, "utf8").toString("base64")}`;
+      }
+    } else {
+      headers.authorization = `Bearer ${trimmedKey || "public"}`;
+      preferChatCompletions = true;
+    }
+  } else if (trimmedKey) {
+    headers.authorization = `Bearer ${trimmedKey}`;
+  }
+
+  return { targetUrl, headers, preferChatCompletions };
+}
+
+export async function discoverLlmProviderModels(
+  input: ProviderModelsInput,
+  fetchFn: typeof fetch = fetch,
+): Promise<ProviderModelsResult> {
+  const entry = LLM_PROVIDER_CATALOG.find((item) => item.id === input.provider);
+  const preset = findProviderEndpointPreset(entry, input.baseUrl);
+  const fallbackModels = preset?.suggestedModels ?? entry?.suggestedModels ?? [];
+  const rawBaseUrl = input.baseUrl?.trim() || entry?.defaultBaseUrl;
+
+  if (!rawBaseUrl) {
+    return { models: fallbackModels, source: "fallback" };
+  }
+
+  let baseUrl: string;
+  try {
+    baseUrl = validateHttpBaseUrl(rawBaseUrl);
+  } catch {
+    return { models: fallbackModels, source: "fallback" };
+  }
+
+  const trimmedKey = input.apiKey?.trim() ?? "";
+  const { targetUrl, headers, preferChatCompletions } = buildModelsRequestConfig(
+    input.provider,
+    baseUrl,
+    trimmedKey,
+  );
+
+  try {
+    const res = await fetchFn(targetUrl, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) {
+      return {
+        models: fallbackModels,
+        source: "fallback",
+        message: `${entry?.label ?? input.provider} returned HTTP ${res.status}.`,
+      };
+    }
+    const discovered = extractModelIdsFromPayload(await res.json(), {
+      preferChatCompletions,
+    });
+    if (discovered.length > 0) {
+      return { models: discovered, source: "live" };
+    }
+  } catch {
+    // Graceful fallback when offline or endpoint is unreachable
+  }
+
+  return { models: fallbackModels, source: "fallback" };
 }
 
 export async function testLlmProviderConnection(
@@ -697,19 +832,11 @@ export async function testLlmProviderConnection(
       // Fall through to OpenAI-compatible /models probe if endpoint returned 404 on /global/health
     }
 
-    let targetUrl = `${baseUrl}/models`;
-    const headers: Record<string, string> = {};
-
-    if (input.provider === "ollama") {
-      targetUrl = `${baseUrl}/api/tags`;
-    } else if (input.provider === "anthropic") {
-      headers["x-api-key"] = trimmedKey;
-      headers["anthropic-version"] = "2023-06-01";
-    } else if (input.provider === "opencode") {
-      headers.authorization = `Bearer ${trimmedKey || "public"}`;
-    } else {
-      headers.authorization = `Bearer ${trimmedKey}`;
-    }
+    const { targetUrl, headers, preferChatCompletions } = buildModelsRequestConfig(
+      input.provider,
+      baseUrl,
+      trimmedKey,
+    );
 
     const res = await fetch(targetUrl, {
       method: "GET",
@@ -730,7 +857,9 @@ export async function testLlmProviderConnection(
 
     let availableModels: string[] | undefined;
     try {
-      const discovered = extractModelIdsFromPayload(await res.json());
+      const discovered = extractModelIdsFromPayload(await res.json(), {
+        preferChatCompletions,
+      });
       if (discovered.length > 0) {
         availableModels = discovered;
       }

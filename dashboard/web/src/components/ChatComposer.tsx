@@ -454,7 +454,23 @@ export function ChatComposer({
     }
   }
 
-  const catalog = onboardingPayload?.providerCatalog ?? [];
+  const catalog = useMemo(() => {
+    const raw = onboardingPayload?.providerCatalog ?? [];
+    const activeBaseUrl = onboardingPayload?.state.llmBaseUrl?.replace(/\/+$/, "").toLowerCase();
+    return raw.map((entry) => {
+      if (!entry.endpointPresets?.length) return entry;
+      const preset =
+        (onboardingPayload?.state.llmProvider === entry.id && activeBaseUrl
+          ? entry.endpointPresets.find(
+              (p) => p.baseUrl.replace(/\/+$/, "").toLowerCase() === activeBaseUrl,
+            )
+          : undefined) ?? entry.endpointPresets[0];
+      return {
+        ...entry,
+        suggestedModels: preset?.suggestedModels ?? entry.suggestedModels,
+      };
+    });
+  }, [onboardingPayload]);
   const filteredCatalog = useMemo(() => {
     const q = modelSearch.trim().toLowerCase();
     if (!q) return catalog;

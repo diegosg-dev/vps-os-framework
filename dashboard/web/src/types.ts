@@ -121,6 +121,8 @@ export interface ProviderEndpointPreset {
   requiresApiKey: boolean;
   keyLabel?: string;
   keyPlaceholder?: string;
+  defaultModel?: string;
+  suggestedModels?: string[];
 }
 
 export interface ProviderCatalogItem {
