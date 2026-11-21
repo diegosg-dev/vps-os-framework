@@ -736,7 +736,7 @@ test("Agent mode skips bogus manual_review plans on conversational prompts and e
     });
     const { thread } = (await threadRes.json()) as { thread: { id: string } };
 
-    for (const prompt of ["whats the link", "via ip", "approve", "what should I deploy?"]) {
+    for (const prompt of ["whats the link", "via ip", "approve", "thanks", "what should I deploy?"]) {
       const res = await app.request(`/api/chat/threads/${thread.id}/messages`, {
         method: "POST",
         headers: { "content-type": "application/json", ...authHeaders },
@@ -756,11 +756,19 @@ test("Agent mode skips bogus manual_review plans on conversational prompts and e
       };
       assert.equal(json.plan, null, `prompt "${prompt}" must not spawn a bogus plan`);
       assert.equal(json.assistantMessage.planId, null);
-      const metricsTool = json.assistantMessage.toolCalls.find(
-        (tc) => tc.toolName === "inspect_system_metrics",
-      );
-      assert.equal(metricsTool?.output?.publicIp, "109.199.127.133");
-      assert.equal(metricsTool?.output?.dashboardUrl, "http://109.199.127.133");
+      if (prompt === "whats the link" || prompt === "via ip") {
+        const metricsTool = json.assistantMessage.toolCalls.find(
+          (tc) => tc.toolName === "inspect_system_metrics",
+        );
+        assert.equal(metricsTool?.output?.publicIp, "109.199.127.133");
+        assert.equal(metricsTool?.output?.dashboardUrl, "http://109.199.127.133");
+      } else if (prompt === "approve" || prompt === "thanks") {
+        assert.equal(
+          json.assistantMessage.toolCalls.length,
+          0,
+          `conversational prompt "${prompt}" must not emit unnecessary inspection tool cards`,
+        );
+      }
     }
   } finally {
     registry.close();
