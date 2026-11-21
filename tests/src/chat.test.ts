@@ -1131,6 +1131,8 @@ test("LLM-emitted vps-plan creates executable card, strips JSON block, passes tr
     };
 
     assert.match(capturedSystemPrompt, /"proposedPlan": null/);
+    assert.match(capturedSystemPrompt, /NEUTRAL WORKLOAD STANCE/);
+    assert.match(capturedSystemPrompt, /cap_drop: ALL/);
     assert.doesNotMatch(msgJson.assistantMessage.content, /```vps-plan/);
     assert.ok(msgJson.plan);
     assert.equal(msgJson.plan.status, "pending");
@@ -1195,6 +1197,91 @@ test("LLM-emitted vps-plan creates executable card, strips JSON block, passes tr
     );
   } finally {
     delete process.env.OPENCODE_API_KEY;
+    registry.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Image upload gracefully falls back to text-only completion when model returns HTTP 400 for image_url", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-chat-imgfallback-"));
+  const dataDir = path.join(tempDir, "data");
+  const envPath = path.join(tempDir, "config", "onboarding.env");
+  const registry = new SystemRegistryStore(path.join(dataDir, "registry.db"));
+
+  let callCount = 0;
+  const mockFetch: typeof fetch = async (_url, init) => {
+    callCount += 1;
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      messages?: Array<{ role: string; content: unknown }>;
+    };
+    const userMsg = body.messages?.at(-1);
+    if (Array.isArray(userMsg?.content)) {
+      return new Response("multimodal image_url unsupported", { status: 400 });
+    }
+    return new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "This model is text-only; paste the command output text and I will inspect it." } }],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+
+  const app = createDashboardApp({
+    registry,
+    adminToken: "img-fallback-admin-token-1234",
+    dataDir,
+    onboardingEnvPath: envPath,
+    chatFetch: mockFetch,
+  });
+  const authHeaders = { authorization: "Bearer img-fallback-admin-token-1234" };
+
+  try {
+    await app.request("/api/onboarding/provider", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        provider: "opencode",
+        model: "glm-5.3",
+        apiKey: "test-zen-key-secret-value",
+      }),
+    });
+    const threadRes = await app.request("/api/chat/threads", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ title: "Image Retry" }),
+    });
+    const { thread } = (await threadRes.json()) as { thread: { id: string } };
+
+    const uploadRes = await app.request("/api/chat/attachments", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        threadId: thread.id,
+        name: "screenshot.png",
+        mimeType: "image/png",
+        dataBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAoMBgQmS7jYAAAAASUVORK5CYII=",
+      }),
+    });
+    assert.equal(uploadRes.status, 201);
+    const { attachment } = (await uploadRes.json()) as { attachment: { id: string } };
+
+    const msgRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        content: "look",
+        mode: "agent",
+        stream: false,
+        attachmentIds: [attachment.id],
+      }),
+    });
+    assert.equal(msgRes.status, 200);
+    const msgJson = (await msgRes.json()) as {
+      assistantMessage: { content: string };
+    };
+    assert.equal(callCount, 2);
+    assert.match(msgJson.assistantMessage.content, /text-only/);
+  } finally {
     registry.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

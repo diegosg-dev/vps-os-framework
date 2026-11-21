@@ -1,13 +1,14 @@
 # Server Memory (VPS OS CTO)
 
 ## Platform Layout
-- Core platform root: `/vps-os` (`docker-compose.yml`, `.env`, `data/registry.db`, `Caddyfile`, `caddy/apps.d/*.caddy`)
-- Hermes CTO home: `/vps-os/hermes` (`SOUL.md`, `memories/`, `skills/`, `state.db`)
-- Isolated workloads root: `/apps/<slug>` (`docker-compose.yml`, `.env`, `.env.example`, `data/` or `workspace/`)
-- Core Docker bridge network: `vps-os-core`
-- Ingress: Caddy 2 handles automatic HTTPS (`80`/`443`) and imports `/etc/caddy/apps.d/*.caddy`. Never expose internal `/agent/*` or gateway ports publicly.
+- Control plane: `/vps-os` (`docker-compose.yml`, `.env`, `data/registry.db` SQLite WAL, `Caddyfile`, `caddy/apps.d/*.caddy`, `/run/vps-os/runtime.sock`).
+- Runtime home & skills: `/vps-os/hermes` (`SOUL.md`, `memories/`, `skills/`, `state.db`).
+- Isolated workloads: `/apps/<slug>` (`docker-compose.yml`, `.env` `0600`, `./data` or `./workspace`).
+- Networking & Ingress: isolated `vps-os-<slug>_app_net` bridge per workload; Caddy 2 terminates `80/tcp` & `443/tcp` via `/etc/caddy/apps.d/*.caddy` (`vps-os-app-<slug>:8080`). UFW allows SSH, `80/tcp`, `443/tcp`.
 
-## Baseline Checklist (Populate on First Host Scan)
-- Ubuntu version, CPU cores, total RAM, and root disk free space: pending initial baseline scan.
-- Docker Engine & Compose v2 status: pending initial baseline scan.
-- UFW firewall ports allowed: SSH, 80/tcp, 443/tcp.
+## Architecture Constraints & Baseline
+- Containers run with `cap_drop: ALL` and `no-new-privileges:true` (services bind ports `>=1024`, e.g., `8080`).
+- Host OS specs & Docker/Compose baseline: verify via live telemetry (`inspect_system_metrics` / `inspect_apps`).
+
+## Persistent Context Slot (Future Memory System)
+- Owner workload preferences, custom domains, and operational notes belong here (never secrets).
