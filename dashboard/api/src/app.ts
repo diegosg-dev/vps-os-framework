@@ -6,6 +6,8 @@ import {
   ApprovalDecisionSchema,
   type AppRecord,
   type AppStatus,
+  type ChatMessage,
+  LlmProviderSchema,
   type PlanStatus,
   PlanStatusSchema,
   type StoredPlan,
@@ -39,7 +41,13 @@ import {
   verifySessionToken,
 } from "./onboarding.js";
 import { registerChatRoutes } from "./chat-routes.js";
-import { formatPlanExecutionMarkdown } from "./chat-engine.js";
+import {
+  type ChatEngineDeps,
+  type ChatStreamEvent,
+  formatPlanExecutionMarkdown,
+  formatSseFrame,
+  runPlanExecutionChatTurn,
+} from "./chat-engine.js";
 import { registerOnboardingRoutes } from "./onboarding-routes.js";
 import { readStaticUiAssetAsync } from "./static.js";
 
@@ -131,6 +139,9 @@ const ChatPlanRequestSchema = z.object({
 
 const ExecutePlanRequestSchema = z.object({
   planId: z.string().trim().min(1).max(128),
+  stream: z.boolean().optional(),
+  provider: LlmProviderSchema.optional(),
+  model: z.string().trim().min(1).max(120).optional(),
 });
 
 const LifecycleRequestSchema = z.object({
@@ -751,27 +762,153 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
       );
     }
 
-    const appendPlanFollowUpMessage = (
-      content: string,
-      status: "completed" | "error",
-    ) => {
-      const originMsg = deps.registry.findChatMessageByPlanId(existing.id);
-      if (!originMsg) return null;
-      return deps.registry.appendChatMessage({
-        id: crypto.randomUUID(),
+    const originMsg = deps.registry.findChatMessageByPlanId(existing.id);
+    const wantsStream =
+      parsed.data.stream === true ||
+      (parsed.data.stream !== false &&
+        (c.req.header("accept") ?? "").includes("text/event-stream"));
+
+    if (originMsg) {
+      const execEngineDeps: ChatEngineDeps = {
+        registry: deps.registry,
+        getMetrics,
+        getDisk,
+        onboardingEnvPath: deps.onboardingEnvPath,
+        syncStatuses: deps.workloadController?.syncStatuses,
+        getLogs: deps.workloadController?.getLogs,
+        executePlan: deps.executePlan,
+        fetchFn: deps.chatFetch,
+        disableExternalLlm: deps.disableExternalLlm,
+      };
+      const executePlanFn = deps.executePlan;
+      const thread = deps.registry.getChatThread(originMsg.threadId);
+
+      if (wantsStream) {
+        const placeholderAssistant: ChatMessage = {
+          id: crypto.randomUUID(),
+          threadId: originMsg.threadId,
+          role: "assistant",
+          content: "",
+          attachments: [],
+          reasoning: [],
+          toolCalls: [],
+          planId: null,
+          provider: parsed.data.provider ?? originMsg.provider,
+          model: parsed.data.model ?? originMsg.model,
+          status: "streaming",
+          createdAt: new Date().toISOString(),
+        };
+        const requestSignal = c.req.raw.signal;
+        const stream = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const send = (event: ChatStreamEvent) => {
+              try {
+                controller.enqueue(formatSseFrame(event));
+              } catch {
+                // Stream closed by client
+              }
+            };
+
+            send({
+              type: "message_start",
+              assistantMessage: placeholderAssistant,
+            });
+
+            try {
+              const turnResult = await runPlanExecutionChatTurn(execEngineDeps, {
+                threadId: originMsg.threadId,
+                plan: existing,
+                leaseOwnerId,
+                executePlan: executePlanFn,
+                messageId: placeholderAssistant.id,
+                overrideProvider: parsed.data.provider,
+                overrideModel: parsed.data.model,
+                signal: requestSignal,
+                onEvent: send,
+              });
+
+              const saved = deps.registry.appendChatMessage(
+                turnResult.assistantMessage,
+              );
+              if (thread) {
+                deps.registry.updateChatThread(thread.id, {
+                  provider: turnResult.providerLabel,
+                  model: turnResult.modelLabel,
+                  updatedAt: saved.createdAt,
+                });
+              }
+
+              send({
+                type: "message_done",
+                assistantMessage: saved,
+                plan: turnResult.plan,
+                threadTitle: thread?.title ?? "New Conversation",
+              });
+            } catch (err) {
+              deps.registry.releasePlanExecution(existing.id, leaseOwnerId);
+              const safeErr = redactSecrets(
+                err instanceof Error ? err.message : "Plan execution failed.",
+              );
+              deps.registry.appendChatMessage({
+                ...placeholderAssistant,
+                content: `### Plan Execution Failed\n\n${safeErr}`,
+                status: "error",
+              });
+              send({ type: "error", message: safeErr });
+            } finally {
+              try {
+                controller.close();
+              } catch {
+                // ignore double close
+              }
+            }
+          },
+        });
+
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache, no-store, must-revalidate",
+            connection: "keep-alive",
+            "x-content-type-options": "nosniff",
+          },
+        });
+      }
+
+      const turnResult = await runPlanExecutionChatTurn(execEngineDeps, {
         threadId: originMsg.threadId,
-        role: "assistant",
-        content,
-        attachments: [],
-        reasoning: [],
-        toolCalls: [],
-        planId: null,
-        provider: originMsg.provider,
-        model: originMsg.model,
-        status,
-        createdAt: new Date().toISOString(),
+        plan: existing,
+        leaseOwnerId,
+        executePlan: executePlanFn,
+        overrideProvider: parsed.data.provider,
+        overrideModel: parsed.data.model,
+        signal: c.req.raw.signal,
       });
-    };
+      const saved = deps.registry.appendChatMessage(turnResult.assistantMessage);
+      if (thread) {
+        deps.registry.updateChatThread(thread.id, {
+          provider: turnResult.providerLabel,
+          model: turnResult.modelLabel,
+          updatedAt: saved.createdAt,
+        });
+      }
+      if (!turnResult.ok) {
+        return c.json(
+          {
+            error: turnResult.errorMessage ?? turnResult.summary,
+            plan: turnResult.plan,
+            followUpMessage: saved,
+          },
+          422,
+        );
+      }
+      return c.json({
+        plan: turnResult.plan,
+        execution: { summary: turnResult.summary },
+        followUpMessage: saved,
+      });
+    }
 
     let execution: PlanExecutionResult;
     try {
@@ -782,17 +919,7 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
         err,
         `Could not execute plan "${existing.id}".`,
       );
-      const followUpMessage = appendPlanFollowUpMessage(
-        `### Plan Execution Failed\n\n${redactSecrets(mapped.message)}`,
-        "error",
-      );
-      return c.json(
-        {
-          error: mapped.message,
-          ...(followUpMessage ? { followUpMessage } : {}),
-        },
-        mapped.status,
-      );
+      return c.json({ error: mapped.message }, mapped.status);
     }
 
     const transitioned = deps.registry.markPlanExecuted(existing.id, leaseOwnerId);
@@ -815,17 +942,11 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
       createdAt: new Date().toISOString(),
     });
 
-    const followUpMessage = appendPlanFollowUpMessage(
-      formatPlanExecutionMarkdown(existing, safeSummary, deps.registry),
-      "completed",
-    );
-
     return c.json({
       plan: deps.registry.getPlan(existing.id),
       execution: {
         summary: safeSummary,
       },
-      ...(followUpMessage ? { followUpMessage } : {}),
     });
   });
 

@@ -769,6 +769,185 @@ export function AgentChat({
     }
   }
 
+  async function consumeChatSseStream(
+    body: ReadableStream<Uint8Array>,
+    opts: {
+      threadId: string;
+      attachments: ChatAttachmentView[];
+      messageCountDelta: number;
+      truncateFromMessageId?: boolean;
+      onAssistantId: (id: string) => void;
+      onErrorEvent?: () => void;
+    },
+  ): Promise<{ assistantId: string | null; plan: ExecutionPlanView | null }> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let activeAssistantId: string | null = null;
+    let finalPlanResult: ExecutionPlanView | null = null;
+
+    const updateAssistant = (
+      updater: (msg: ChatMessageView) => ChatMessageView,
+    ) => {
+      if (!activeAssistantId || activeThreadIdRef.current !== opts.threadId) return;
+      const targetId = activeAssistantId;
+      setMessages((prev) =>
+        prev.map((msg) => (msg.id === targetId ? updater(msg) : msg)),
+      );
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+
+      for (const frame of frames) {
+        const dataLine = frame
+          .split("\n")
+          .find((line) => line.startsWith("data:"));
+        if (!dataLine) continue;
+
+        let evt: Record<string, unknown>;
+        try {
+          evt = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+
+        switch (evt.type) {
+          case "message_start": {
+            const userMsg = evt.userMessage as ChatMessageView | undefined;
+            const assistantMsg = evt.assistantMessage as ChatMessageView;
+            activeAssistantId = assistantMsg.id;
+            opts.onAssistantId(assistantMsg.id);
+            if (activeThreadIdRef.current === opts.threadId) {
+              if (userMsg) {
+                const mergedUserMsg: ChatMessageView = {
+                  ...userMsg,
+                  attachments: userMsg.attachments.map((att) => {
+                    const local = opts.attachments.find((a) => a.id === att.id);
+                    return local?.localPreviewUrl
+                      ? { ...att, localPreviewUrl: local.localPreviewUrl }
+                      : att;
+                  }),
+                };
+                setMessages((prev) => [...prev, mergedUserMsg, assistantMsg]);
+              } else {
+                setMessages((prev) => [...prev, assistantMsg]);
+                scrollToLatest("smooth");
+              }
+            }
+            break;
+          }
+          case "reasoning_start": {
+            const block = evt.block as ChatReasoningBlockView;
+            updateAssistant((msg) => ({
+              ...msg,
+              reasoning: [...msg.reasoning, block],
+            }));
+            break;
+          }
+          case "reasoning_delta": {
+            const blockId = evt.blockId as string;
+            const delta = evt.delta as string;
+            updateAssistant((msg) => ({
+              ...msg,
+              reasoning: msg.reasoning.map((b) =>
+                b.id === blockId ? { ...b, content: b.content + delta } : b,
+              ),
+            }));
+            break;
+          }
+          case "reasoning_done": {
+            const block = evt.block as ChatReasoningBlockView;
+            updateAssistant((msg) => ({
+              ...msg,
+              reasoning: msg.reasoning.map((b) => (b.id === block.id ? block : b)),
+            }));
+            break;
+          }
+          case "tool_start": {
+            const toolCall = evt.toolCall as ChatToolCallView;
+            updateAssistant((msg) => ({
+              ...msg,
+              toolCalls: [...msg.toolCalls, toolCall],
+            }));
+            break;
+          }
+          case "tool_done": {
+            const toolCall = evt.toolCall as ChatToolCallView;
+            updateAssistant((msg) => ({
+              ...msg,
+              toolCalls: msg.toolCalls.map((t) =>
+                t.id === toolCall.id ? toolCall : t,
+              ),
+            }));
+            break;
+          }
+          case "plan_created": {
+            const plan = evt.plan as ExecutionPlanView;
+            setPlansById((prev) => ({ ...prev, [plan.id]: plan }));
+            updateAssistant((msg) => ({ ...msg, planId: plan.id }));
+            break;
+          }
+          case "text_delta": {
+            const delta = evt.delta as string;
+            updateAssistant((msg) => ({
+              ...msg,
+              content: msg.content + delta,
+            }));
+            break;
+          }
+          case "message_done": {
+            const finalAssistant = evt.assistantMessage as ChatMessageView;
+            const finalPlan = evt.plan as ExecutionPlanView | null;
+            const threadTitle = evt.threadTitle as string;
+            if (finalPlan) {
+              finalPlanResult = finalPlan;
+              setPlansById((prev) => ({ ...prev, [finalPlan.id]: finalPlan }));
+            }
+            updateAssistant(() => finalAssistant);
+            setThreads((prev) =>
+              sortThreads(
+                prev.map((t) =>
+                  t.id === opts.threadId
+                    ? {
+                        ...t,
+                        title: threadTitle || t.title,
+                        provider: finalAssistant.provider,
+                        model: finalAssistant.model,
+                        messageCount: opts.truncateFromMessageId
+                          ? Math.max(2, t.messageCount)
+                          : t.messageCount + opts.messageCountDelta,
+                        updatedAt: finalAssistant.createdAt,
+                      }
+                    : t,
+                ),
+              ),
+            );
+            break;
+          }
+          case "error": {
+            const errMsg = evt.message as string;
+            opts.onErrorEvent?.();
+            setChatError(errMsg);
+            updateAssistant((msg) => ({
+              ...msg,
+              status: "error",
+              content: msg.content || `Error: ${errMsg}`,
+            }));
+            break;
+          }
+        }
+      }
+    }
+
+    return { assistantId: activeAssistantId, plan: finalPlanResult };
+  }
+
   const dispatchTurn = useCallback(
     async (params: DispatchTurnParams) => {
       const text = params.content.trim();
@@ -827,161 +1006,19 @@ export function AgentChat({
           throw new Error("Streaming response unavailable.");
         }
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        const updateAssistant = (
-          updater: (msg: ChatMessageView) => ChatMessageView,
-        ) => {
-          if (!activeAssistantId || activeThreadIdRef.current !== threadId) return;
-          const targetId = activeAssistantId;
-          setMessages((prev) =>
-            prev.map((msg) => (msg.id === targetId ? updater(msg) : msg)),
-          );
-        };
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-
-          const frames = buffer.split("\n\n");
-          buffer = frames.pop() ?? "";
-
-          for (const frame of frames) {
-            const dataLine = frame
-              .split("\n")
-              .find((line) => line.startsWith("data:"));
-            if (!dataLine) continue;
-
-            let evt: Record<string, unknown>;
-            try {
-              evt = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
-            } catch {
-              continue;
-            }
-
-            switch (evt.type) {
-              case "message_start": {
-                const userMsg = evt.userMessage as ChatMessageView;
-                const assistantMsg = evt.assistantMessage as ChatMessageView;
-                const mergedUserMsg: ChatMessageView = {
-                  ...userMsg,
-                  attachments: userMsg.attachments.map((att) => {
-                    const local = params.attachments.find((a) => a.id === att.id);
-                    return local?.localPreviewUrl
-                      ? { ...att, localPreviewUrl: local.localPreviewUrl }
-                      : att;
-                  }),
-                };
-                activeAssistantId = assistantMsg.id;
-                if (activeThreadIdRef.current === threadId) {
-                  setMessages((prev) => [...prev, mergedUserMsg, assistantMsg]);
-                }
-                break;
-              }
-              case "reasoning_start": {
-                const block = evt.block as ChatReasoningBlockView;
-                updateAssistant((msg) => ({
-                  ...msg,
-                  reasoning: [...msg.reasoning, block],
-                }));
-                break;
-              }
-              case "reasoning_delta": {
-                const blockId = evt.blockId as string;
-                const delta = evt.delta as string;
-                updateAssistant((msg) => ({
-                  ...msg,
-                  reasoning: msg.reasoning.map((b) =>
-                    b.id === blockId ? { ...b, content: b.content + delta } : b,
-                  ),
-                }));
-                break;
-              }
-              case "reasoning_done": {
-                const block = evt.block as ChatReasoningBlockView;
-                updateAssistant((msg) => ({
-                  ...msg,
-                  reasoning: msg.reasoning.map((b) => (b.id === block.id ? block : b)),
-                }));
-                break;
-              }
-              case "tool_start": {
-                const toolCall = evt.toolCall as ChatToolCallView;
-                updateAssistant((msg) => ({
-                  ...msg,
-                  toolCalls: [...msg.toolCalls, toolCall],
-                }));
-                break;
-              }
-              case "tool_done": {
-                const toolCall = evt.toolCall as ChatToolCallView;
-                updateAssistant((msg) => ({
-                  ...msg,
-                  toolCalls: msg.toolCalls.map((t) =>
-                    t.id === toolCall.id ? toolCall : t,
-                  ),
-                }));
-                break;
-              }
-              case "plan_created": {
-                const plan = evt.plan as ExecutionPlanView;
-                setPlansById((prev) => ({ ...prev, [plan.id]: plan }));
-                updateAssistant((msg) => ({ ...msg, planId: plan.id }));
-                break;
-              }
-              case "text_delta": {
-                const delta = evt.delta as string;
-                updateAssistant((msg) => ({
-                  ...msg,
-                  content: msg.content + delta,
-                }));
-                break;
-              }
-              case "message_done": {
-                const finalAssistant = evt.assistantMessage as ChatMessageView;
-                const finalPlan = evt.plan as ExecutionPlanView | null;
-                const threadTitle = evt.threadTitle as string;
-                if (finalPlan) {
-                  setPlansById((prev) => ({ ...prev, [finalPlan.id]: finalPlan }));
-                }
-                updateAssistant(() => finalAssistant);
-                setThreads((prev) =>
-                  sortThreads(
-                    prev.map((t) =>
-                      t.id === threadId
-                        ? {
-                            ...t,
-                            title: threadTitle || t.title,
-                            provider: finalAssistant.provider,
-                            model: finalAssistant.model,
-                            messageCount: params.truncateFromMessageId
-                              ? Math.max(2, t.messageCount)
-                              : t.messageCount + 2,
-                            updatedAt: finalAssistant.createdAt,
-                          }
-                        : t,
-                    ),
-                  ),
-                );
-                break;
-              }
-              case "error": {
-                const errMsg = evt.message as string;
-                turnFailed = true;
-                setChatError(errMsg);
-                updateAssistant((msg) => ({
-                  ...msg,
-                  status: "error",
-                  content: msg.content || `Error: ${errMsg}`,
-                }));
-                break;
-              }
-            }
-          }
-        }
+        const result = await consumeChatSseStream(res.body, {
+          threadId,
+          attachments: params.attachments,
+          messageCountDelta: params.truncateFromMessageId ? 0 : 2,
+          truncateFromMessageId: Boolean(params.truncateFromMessageId),
+          onAssistantId: (id) => {
+            activeAssistantId = id;
+          },
+          onErrorEvent: () => {
+            turnFailed = true;
+          },
+        });
+        activeAssistantId = result.assistantId ?? activeAssistantId;
 
         void onRefreshDashboard();
         if (params.truncateFromMessageId) {
@@ -1358,14 +1395,54 @@ export function AgentChat({
   }
 
   async function handleExecutePlan(planId: string) {
+    const threadId = activeThreadIdRef.current;
     setPlanBusyId(planId);
     setChatError(null);
+
+    const canStream = Boolean(threadId) && !streamingRef.current;
+    const controller = canStream ? new AbortController() : null;
+    if (canStream && threadId && controller) {
+      abortRef.current = controller;
+      streamingRef.current = true;
+      streamStartedAtRef.current = Date.now();
+      setElapsedMs(0);
+      setStreaming(true);
+      setStreamingThreadId(threadId);
+      streamingThreadIdRef.current = threadId;
+    }
+
     try {
       const res = await fetch("/api/chat/execute", {
         method: "POST",
-        headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ planId }),
+        headers: {
+          "content-type": "application/json",
+          ...(canStream ? { accept: "text/event-stream" } : {}),
+          ...authHeaders(),
+        },
+        body: JSON.stringify({
+          planId,
+          ...(canStream ? { stream: true } : {}),
+          ...(selectedProvider ? { provider: selectedProvider } : {}),
+          ...(selectedModel ? { model: selectedModel } : {}),
+        }),
+        ...(controller ? { signal: controller.signal } : {}),
       });
+
+      const contentType = res.headers.get("content-type") ?? "";
+      if (res.ok && contentType.includes("text/event-stream") && res.body && threadId) {
+        const result = await consumeChatSseStream(res.body, {
+          threadId,
+          attachments: [],
+          messageCountDelta: 1,
+          onAssistantId: () => {},
+        });
+        if (result.plan?.status === "executed") {
+          onNotify("Plan executed", "success", result.plan.summary);
+        }
+        void onRefreshDashboard();
+        return;
+      }
+
       const payload = (await res.json().catch(() => ({}))) as {
         error?: string;
         plan?: ExecutionPlanView;
@@ -1391,8 +1468,17 @@ export function AgentChat({
       }
       void onRefreshDashboard();
     } catch (err) {
-      setChatError(err instanceof Error ? err.message : "Could not execute plan.");
+      if ((err as Error).name !== "AbortError") {
+        setChatError(err instanceof Error ? err.message : "Could not execute plan.");
+      }
     } finally {
+      if (canStream) {
+        abortRef.current = null;
+        streamingRef.current = false;
+        setStreaming(false);
+        setStreamingThreadId(null);
+        streamingThreadIdRef.current = null;
+      }
       setPlanBusyId(null);
     }
   }

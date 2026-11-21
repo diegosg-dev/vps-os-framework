@@ -606,8 +606,12 @@ export function ChatTurnItem({
   const [copied, setCopied] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draftEdit, setDraftEdit] = useState(message.content);
+  const hasExecutionTrace = message.toolCalls.some(
+    (tc) => tc.toolName === "execute_plan" || tc.toolName === "propose_plan",
+  );
   const [timelineExpanded, setTimelineExpanded] = useState(
-    message.status === "streaming",
+    message.status === "streaming" ||
+      (isLatestAssistant && (hasExecutionTrace || message.toolCalls.length > 0)),
   );
   const { cleanContent, questions } = useMemo(
     () => parseClarifyingQuestions(message.content),
@@ -615,8 +619,12 @@ export function ChatTurnItem({
   );
 
   useEffect(() => {
-    setTimelineExpanded(message.status === "streaming");
-  }, [message.status]);
+    if (message.status === "streaming") {
+      setTimelineExpanded(true);
+    } else if (message.toolCalls.length === 0) {
+      setTimelineExpanded(false);
+    }
+  }, [message.status, message.toolCalls.length]);
 
   function handleCopy() {
     void navigator.clipboard?.writeText(message.content);
@@ -864,6 +872,20 @@ export function ChatTurnItem({
           </div>
         )}
 
+        {/* Executed Plan Card sits above the CTO's post-execution summary */}
+        {linkedPlan &&
+          message.status !== "streaming" &&
+          linkedPlan.status === "executed" && (
+            <InlinePlanCard
+              plan={linkedPlan}
+              busy={planBusyId === linkedPlan.id}
+              executionSummary={executionSummary}
+              onApprove={onApprovePlan}
+              onReject={onRejectPlan}
+              onExecute={onExecutePlan}
+            />
+          )}
+
         {/* Markdown Answer Body */}
         {cleanContent && (
           <div className="pt-0.5">
@@ -880,17 +902,19 @@ export function ChatTurnItem({
           />
         )}
 
-        {/* Inline Execution Plan Card (shown only after streaming/thinking finishes) */}
-        {linkedPlan && message.status !== "streaming" && (
-          <InlinePlanCard
-            plan={linkedPlan}
-            busy={planBusyId === linkedPlan.id}
-            executionSummary={executionSummary}
-            onApprove={onApprovePlan}
-            onReject={onRejectPlan}
-            onExecute={onExecutePlan}
-          />
-        )}
+        {/* Pending/Approved/Rejected Execution Plan Card sits at the bottom */}
+        {linkedPlan &&
+          message.status !== "streaming" &&
+          linkedPlan.status !== "executed" && (
+            <InlinePlanCard
+              plan={linkedPlan}
+              busy={planBusyId === linkedPlan.id}
+              executionSummary={executionSummary}
+              onApprove={onApprovePlan}
+              onReject={onRejectPlan}
+              onExecute={onExecutePlan}
+            />
+          )}
       </div>
     </div>
   );

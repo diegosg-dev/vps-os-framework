@@ -398,11 +398,29 @@ test("Dashboard Control API supports app detail, lifecycle, redacted logs, and p
     const okExec = execResA.status === 200 ? execResA : execResB;
     const execJson = (await okExec.json()) as {
       plan: { status: string };
-      followUpMessage?: { id: string; threadId: string; role: string; content: string };
+      followUpMessage?: {
+        id: string;
+        threadId: string;
+        role: string;
+        content: string;
+        reasoning: Array<{ title: string }>;
+        toolCalls: Array<{ toolName: string; status: string }>;
+      };
     };
     assert.equal(execJson.plan.status, "executed");
     assert.equal(execJson.followUpMessage?.threadId, chatThread.id);
     assert.equal(execJson.followUpMessage?.role, "assistant");
+    assert.ok((execJson.followUpMessage?.reasoning.length ?? 0) >= 1);
+    assert.ok(
+      execJson.followUpMessage?.toolCalls.some(
+        (tc) => tc.toolName === "execute_plan" && tc.status === "success",
+      ),
+    );
+    assert.ok(
+      execJson.followUpMessage?.toolCalls.some(
+        (tc) => tc.toolName === "inspect_apps" && tc.status === "success",
+      ),
+    );
     assert.match(execJson.followUpMessage?.content ?? "", /Plan Executed/);
     assert.match(execJson.followUpMessage?.content ?? "", /Steps completed:/);
     const threadMsgs = registry.listChatMessages(chatThread.id);
