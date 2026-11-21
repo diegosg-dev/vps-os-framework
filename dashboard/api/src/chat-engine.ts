@@ -1,8 +1,11 @@
 import crypto from "node:crypto";
 import {
+  buildValidatedLlmPlan,
   classifyGoalRisk,
   createExecutionPlan,
   extractDeploySpecFromGoal,
+  extractRemoveSlugsFromGoal,
+  extractRouteSpecFromGoal,
 } from "@vps-os/agent";
 import {
   type AppRecord,
@@ -252,14 +255,45 @@ function buildSystemPrompt(
     "Respond naturally and conversationally like a helpful CTO in chat — keep follow-ups and answers concise without dumping huge boilerplate tables unless telemetry was requested.",
     "Use clean Markdown formatting (short headings, bullet points, tables, fenced code blocks when helpful).",
     "NEVER claim a plan was approved, executed, or deployed unless that exact state appears in Live Inspected Server Context or executed tool results — typing 'approve' in chat does not approve or execute a pending Execution Plan card.",
-    "When an Execution Plan card is attached to your turn with status 'pending', NEVER ask the user to type 'approve' in chat — instead direct them to click Approve & Execute on the Execution Plan card below your message.",
+    "When proposedPlan is non-null with status 'pending', direct the user to click Approve & Execute on the Execution Plan card below your message (never ask them to type 'approve').",
+    "CRITICAL HONESTY RULE: When proposedPlan is null AND you do NOT append a valid ```vps-plan``` block at the end of your reply, NO Execution Plan card is attached below your reply — NEVER write 'pending below', 'card below this message', or tell the user to click Approve & Execute below!",
+    "When proposedPlan is null, mode is NOT 'ask', and the user asks you to act (deploy, remove, start/stop/restart, attach/detach a domain, or follow up with 'can you do it?' / 'go ahead' / 'yes'), emit a single trailing fenced block so a real interactive Execution Plan card is created (and auto-executed in YOLO mode):\n```vps-plan\n{\"goal\":\"...\",\"summary\":\"...\",\"steps\":[{\"title\":\"...\",\"description\":\"...\",\"toolName\":\"prepare_app_workspace|control_app_lifecycle|remove_workload|route_caddy\",\"args\":{...}}]}\n```\nSupported args: prepare_app_workspace({slug,name,kind:'web-app'|'personal-agent',domain:string|null,internalPort}), control_app_lifecycle({slug,action:'start'|'stop'|'restart'}), remove_workload({slug,removeFiles:true}), route_caddy({slug,domain:string|null}). NEVER put shell, ufw, or raw host port '-p 8080:8080' steps in vps-plan — if a request asks for an unsupported host port or OS firewall edit, explain plainly what runtimeCapabilities allows (e.g. Caddy HTTPS domain routing on ports 80/443, including `<slug>.<ip-with-dashes>.sslip.io` when publicIp is set and no custom domain exists yet).",
     "When proposedPlan.status is 'executed' (auto-executed in YOLO mode), confirm that it ALREADY ran, report the live workload status, folder, port, and public/internal URL from workloads & autoExecutedSummary, and state any next step clearly.",
-    "When an app has domain=null, state clearly that it is currently internal-network-only (listening on its internal port) and needs a domain/route attached before it has a public HTTP(S) link.",
-    "If key details are missing or you want the user to pick between options before acting (and no Execution Plan card is attached), ask concisely and optionally append at the very end a single fenced block:\n```vps-questions\n{\"questions\":[{\"question\":\"...\",\"options\":[\"...\",\"...\"]}]}\n```",
+    "When an app has domain=null, state clearly that it is currently internal-network-only (listening on its internal port) and needs a domain/route attached via Caddy (ports 80/443) before it has a public HTTP(S) link.",
+    "If key details are missing or you want the user to pick between options before acting (and neither proposedPlan nor vps-plan is attached), ask concisely and optionally append at the very end a single fenced block:\n```vps-questions\n{\"questions\":[{\"question\":\"...\",\"options\":[\"...\",\"...\"]}]}\n```",
     "",
     "### Live Inspected Server Context",
     toolContext,
   ].join("\n");
+}
+
+function parseAndStripVpsPlanBlock(
+  rawText: string,
+  fallbackGoal: string,
+): { cleanText: string; plan: ReturnType<typeof buildValidatedLlmPlan> } {
+  const blockRegex = /```vps-plan\s*\n([\s\S]*?)\n```/g;
+  let parsedPlan: ReturnType<typeof buildValidatedLlmPlan> = null;
+  let match: RegExpExecArray | null = null;
+
+  while ((match = blockRegex.exec(rawText)) !== null) {
+    const jsonBody = match[1]?.trim();
+    if (!jsonBody) continue;
+    try {
+      const candidate = JSON.parse(jsonBody) as unknown;
+      const validated = buildValidatedLlmPlan(candidate, fallbackGoal);
+      if (validated) {
+        parsedPlan = validated;
+      }
+    } catch {
+      // ignore invalid JSON block; still strip fence below
+    }
+  }
+
+  const cleanText = rawText
+    .replace(/```vps-plan\s*\n[\s\S]*?\n```\s*/g, "")
+    .trimEnd();
+
+  return { cleanText, plan: parsedPlan };
 }
 
 /**
@@ -935,29 +969,23 @@ export async function runAgentChatTurn(
     .filter(Boolean);
   const riskLevel = classifyGoalRisk(sanitizedGoal);
   const isQuestionAnswerReply = /^[-*]\s+\*\*[^*]+\*\*/m.test(sanitizedGoal);
-  const isConversationalQuestion =
-    isQuestionAnswerReply ||
-    /^(what|whats|what's|how|why|when|where|which|who|can|could|would|should|do|does|is|are|explain|tell)\b/i.test(
+  const isHostSafetyGoal =
+    !isQuestionAnswerReply &&
+    /\b(firewall|ufw|ssh|sudo|root|wipe|erase|format)\b/i.test(sanitizedGoal);
+  const hasLifecycleIntent =
+    !isQuestionAnswerReply &&
+    /^\s*(start|stop|restart)\s+(?:the\s+)?(?:app\s+|container\s+|workload\s+)?[a-z0-9][a-z0-9-]{1,47}/i.test(
       sanitizedGoal,
-    ) ||
-    sanitizedGoal.endsWith("?");
-  const hasExecutableDeployOrLifecycle =
+    );
+  const hasDeployIntent =
+    !isQuestionAnswerReply && extractDeploySpecFromGoal(sanitizedGoal) !== null;
+  const mayMutateWorkloads =
     !isQuestionAnswerReply &&
-    (extractDeploySpecFromGoal(sanitizedGoal) !== null ||
-      /^\s*(start|stop|restart)\s+(?:the\s+)?(?:app\s+|container\s+|workload\s+)?[a-z0-9][a-z0-9-]{1,47}/i.test(
+    (hasDeployIntent ||
+      hasLifecycleIntent ||
+      /\b(remove|delete|uninstall|teardown|tear\s+down|destroy|route|attach|bind|map|point|deploy|install|create|provision|launch|restart|stop|start)\b/i.test(
         sanitizedGoal,
       ));
-  const hasExplicitMutationVerb =
-    !isQuestionAnswerReply &&
-    (riskLevel === "high" ||
-      /\b(deploy|install|create|provision|restart|stop|start|domain|backup|plan|route|expose|remove|delete)\b/i.test(
-        sanitizedGoal,
-      ));
-  const shouldProposePlan =
-    input.mode !== "ask" &&
-    (input.mode === "plan" ||
-      hasExecutableDeployOrLifecycle ||
-      (hasExplicitMutationVerb && !isConversationalQuestion));
 
   appendInitialThought(
     `Classified request risk as **${riskLevel}** in \`${input.mode}\` mode (effort: \`${effort}\`)${
@@ -1058,17 +1086,19 @@ export async function runAgentChatTurn(
   };
 
   const shouldTraceMetrics =
-    shouldProposePlan ||
     input.mode === "plan" ||
+    hasDeployIntent ||
+    isHostSafetyGoal ||
     mentionedSlugs.includes("host-metrics") ||
     /\b(cpu|ram|memory|disk|load|uptime|metric|health|status|server|host|vps|link|url|domain|ip|port|headroom)\b/i.test(
       sanitizedGoal,
     );
   const shouldTraceApps =
-    shouldProposePlan ||
     input.mode === "plan" ||
+    mayMutateWorkloads ||
+    isHostSafetyGoal ||
     mentionedSlugs.length > 0 ||
-    /\b(app|apps|container|workload|deploy|install|create|provision|restart|stop|start|link|url|domain|ip|port|error|log|crash|broken|remove|delete|status|health|list)\b/i.test(
+    /\b(app|apps|container|workload|link|url|domain|ip|port|error|log|crash|broken|status|health|list)\b/i.test(
       sanitizedGoal,
     );
 
@@ -1185,9 +1215,139 @@ export async function runAgentChatTurn(
     );
   }
 
-  // Tool 6: Propose approval-gated ExecutionPlan when requested or mutating
+  // Tool 6: Propose approval-gated ExecutionPlan when requested or unambiguously actionable
   let yoloExecutionSummary: string | null = null;
   let yoloExecutionError: string | null = null;
+
+  const knownAppSlugs = apps.map((app) => app.slug);
+  const removeSlugs = isQuestionAnswerReply
+    ? []
+    : extractRemoveSlugsFromGoal(sanitizedGoal, knownAppSlugs);
+  const routeSpec = isQuestionAnswerReply
+    ? null
+    : extractRouteSpecFromGoal(sanitizedGoal, knownAppSlugs);
+  const isConversationalQuestion =
+    isQuestionAnswerReply ||
+    /^(what|whats|what's|how|why|when|where|which|who|can|could|would|should|do|does|is|are|explain|tell)\b/i.test(
+      sanitizedGoal,
+    ) ||
+    sanitizedGoal.endsWith("?");
+
+  const pendingThreadPlans: StoredPlan[] = [];
+  const seenPlanIds = new Set<string>();
+  for (const msg of input.history) {
+    if (!msg.planId || seenPlanIds.has(msg.planId)) continue;
+    seenPlanIds.add(msg.planId);
+    const existingPlan = deps.registry.getPlan(msg.planId);
+    if (
+      existingPlan &&
+      (existingPlan.status === "pending" || existingPlan.status === "approved")
+    ) {
+      pendingThreadPlans.push(existingPlan);
+    }
+  }
+
+  const autoExecuteYoloPlan = async (targetPlan: StoredPlan): Promise<StoredPlan> => {
+    let activePlan = targetPlan;
+    const canYoloAutoExecute =
+      onboarding.persona.approvalMode === "yolo" &&
+      input.mode === "agent" &&
+      Boolean(deps.executePlan) &&
+      !activePlan.steps.some((step) => step.toolName === "manual_review");
+
+    if (!canYoloAutoExecute || !deps.executePlan) {
+      appendInitialThought(
+        `Generated ${activePlan.steps.length}-step plan (${activePlan.status}) with approval gate ${
+          activePlan.requiresUserApproval ? "enabled" : "auto-approved (read-only)"
+        }.`,
+      );
+      return activePlan;
+    }
+
+    if (activePlan.status === "pending") {
+      activePlan = deps.registry.recordApproval({
+        planId: activePlan.id,
+        approved: true,
+        decidedBy: "yolo-mode",
+      });
+    }
+    const proposeTool = [...toolCalls]
+      .reverse()
+      .find((tc) => tc.toolName === "propose_plan");
+    if (proposeTool && proposeTool.status === "awaiting_approval") {
+      proposeTool.status = "success";
+      emit({ type: "tool_done", toolCall: { ...proposeTool } });
+    }
+    appendInitialThought(
+      `YOLO Sandbox mode active: auto-approved ${activePlan.steps.length}-step plan and executing immediately.`,
+    );
+
+    const leaseOwnerId = `yolo:${crypto.randomUUID()}`;
+    if (deps.registry.claimPlanExecution(activePlan.id, leaseOwnerId)) {
+      const execRes = await runTool(
+        "execute_plan",
+        "Auto-execute plan (YOLO Sandbox mode)",
+        { planId: activePlan.id, steps: activePlan.steps.map((s) => s.title) },
+        async () => {
+          try {
+            const outcome = await deps.executePlan!(activePlan, { leaseOwnerId });
+            deps.registry.markPlanExecuted(activePlan.id, leaseOwnerId);
+            const safeSummary = redactSecrets(outcome.summary);
+            deps.registry.recordAudit({
+              id: crypto.randomUUID(),
+              actor: "agent",
+              action: "chat.plan_executed",
+              targetSlug: null,
+              summary: redactSecrets(
+                `YOLO executed plan ${activePlan.id}: ${safeSummary}`,
+              ),
+              riskLevel: "medium",
+              createdAt: new Date().toISOString(),
+            });
+            activePlan = deps.registry.getPlan(activePlan.id) ?? activePlan;
+            yoloExecutionSummary = safeSummary;
+            return { summary: safeSummary };
+          } catch (err) {
+            deps.registry.releasePlanExecution(activePlan.id, leaseOwnerId);
+            const errMsg = redactSecrets(
+              err instanceof Error ? err.message : "YOLO execution failed.",
+            );
+            yoloExecutionError = errMsg;
+            throw new Error(errMsg);
+          }
+        },
+      );
+      if (execRes) {
+        appendInitialThought(`YOLO execution succeeded: ${execRes.summary}`);
+        appsResult = await runTool(
+          "inspect_apps",
+          "Refresh workload statuses after execution",
+          {},
+          collectAppsSummary,
+        ) ?? (await collectAppsSummary());
+        apps = deps.registry.listApps();
+      }
+    }
+    return activePlan;
+  };
+
+  const shouldProposePlan =
+    input.mode !== "ask" &&
+    (input.mode === "plan" ||
+      hasDeployIntent ||
+      hasLifecycleIntent ||
+      removeSlugs.length > 0 ||
+      routeSpec !== null ||
+      (isHostSafetyGoal && !isConversationalQuestion) ||
+      (riskLevel === "high" &&
+        /\b(firewall|ufw|ssh|sudo|root|wipe|erase|format)\b/i.test(sanitizedGoal)));
+
+  const isConfirmationFollowUp =
+    !shouldProposePlan &&
+    !isQuestionAnswerReply &&
+    /^\s*(?:can you do it|do it|go ahead|yes(?:,?\s*(?:please|do it|go ahead))?|please do|run it|execute it|approve(?:\s+and\s+execute)?)\s*[.!?]?\s*$/i.test(
+      sanitizedGoal,
+    );
 
   if (shouldProposePlan) {
     const planOutcome = await runTool(
@@ -1195,7 +1355,9 @@ export async function runAgentChatTurn(
       "Build risk-classified execution plan",
       { goal: sanitizedGoal, mode: input.mode },
       () => {
-        const stored = deps.registry.savePlan(createExecutionPlan(sanitizedGoal));
+        const stored = deps.registry.savePlan(
+          createExecutionPlan(sanitizedGoal, knownAppSlugs),
+        );
         deps.registry.recordAudit({
           id: crypto.randomUUID(),
           actor: "user",
@@ -1218,77 +1380,20 @@ export async function runAgentChatTurn(
           emit({ type: "tool_done", toolCall: { ...lastTool } });
         }
       }
-
-      const canYoloAutoExecute =
-        onboarding.persona.approvalMode === "yolo" &&
-        input.mode === "agent" &&
-        Boolean(deps.executePlan) &&
-        !createdPlan.steps.some((step) => step.toolName === "manual_review");
-
-      if (canYoloAutoExecute && deps.executePlan) {
-        if (createdPlan.status === "pending") {
-          createdPlan = deps.registry.recordApproval({
-            planId: createdPlan.id,
-            approved: true,
-            decidedBy: "yolo-mode",
-          });
-        }
-        const proposeTool = toolCalls.at(-1);
-        if (proposeTool && proposeTool.toolName === "propose_plan") {
-          proposeTool.status = "success";
-          emit({ type: "tool_done", toolCall: { ...proposeTool } });
-        }
-        appendInitialThought(
-          `YOLO Sandbox mode active: auto-approved ${createdPlan.steps.length}-step plan and executing immediately.`,
-        );
-
-        const leaseOwnerId = `yolo:${crypto.randomUUID()}`;
-        if (deps.registry.claimPlanExecution(createdPlan.id, leaseOwnerId)) {
-          const execRes = await runTool(
-            "execute_plan",
-            "Auto-execute plan (YOLO Sandbox mode)",
-            { planId: createdPlan.id, steps: createdPlan.steps.map((s) => s.title) },
-            async () => {
-              try {
-                const outcome = await deps.executePlan!(createdPlan!, { leaseOwnerId });
-                deps.registry.markPlanExecuted(createdPlan!.id, leaseOwnerId);
-                const safeSummary = redactSecrets(outcome.summary);
-                deps.registry.recordAudit({
-                  id: crypto.randomUUID(),
-                  actor: "agent",
-                  action: "chat.plan_executed",
-                  targetSlug: null,
-                  summary: redactSecrets(`YOLO executed plan ${createdPlan!.id}: ${safeSummary}`),
-                  riskLevel: "medium",
-                  createdAt: new Date().toISOString(),
-                });
-                createdPlan = deps.registry.getPlan(createdPlan!.id) ?? createdPlan;
-                yoloExecutionSummary = safeSummary;
-                return { summary: safeSummary };
-              } catch (err) {
-                deps.registry.releasePlanExecution(createdPlan!.id, leaseOwnerId);
-                const errMsg = redactSecrets(
-                  err instanceof Error ? err.message : "YOLO execution failed.",
-                );
-                yoloExecutionError = errMsg;
-                throw new Error(errMsg);
-              }
-            },
-          );
-          if (execRes) {
-            appendInitialThought(`YOLO execution succeeded: ${execRes.summary}`);
-            appsResult = await collectAppsSummary();
-            apps = deps.registry.listApps();
-          }
-        }
-      } else {
-        appendInitialThought(
-          `Generated ${createdPlan.steps.length}-step plan (${createdPlan.status}) with approval gate ${
-            createdPlan.requiresUserApproval ? "enabled" : "auto-approved (read-only)"
-          }.`,
-        );
-      }
-
+      createdPlan = await autoExecuteYoloPlan(createdPlan);
+      emit({ type: "plan_created", plan: createdPlan });
+    }
+  } else if (
+    isConfirmationFollowUp &&
+    onboarding.persona.approvalMode === "yolo" &&
+    input.mode === "agent" &&
+    deps.executePlan
+  ) {
+    const latestSafePending = [...pendingThreadPlans]
+      .reverse()
+      .find((p) => !p.steps.some((step) => step.toolName === "manual_review"));
+    if (latestSafePending) {
+      createdPlan = await autoExecuteYoloPlan(latestSafePending);
       emit({ type: "plan_created", plan: createdPlan });
     }
   }
@@ -1300,6 +1405,7 @@ export async function runAgentChatTurn(
   // 2. Compose final response via OpenCode / configured LLM or built-in CTO fallback
   let assistantText = "";
   let providerNote: string | null = null;
+  let postStreamYoloAppended = false;
 
   if (providerCfg) {
     const contextPayload = JSON.stringify(
@@ -1308,27 +1414,43 @@ export async function runAgentChatTurn(
         workloads: appsResult,
         ...(inspectedLogs ? { logs: inspectedLogs } : {}),
         ...(auditSnapshot ? { recentAudit: auditSnapshot } : {}),
-        ...(createdPlan
+        runtimeCapabilities: {
+          executableTools: [
+            "prepare_app_workspace",
+            "control_app_lifecycle",
+            "remove_workload",
+            "route_caddy",
+            "inspect_apps",
+          ],
+          ingressModel:
+            "Apps run on private container port 8080 inside app_net. Public access uses Caddy TLS on ports 80/443 via route_caddy (including <slug>.<ip-with-dashes>.sslip.io when publicIp is known and no custom domain exists). Direct host port publishing (-p 8080:8080) and host UFW/SSH commands are NOT supported.",
+        },
+        pendingThreadPlans: pendingThreadPlans.slice(-3).map((p) => ({
+          id: p.id,
+          status: p.status,
+          goal: p.goal,
+          summary: p.summary,
+          executable: !p.steps.some((s) => s.toolName === "manual_review"),
+        })),
+        proposedPlan: createdPlan
           ? {
-              proposedPlan: {
-                id: createdPlan.id,
-                status: createdPlan.status,
-                requiresUserApproval: createdPlan.requiresUserApproval,
-                summary: createdPlan.summary,
-                ...(yoloExecutionSummary
-                  ? { autoExecutedSummary: yoloExecutionSummary }
-                  : {}),
-                ...(yoloExecutionError
-                  ? { autoExecutionError: yoloExecutionError }
-                  : {}),
-                steps: createdPlan.steps.map((s) => ({
-                  title: s.title,
-                  toolName: s.toolName,
-                  riskLevel: s.riskLevel,
-                })),
-              },
+              id: createdPlan.id,
+              status: createdPlan.status,
+              requiresUserApproval: createdPlan.requiresUserApproval,
+              summary: createdPlan.summary,
+              ...(yoloExecutionSummary
+                ? { autoExecutedSummary: yoloExecutionSummary }
+                : {}),
+              ...(yoloExecutionError
+                ? { autoExecutionError: yoloExecutionError }
+                : {}),
+              steps: createdPlan.steps.map((s) => ({
+                title: s.title,
+                toolName: s.toolName,
+                riskLevel: s.riskLevel,
+              })),
             }
-          : {}),
+          : null,
       },
       null,
       2,
@@ -1359,6 +1481,56 @@ export async function runAgentChatTurn(
     });
     assistantText = streamed.assistantText;
     providerNote = streamed.providerNote;
+
+    // Parse optional LLM-emitted ```vps-plan``` block when no pre-turn plan was attached
+    const extracted = parseAndStripVpsPlanBlock(assistantText, sanitizedGoal);
+    assistantText = extracted.cleanText;
+
+    if (!createdPlan && extracted.plan && input.mode !== "ask") {
+      const llmPlan = extracted.plan;
+      const storedPlan = await runTool(
+        "propose_plan",
+        "Build risk-classified execution plan",
+        { goal: llmPlan.goal, mode: input.mode, source: "llm" },
+        () => {
+          const saved = deps.registry.savePlan(llmPlan);
+          deps.registry.recordAudit({
+            id: crypto.randomUUID(),
+            actor: "agent",
+            action: "chat.plan_requested",
+            targetSlug: null,
+            summary: redactSecrets(`LLM planned goal: ${llmPlan.goal.slice(0, 120)}`),
+            riskLevel: saved.requiresUserApproval ? "medium" : "low",
+            createdAt: new Date().toISOString(),
+          });
+          return saved;
+        },
+        "awaiting_approval",
+      );
+      if (storedPlan) {
+        createdPlan = storedPlan;
+        if (!createdPlan.requiresUserApproval) {
+          const lastTool = toolCalls.at(-1);
+          if (lastTool) {
+            lastTool.status = "success";
+            emit({ type: "tool_done", toolCall: { ...lastTool } });
+          }
+        }
+        createdPlan = await autoExecuteYoloPlan(createdPlan);
+        emit({ type: "plan_created", plan: createdPlan });
+        if (createdPlan.status === "executed" && yoloExecutionSummary) {
+          const stepDetails = formatPlanExecutionMarkdown(
+            createdPlan,
+            yoloExecutionSummary,
+            deps.registry,
+          );
+          const addition = `\n\n${stepDetails}`;
+          assistantText += addition;
+          postStreamYoloAppended = true;
+          emit({ type: "text_delta", delta: addition });
+        }
+      }
+    }
   } else {
     providerNote =
       "Running with the built-in VPS OS CTO planner. Connect **OpenCode** or another AI provider in Setup Wizard for full multi-turn LLM reasoning.";
@@ -1379,6 +1551,7 @@ export async function runAgentChatTurn(
     });
     emit({ type: "text_delta", delta: assistantText });
   } else if (
+    !postStreamYoloAppended &&
     createdPlan?.status === "executed" &&
     yoloExecutionSummary &&
     !assistantText.includes("Workloads")

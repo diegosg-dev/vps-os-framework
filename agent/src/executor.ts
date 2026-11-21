@@ -54,6 +54,17 @@ const LifecycleArgsSchema = z.object({
   action: z.enum(["start", "stop", "restart"]),
 });
 
+const RemoveArgsSchema = z.object({
+  slug: z.string().min(2).max(48),
+  removeFiles: z.boolean().optional(),
+});
+
+const RouteCaddyArgsSchema = z.object({
+  slug: z.string().min(2).max(48),
+  domain: z.string().nullable(),
+  internalPort: z.number().int().min(1).max(65535).optional(),
+});
+
 const activeSlugDeploys = new Set<string>();
 
 /**
@@ -210,6 +221,180 @@ export async function deployWorkloadWithBridge(
   }
 }
 
+async function executeLifecycleStep(
+  rawArgs: Record<string, unknown> | undefined,
+  planId: string,
+  deps: ExecuteApprovedPlanDeps,
+): Promise<string> {
+  const parsed = LifecycleArgsSchema.safeParse(rawArgs ?? {});
+  if (!parsed.success) {
+    throw new PlanExecutionError(
+      400,
+      "Lifecycle step is missing valid slug or action arguments.",
+    );
+  }
+  const safeSlug = validateAppSlug(parsed.data.slug);
+  const existing = deps.registry.getAppBySlug(safeSlug);
+  if (!existing) {
+    throw new PlanExecutionError(404, `App "${safeSlug}" is not registered.`);
+  }
+  if (!deps.runtimeBridge) {
+    throw new PlanExecutionError(
+      503,
+      "Host runtime bridge is not configured; cannot control workload container.",
+    );
+  }
+
+  try {
+    const outcome = await deps.runtimeBridge.lifecycle(
+      safeSlug,
+      parsed.data.action,
+    );
+    const now = new Date().toISOString();
+    deps.registry.setAppCleanupPending(safeSlug, false);
+    deps.registry.updateAppStatus(safeSlug, outcome.status, now);
+    deps.registry.recordAudit({
+      id: crypto.randomUUID(),
+      actor: "agent",
+      action: `app.${parsed.data.action}`,
+      targetSlug: safeSlug,
+      summary: `Executed plan ${planId}: ${parsed.data.action} ${safeSlug} -> ${outcome.status}`,
+      riskLevel: parsed.data.action === "stop" ? "medium" : "low",
+      createdAt: now,
+    });
+    return `Executed ${parsed.data.action} on "${safeSlug}"; container status is now ${outcome.status}.`;
+  } catch (err) {
+    if (err instanceof RuntimeBridgeError) {
+      throw new PlanExecutionError(err.statusCode, err.message);
+    }
+    throw new PlanExecutionError(
+      502,
+      err instanceof Error ? err.message : "Workload lifecycle failed.",
+    );
+  }
+}
+
+async function executeRemoveStep(
+  rawArgs: Record<string, unknown> | undefined,
+  planId: string,
+  deps: ExecuteApprovedPlanDeps,
+): Promise<string> {
+  const parsed = RemoveArgsSchema.safeParse(rawArgs ?? {});
+  if (!parsed.success) {
+    throw new PlanExecutionError(
+      400,
+      "Removal step is missing a valid app slug.",
+    );
+  }
+  const safeSlug = validateAppSlug(parsed.data.slug);
+  const removeFiles = parsed.data.removeFiles ?? true;
+  if (!deps.runtimeBridge) {
+    throw new PlanExecutionError(
+      503,
+      "Host runtime bridge is not configured; cannot remove workload container.",
+    );
+  }
+
+  try {
+    await deps.runtimeBridge.removeWorkload(safeSlug, { removeFiles });
+    const removedRow = deps.registry.deleteApp(safeSlug);
+    const now = new Date().toISOString();
+    deps.registry.recordAudit({
+      id: crypto.randomUUID(),
+      actor: "agent",
+      action: "app.removed",
+      targetSlug: safeSlug,
+      summary: `Executed plan ${planId}: removed "${safeSlug}" (removeFiles=${removeFiles})`,
+      riskLevel: "high",
+      createdAt: now,
+    });
+    return `Removed "${safeSlug}" (container stopped, Caddy route cleared${
+      removeFiles ? `, /apps/${safeSlug} deleted` : ""
+    }${removedRow ? ", registry entry deleted" : ""}).`;
+  } catch (err) {
+    if (err instanceof RuntimeBridgeError) {
+      throw new PlanExecutionError(err.statusCode, err.message);
+    }
+    throw new PlanExecutionError(
+      502,
+      err instanceof Error ? err.message : `Failed removing "${safeSlug}".`,
+    );
+  }
+}
+
+async function executeRouteCaddyStep(
+  rawArgs: Record<string, unknown> | undefined,
+  planId: string,
+  deps: ExecuteApprovedPlanDeps,
+): Promise<string> {
+  const parsed = RouteCaddyArgsSchema.safeParse(rawArgs ?? {});
+  if (!parsed.success) {
+    throw new PlanExecutionError(
+      400,
+      "Routing step is missing valid slug or domain arguments.",
+    );
+  }
+  const safeSlug = validateAppSlug(parsed.data.slug);
+  const existing = deps.registry.getAppBySlug(safeSlug);
+  if (!existing) {
+    throw new PlanExecutionError(404, `App "${safeSlug}" is not registered.`);
+  }
+  const safeDomain = parsed.data.domain
+    ? validateDomain(parsed.data.domain)
+    : null;
+  if (safeDomain) {
+    const conflict = deps.registry
+      .listApps()
+      .find(
+        (app) =>
+          app.slug !== safeSlug && app.domain?.toLowerCase() === safeDomain,
+      );
+    if (conflict) {
+      throw new PlanExecutionError(
+        409,
+        `Domain "${safeDomain}" is already assigned to app "${conflict.slug}".`,
+      );
+    }
+  }
+  if (!deps.runtimeBridge) {
+    throw new PlanExecutionError(
+      503,
+      "Host runtime bridge is not configured; cannot update Caddy route.",
+    );
+  }
+
+  try {
+    const internalPort = parsed.data.internalPort ?? existing.internalPort;
+    await deps.runtimeBridge.routeCaddy({
+      slug: safeSlug,
+      domain: safeDomain,
+      internalPort,
+    });
+    const now = new Date().toISOString();
+    deps.registry.updateAppDomain(safeSlug, safeDomain, now);
+    deps.registry.recordAudit({
+      id: crypto.randomUUID(),
+      actor: "agent",
+      action: "app.routed",
+      targetSlug: safeSlug,
+      summary: `Executed plan ${planId}: routed "${safeSlug}" -> ${safeDomain ?? "internal-only"}`,
+      riskLevel: "medium",
+      createdAt: now,
+    });
+    return safeDomain
+      ? `Routed "${safeSlug}" at https://${safeDomain} (port ${internalPort}).`
+      : `Cleared public domain route for "${safeSlug}"; workload is now internal-only.`;
+  } catch (err) {
+    if (err instanceof RuntimeBridgeError) {
+      throw new PlanExecutionError(err.statusCode, err.message);
+    }
+    throw new PlanExecutionError(
+      502,
+      err instanceof Error ? err.message : `Failed routing "${safeSlug}".`,
+    );
+  }
+}
+
 /**
  * Executes an approved ExecutionPlan server-side using the isolated subagent
  * workspace provisioner and host runtime bridge. Never marks the plan as
@@ -233,85 +418,47 @@ export async function executeApprovedPlan(
     );
   }
 
-  const lifecycleStep = plan.steps.find(
-    (step) => step.toolName === "control_app_lifecycle",
-  );
-  if (lifecycleStep) {
-    const parsed = LifecycleArgsSchema.safeParse(lifecycleStep.args ?? {});
-    if (!parsed.success) {
-      throw new PlanExecutionError(
-        400,
-        "Lifecycle step is missing valid slug or action arguments.",
-      );
-    }
-    const safeSlug = validateAppSlug(parsed.data.slug);
-    const existing = deps.registry.getAppBySlug(safeSlug);
-    if (!existing) {
-      throw new PlanExecutionError(404, `App "${safeSlug}" is not registered.`);
-    }
-    if (!deps.runtimeBridge) {
-      throw new PlanExecutionError(
-        503,
-        "Host runtime bridge is not configured; cannot control workload container.",
-      );
-    }
+  const actionSummaries: string[] = [];
 
-    try {
-      const outcome = await deps.runtimeBridge.lifecycle(
-        safeSlug,
-        parsed.data.action,
+  for (const step of plan.steps) {
+    if (step.toolName === "control_app_lifecycle") {
+      actionSummaries.push(
+        await executeLifecycleStep(step.args, plan.id, deps),
       );
-      const now = new Date().toISOString();
-      deps.registry.setAppCleanupPending(safeSlug, false);
-      deps.registry.updateAppStatus(safeSlug, outcome.status, now);
-      deps.registry.recordAudit({
-        id: crypto.randomUUID(),
-        actor: "agent",
-        action: `app.${parsed.data.action}`,
-        targetSlug: safeSlug,
-        summary: `Executed plan ${plan.id}: ${parsed.data.action} ${safeSlug} -> ${outcome.status}`,
-        riskLevel: parsed.data.action === "stop" ? "medium" : "low",
-        createdAt: now,
-      });
-      return {
-        summary: `Executed ${parsed.data.action} on "${safeSlug}"; container status is now ${outcome.status}.`,
-      };
-    } catch (err) {
-      if (err instanceof RuntimeBridgeError) {
-        throw new PlanExecutionError(err.statusCode, err.message);
+    } else if (step.toolName === "remove_workload") {
+      actionSummaries.push(
+        await executeRemoveStep(step.args, plan.id, deps),
+      );
+    } else if (step.toolName === "route_caddy") {
+      actionSummaries.push(
+        await executeRouteCaddyStep(step.args, plan.id, deps),
+      );
+    } else if (step.toolName === "prepare_app_workspace") {
+      const rawArgs =
+        step.args ?? extractDeploySpecFromGoal(plan.goal) ?? null;
+      const parsed = DeployArgsSchema.safeParse(rawArgs);
+      if (!parsed.success) {
+        throw new PlanExecutionError(
+          422,
+          "Could not determine target app slug and workload kind from this plan. Specify a workload name (e.g., 'Deploy billing web app at billing.example.com').",
+        );
       }
-      throw new PlanExecutionError(
-        502,
-        err instanceof Error ? err.message : "Workload lifecycle failed.",
+      const deployed = await deployWorkloadWithBridge(
+        {
+          slug: parsed.data.slug,
+          name: parsed.data.name,
+          kind: parsed.data.kind,
+          domain: parsed.data.domain,
+          internalPort: parsed.data.internalPort,
+        },
+        deps,
       );
+      actionSummaries.push(deployed.summary);
     }
   }
 
-  const provisionStep = plan.steps.find(
-    (step) => step.toolName === "prepare_app_workspace",
-  );
-  if (provisionStep) {
-    const rawArgs =
-      provisionStep.args ?? extractDeploySpecFromGoal(plan.goal) ?? null;
-    const parsed = DeployArgsSchema.safeParse(rawArgs);
-    if (!parsed.success) {
-      throw new PlanExecutionError(
-        422,
-        "Could not determine target app slug and workload kind from this plan. Specify a workload name (e.g., 'Deploy billing web app at billing.example.com').",
-      );
-    }
-
-    const deployed = await deployWorkloadWithBridge(
-      {
-        slug: parsed.data.slug,
-        name: parsed.data.name,
-        kind: parsed.data.kind,
-        domain: parsed.data.domain,
-        internalPort: parsed.data.internalPort,
-      },
-      deps,
-    );
-    return { summary: deployed.summary };
+  if (actionSummaries.length > 0) {
+    return { summary: actionSummaries.join(" ") };
   }
 
   // Read-only inspection plan (`inspect_apps`)

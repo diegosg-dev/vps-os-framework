@@ -59,9 +59,17 @@ function parseClarifyingQuestions(content: string): {
   cleanContent: string;
   questions: ClarifyingQuestion[];
 } {
-  const match = content.match(/```vps-questions\s*\n([\s\S]*?)\n```\s*$/);
+  // Strip any completed or in-progress ```vps-plan block so raw plan JSON never flashes in chat.
+  let sanitized = content
+    .replace(/```vps-plan\s*\n[\s\S]*?\n```\s*/g, "")
+    .replace(/```vps-plan[\s\S]*$/g, "")
+    .trimEnd();
+
+  const match = sanitized.match(/```vps-questions\s*\n([\s\S]*?)\n```\s*$/);
   if (!match?.[1]) {
-    return { cleanContent: content, questions: [] };
+    // Also hide incomplete trailing ```vps-questions while still streaming.
+    sanitized = sanitized.replace(/```vps-questions[\s\S]*$/g, "").trimEnd();
+    return { cleanContent: sanitized, questions: [] };
   }
   try {
     const parsed = JSON.parse(match[1]) as {
@@ -82,14 +90,14 @@ function parseClarifyingQuestions(content: string): {
       }
     }
     if (questions.length === 0) {
-      return { cleanContent: content, questions: [] };
+      return { cleanContent: sanitized, questions: [] };
     }
     return {
-      cleanContent: content.slice(0, match.index).trimEnd(),
+      cleanContent: sanitized.slice(0, match.index).trimEnd(),
       questions,
     };
   } catch {
-    return { cleanContent: content, questions: [] };
+    return { cleanContent: sanitized, questions: [] };
   }
 }
 
