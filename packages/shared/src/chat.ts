@@ -1,7 +1,10 @@
 import { z } from "zod";
 
-export const ChatModeSchema = z.enum(["agent", "plan"]);
+export const ChatModeSchema = z.enum(["agent", "plan", "ask"]);
 export type ChatMode = z.infer<typeof ChatModeSchema>;
+
+export const ReasoningEffortSchema = z.enum(["low", "medium", "high", "max"]);
+export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 
 export const ChatAttachmentKindSchema = z.enum(["image", "text", "file"]);
 export type ChatAttachmentKind = z.infer<typeof ChatAttachmentKindSchema>;
@@ -81,6 +84,9 @@ export const ChatThreadSchema = z.object({
   title: z.string().min(1).max(160),
   provider: z.string().nullable().default(null),
   model: z.string().nullable().default(null),
+  pinned: z.boolean().default(false),
+  archived: z.boolean().default(false),
+  parentThreadId: z.string().nullable().default(null),
   messageCount: z.number().int().nonnegative().default(0),
   createdAt: z.string(),
   updatedAt: z.string(),

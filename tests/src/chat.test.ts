@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { createDashboardApp } from "@vps-os/dashboard-api";
 import { SystemRegistryStore } from "@vps-os/shared";
@@ -252,6 +253,458 @@ test("Agentic Chat SSE streaming parses live OpenCode Zen reasoning_content and 
     );
   } finally {
     registry.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("T3-Code Chat upgrades: pin/archive ordering, fork checkpoints, ask mode, @mentions, edit/truncate, export, and clear", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-chat-t3-"));
+  const registry = new SystemRegistryStore(path.join(tempDir, "data", "registry.db"));
+
+  // Register a sample workload so @mention grounding triggers live log inspection
+  registry.upsertApp({
+    slug: "acme-crm",
+    name: "Acme CRM",
+    kind: "web-app",
+    status: "running",
+    folderPath: "/opt/vps-os/apps/acme-crm",
+    domain: "crm.example.com",
+    internalPort: 3000,
+    memoryLimitMb: 512,
+    cpuLimit: "1.0",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  const app = createDashboardApp({
+    registry,
+    adminToken: "t3-chat-test-token-1234",
+    disableExternalLlm: true,
+    rateLimitMax: 100,
+    workloadController: {
+      control: () => ({ status: "running" }),
+      getLogs: (slug) => [`2026-11-21T00:00:00Z INFO [${slug}] listening on :3000`],
+    },
+  });
+
+  const authHeaders = {
+    "content-type": "application/json",
+    authorization: "Bearer t3-chat-test-token-1234",
+  };
+
+  try {
+    // 1. Create two threads and verify pinning orders the pinned thread first
+    const t1Res = await app.request("/api/chat/threads", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "Older Thread" }),
+    });
+    const t2Res = await app.request("/api/chat/threads", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "Newer Thread" }),
+    });
+    assert.equal(t1Res.status, 201);
+    assert.equal(t2Res.status, 201);
+    const { thread: t1 } = (await t1Res.json()) as { thread: { id: string } };
+    const { thread: t2 } = (await t2Res.json()) as { thread: { id: string } };
+
+    const pinRes = await app.request(`/api/chat/threads/${t1.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ pinned: true }),
+    });
+    assert.equal(pinRes.status, 200);
+    const { thread: pinnedT1 } = (await pinRes.json()) as {
+      thread: { id: string; pinned: boolean; archived: boolean };
+    };
+    assert.equal(pinnedT1.pinned, true);
+    assert.equal(pinnedT1.archived, false);
+
+    const archiveRes = await app.request(`/api/chat/threads/${t2.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ archived: true }),
+    });
+    assert.equal(archiveRes.status, 200);
+
+    const listRes = await app.request("/api/chat/threads", {
+      headers: { authorization: authHeaders.authorization },
+    });
+    const { threads } = (await listRes.json()) as {
+      threads: Array<{ id: string; pinned: boolean; archived: boolean }>;
+    };
+    assert.equal(threads[0]?.id, t1.id);
+    assert.equal(threads.find((t) => t.id === t2.id)?.archived, true);
+
+    // 2. Turn 1 in ASK mode with @acme-crm and @audit-trail mentions:
+    //    should run read_app_logs + list_audit_events and MUST NOT create a mutating plan.
+    const askRes = await app.request(`/api/chat/threads/${t1.id}/messages`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        content: "Deploy billing web app at billing.example.com — explain only, do not mutate",
+        mode: "ask",
+        effort: "high",
+        mentionedSlugs: ["acme-crm", "audit-trail"],
+        stream: false,
+      }),
+    });
+    assert.equal(askRes.status, 200);
+    const askTurn = (await askRes.json()) as {
+      userMessage: { id: string };
+      assistantMessage: {
+        id: string;
+        toolCalls: Array<{ toolName: string; input: Record<string, unknown> }>;
+        planId: string | null;
+      };
+      plan: unknown;
+    };
+    const askTools = askTurn.assistantMessage.toolCalls.map((tc) => tc.toolName);
+    assert.ok(askTools.includes("read_app_logs"));
+    assert.ok(askTools.includes("list_audit_events"));
+    assert.equal(askTools.includes("propose_plan"), false);
+    assert.equal(askTurn.plan, null);
+    assert.equal(askTurn.assistantMessage.planId, null);
+
+    // 3. Turn 2 normal message so thread has 4 messages total
+    const turn2Res = await app.request(`/api/chat/threads/${t1.id}/messages`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        content: "Summarize memory usage (ignore token sk-leakedsecret987654321)",
+        mode: "agent",
+        effort: "low",
+        stream: false,
+      }),
+    });
+    assert.equal(turn2Res.status, 200);
+    const turn2 = (await turn2Res.json()) as {
+      userMessage: { id: string };
+      assistantMessage: { id: string };
+    };
+
+    // 3b. Unpin & unarchive via PATCH and verify updated flags + natural ordering.
+    // With no pinned threads, ordering falls back to updated_at DESC; t1 was just
+    // messaged (turns 1 & 2) so it must now sort ahead of the untouched t2.
+    const unpinRes = await app.request(`/api/chat/threads/${t1.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ pinned: false }),
+    });
+    assert.equal(unpinRes.status, 200);
+    const { thread: unpinnedT1 } = (await unpinRes.json()) as {
+      thread: { pinned: boolean; archived: boolean };
+    };
+    assert.equal(unpinnedT1.pinned, false);
+    assert.equal(unpinnedT1.archived, false);
+
+    const unarchiveRes = await app.request(`/api/chat/threads/${t2.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ archived: false }),
+    });
+    assert.equal(unarchiveRes.status, 200);
+    const { thread: unarchivedT2 } = (await unarchiveRes.json()) as {
+      thread: { pinned: boolean; archived: boolean };
+    };
+    assert.equal(unarchivedT2.pinned, false);
+    assert.equal(unarchivedT2.archived, false);
+
+    const listRes2 = await app.request("/api/chat/threads", {
+      headers: { authorization: authHeaders.authorization },
+    });
+    const { threads: threads2 } = (await listRes2.json()) as {
+      threads: Array<{ id: string; pinned: boolean; archived: boolean }>;
+    };
+    assert.equal(threads2[0]?.id, t1.id);
+    assert.equal(threads2.find((t) => t.id === t1.id)?.pinned, false);
+    assert.equal(threads2.find((t) => t.id === t2.id)?.archived, false);
+
+    // 4. Fork from Turn 1 assistant checkpoint -> forked thread has exactly 2 messages + parentThreadId
+    const partialForkRes = await app.request(`/api/chat/threads/${t1.id}/fork`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ upToMessageId: askTurn.assistantMessage.id }),
+    });
+    assert.equal(partialForkRes.status, 201);
+    const partialFork = (await partialForkRes.json()) as {
+      thread: { id: string; parentThreadId: string | null; messageCount: number };
+      messages: Array<{ id: string }>;
+    };
+    assert.equal(partialFork.thread.parentThreadId, t1.id);
+    assert.equal(partialFork.messages.length, 2);
+    assert.equal(partialFork.thread.messageCount, 2);
+
+    // 4b. Fork from a non-existent checkpoint message id is rejected with 404
+    const badForkRes = await app.request(`/api/chat/threads/${t1.id}/fork`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ upToMessageId: "non-existent-id" }),
+    });
+    assert.equal(badForkRes.status, 404);
+    const badForkThreads = (await (
+      await app.request("/api/chat/threads", {
+        headers: { authorization: authHeaders.authorization },
+      })
+    ).json()) as { threads: Array<{ id: string }> };
+    assert.equal(
+      badForkThreads.threads.filter((t) => t.id === t1.id).length,
+      1,
+      "failed fork must not leave a partial duplicate thread",
+    );
+
+    // 5. Export Markdown transcript -> verifies live auto-titled Markdown headers, disposition, and secret redaction
+    // (chat-routes auto-titles a thread on its first message, so fetch the live title instead of "Older Thread")
+    const t1StateRes = await app.request(`/api/chat/threads/${t1.id}`, {
+      headers: { authorization: authHeaders.authorization },
+    });
+    assert.equal(t1StateRes.status, 200);
+    const t1State = (await t1StateRes.json()) as {
+      thread: { id: string; title: string };
+    };
+    assert.ok(t1State.thread.title.startsWith("Deploy billing web app"));
+
+    const exportRes = await app.request(`/api/chat/threads/${t1.id}/export`, {
+      headers: { authorization: authHeaders.authorization },
+    });
+    assert.equal(exportRes.status, 200);
+    assert.match(exportRes.headers.get("content-type") ?? "", /text\/markdown/);
+    assert.match(
+      exportRes.headers.get("content-disposition") ?? "",
+      /^attachment; filename="[a-z0-9-]+\.md"$/,
+    );
+    const markdown = await exportRes.text();
+    assert.ok(markdown.includes(`# ${t1State.thread.title}`));
+    assert.equal(markdown.includes("sk-leakedsecret987654321"), false);
+
+    // 5b. Export for a non-existent thread is rejected with 404
+    const missingExportRes = await app.request(
+      "/api/chat/threads/non-existent/export",
+      { headers: { authorization: authHeaders.authorization } },
+    );
+    assert.equal(missingExportRes.status, 404);
+
+    // 6. Edit & Resend via truncateFromMessageId replaces Turn 2 cleanly (remains 4 messages total)
+    const editRes = await app.request(`/api/chat/threads/${t1.id}/messages`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        content: "Edited follow-up checking disk space",
+        mode: "agent",
+        effort: "medium",
+        truncateFromMessageId: turn2.userMessage.id,
+        stream: false,
+      }),
+    });
+    assert.equal(editRes.status, 200);
+    const afterEdit = (await (
+      await app.request(`/api/chat/threads/${t1.id}`, {
+        headers: { authorization: authHeaders.authorization },
+      })
+    ).json()) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    assert.equal(afterEdit.messages.length, 4);
+    assert.equal(afterEdit.messages[2]?.content, "Edited follow-up checking disk space");
+
+    // 7. Clear thread removes all messages while preserving thread metadata
+    const clearRes = await app.request(`/api/chat/threads/${t1.id}/clear`, {
+      method: "POST",
+      headers: { authorization: authHeaders.authorization },
+    });
+    assert.equal(clearRes.status, 200);
+    const clearJson = (await clearRes.json()) as {
+      ok: boolean;
+      cleared: number;
+      thread: { id: string; messageCount: number };
+    };
+    assert.equal(clearJson.ok, true);
+    assert.equal(clearJson.cleared, 4);
+    assert.equal(clearJson.thread.messageCount, 0);
+  } finally {
+    registry.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Agentic Chat surfaces unresolved @mentions in the reasoning trace and rejects invalid requests", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-chat-mentions-"));
+  const registry = new SystemRegistryStore(path.join(tempDir, "data", "registry.db"));
+
+  registry.upsertApp({
+    slug: "billing-api",
+    name: "Billing API",
+    kind: "web-app",
+    status: "running",
+    folderPath: "/opt/vps-os/apps/billing-api",
+    domain: "billing.example.com",
+    internalPort: 3000,
+    memoryLimitMb: 512,
+    cpuLimit: "1.0",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  let logReads = 0;
+  const app = createDashboardApp({
+    registry,
+    adminToken: "mention-test-token-1234",
+    disableExternalLlm: true,
+    rateLimitMax: 100,
+    workloadController: {
+      control: () => ({ status: "running" }),
+      getLogs: (slug) => {
+        logReads += 1;
+        return [`2026-11-21T00:00:00Z INFO [${slug}] heartbeat ok`];
+      },
+    },
+  });
+
+  const authHeaders = {
+    "content-type": "application/json",
+    authorization: "Bearer mention-test-token-1234",
+  };
+
+  try {
+    const threadRes = await app.request("/api/chat/threads", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "Mention Probe" }),
+    });
+    assert.equal(threadRes.status, 201);
+    const { thread } = (await threadRes.json()) as { thread: { id: string } };
+
+    // Unknown @mention in ask mode: no read_app_logs run, reasoning flags the typo
+    const mentionRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        content: "Explain current disk and memory headroom briefly",
+        mode: "ask",
+        mentionedSlugs: ["no-such-app"],
+        stream: false,
+      }),
+    });
+    assert.equal(mentionRes.status, 200);
+    const mentionTurn = (await mentionRes.json()) as {
+      assistantMessage: {
+        reasoning: Array<{ title: string; content: string; status: string }>;
+        toolCalls: Array<{ toolName: string }>;
+        planId: string | null;
+      };
+      plan: unknown;
+    };
+    const mentionTools = mentionTurn.assistantMessage.toolCalls.map(
+      (t) => t.toolName,
+    );
+    assert.equal(mentionTools.includes("read_app_logs"), false);
+    assert.equal(mentionTools.includes("propose_plan"), false);
+    assert.equal(mentionTurn.assistantMessage.planId, null);
+    assert.equal(mentionTurn.plan, null);
+    assert.equal(logReads, 0);
+    assert.ok(
+      mentionTurn.assistantMessage.reasoning.some((r) =>
+        r.content.includes("Unrecognized @mentions ignored: @no-such-app"),
+      ),
+    );
+    assert.ok(
+      mentionTurn.assistantMessage.reasoning.some((r) =>
+        r.content.includes("@no-such-app"),
+      ),
+    );
+
+    // Validation: more than 10 mentionedSlugs is rejected with 400
+    const tooManyRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        content: "Audit everything about this host",
+        mode: "ask",
+        mentionedSlugs: Array.from({ length: 11 }, (_, i) => `app-${i}`),
+        stream: false,
+      }),
+    });
+    assert.equal(tooManyRes.status, 400);
+
+    // Validation: unknown mode string is rejected with 400
+    const invalidModeRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        content: "Check system health",
+        mode: "invalid",
+        stream: false,
+      }),
+    });
+    assert.equal(invalidModeRes.status, 400);
+
+    // Rejected requests must not persist any messages
+    const afterReject = (await (
+      await app.request(`/api/chat/threads/${thread.id}`, {
+        headers: { authorization: authHeaders.authorization },
+      })
+    ).json()) as { messages: Array<{ id: string }> };
+    assert.equal(afterReject.messages.length, 2);
+    assert.equal(logReads, 0);
+  } finally {
+    registry.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("SystemRegistryStore migrates a legacy chat_threads schema idempotently", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vps-os-chat-legacy-"));
+  const dbPath = path.join(tempDir, "legacy-registry.db");
+
+  // Simulate a pre-upgrade database whose chat_threads table lacks
+  // pinned / archived / parent_thread_id columns.
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`
+    CREATE TABLE chat_threads (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      provider TEXT,
+      model TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  legacy
+    .prepare(
+      "INSERT INTO chat_threads (id, title, provider, model, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run(
+      "legacy-thread-1",
+      "Legacy Thread",
+      null,
+      null,
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00.000Z",
+    );
+  legacy.close();
+
+  const store = new SystemRegistryStore(dbPath);
+  // Second connection re-runs migrate() on the already-upgraded schema
+  // to prove the migration is idempotent and data-preserving.
+  const reopened = new SystemRegistryStore(dbPath);
+  try {
+    const thread = store.getChatThread("legacy-thread-1");
+    assert.ok(thread);
+    assert.equal(thread.title, "Legacy Thread");
+    assert.equal(thread.pinned, false);
+    assert.equal(thread.archived, false);
+    assert.equal(thread.parentThreadId, null);
+
+    const reloaded = reopened.getChatThread("legacy-thread-1");
+    assert.ok(reloaded);
+    assert.equal(reloaded.title, "Legacy Thread");
+    assert.equal(reloaded.pinned, false);
+    assert.equal(reloaded.archived, false);
+    assert.equal(reloaded.parentThreadId, null);
+  } finally {
+    reopened.close();
+    store.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });

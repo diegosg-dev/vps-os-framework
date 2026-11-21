@@ -9,6 +9,70 @@ export interface DiskMetrics {
   usagePercent: number;
 }
 
+export interface TelemetrySample {
+  collectedAt: string;
+  loadAverage1m: number;
+  cpuCount: number;
+  cpuLoadPercent: number;
+  memoryUsagePercent: number;
+  memoryUsedMb: number;
+  diskUsagePercent: number | null;
+}
+
+/**
+ * Bounded in-memory ring buffer storing recent sanitized telemetry samples
+ * so the dashboard can render live trend sparklines across page reloads.
+ */
+export class TelemetryHistoryBuffer {
+  private readonly samples: TelemetrySample[] = [];
+  private readonly maxSamples: number;
+
+  constructor(maxSamples = 60, initialSamples: TelemetrySample[] = []) {
+    this.maxSamples = Math.max(1, maxSamples);
+    for (const sample of initialSamples.slice(-this.maxSamples)) {
+      this.samples.push(sample);
+    }
+  }
+
+  record(metrics: SystemMetrics, disk: DiskMetrics | null): TelemetrySample {
+    const cpuLoadPercent = Math.min(
+      100,
+      Math.max(
+        0,
+        Math.round((metrics.loadAverage1m / Math.max(1, metrics.cpuCount)) * 1000) /
+          10,
+      ),
+    );
+    const sample: TelemetrySample = {
+      collectedAt: metrics.collectedAt,
+      loadAverage1m: metrics.loadAverage1m,
+      cpuCount: metrics.cpuCount,
+      cpuLoadPercent,
+      memoryUsagePercent: metrics.memoryUsagePercent,
+      memoryUsedMb: metrics.memoryUsedMb,
+      diskUsagePercent: disk ? disk.usagePercent : null,
+    };
+
+    const last = this.samples.at(-1);
+    if (last && last.collectedAt === sample.collectedAt) {
+      this.samples[this.samples.length - 1] = sample;
+    } else {
+      this.samples.push(sample);
+      if (this.samples.length > this.maxSamples) {
+        this.samples.splice(0, this.samples.length - this.maxSamples);
+      }
+    }
+    return sample;
+  }
+
+  list(limit?: number): TelemetrySample[] {
+    if (limit === undefined || limit >= this.samples.length) {
+      return [...this.samples];
+    }
+    return this.samples.slice(-Math.max(1, limit));
+  }
+}
+
 function readLinuxAvailableMemoryBytes(totalBytes: number): number | null {
   if (process.platform !== "linux") {
     return null;

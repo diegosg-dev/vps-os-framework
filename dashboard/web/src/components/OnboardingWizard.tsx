@@ -6,6 +6,7 @@ import type {
   OnboardingPayload,
   OnboardingStepId,
 } from "../types";
+import { CheckCircleIcon, CopyIcon, VpsOsLogo } from "./Icons";
 
 interface OnboardingWizardProps {
   payload: OnboardingPayload;
@@ -32,12 +33,12 @@ const STARTER_PROMPTS = [
 
 function statusBadgeClass(status: "ok" | "warn" | "pending"): string {
   if (status === "ok") {
-    return "bg-emerald-500/15 text-emerald-300 border-emerald-500/30";
+    return "bg-[var(--success-soft)] text-[var(--success)] border-[var(--success-border)]";
   }
   if (status === "warn") {
-    return "bg-amber-500/15 text-amber-300 border-amber-500/30";
+    return "bg-[var(--warning-soft)] text-[var(--warning)] border-[var(--warning-border)]";
   }
-  return "bg-slate-800 text-slate-300 border-slate-700";
+  return "bg-[var(--bg-inset)] text-[var(--text-secondary)] border-[var(--border-default)]";
 }
 
 async function extractError(res: Response): Promise<string> {
@@ -213,7 +214,7 @@ export function OnboardingWizard({
         setStep("provider");
       } else {
         setNotice(
-          "Domain saved. Point your DNS A record to your VPS IP, then click Re-check DNS or continue for now.",
+          "Domain saved. Point your DNS A record to your VPS IP, then click Check DNS Now or continue for now.",
         );
       }
     } catch (err) {
@@ -411,33 +412,39 @@ export function OnboardingWizard({
     }
   }
 
+  const currentStepIdx = STEPS.findIndex((s) => s.id === step);
+
   return (
-    <div className="mx-auto max-w-4xl px-6 py-8">
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-6 shadow-xl">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-5">
-          <div>
-            <span className="text-xs font-medium uppercase tracking-wider text-sky-400">
-              First-Boot Setup Wizard
-            </span>
-            <h2 className="mt-1 text-xl font-semibold text-slate-100">
-              Configure Your Autonomous VPS OS
-            </h2>
+    <div className="mx-auto max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
+      <div className="vps-elevated rounded-2xl p-5 sm:p-7">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border-subtle)] pb-5">
+          <div className="flex items-center gap-3">
+            <VpsOsLogo className="h-9 w-9 shrink-0" />
+            <div>
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--accent)]">
+                VPS OS Setup Wizard
+              </span>
+              <h2 className="text-lg font-semibold tracking-tight text-[var(--text-primary)] sm:text-xl">
+                Configure Your Autonomous Personal Cloud
+              </h2>
+            </div>
           </div>
           {onCancel && (
             <button
               type="button"
               onClick={onCancel}
-              className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700"
+              className="vps-btn-secondary rounded-xl px-3.5 py-1.5 text-xs font-medium"
             >
-              Back to Dashboard
+              Back to Workspace
             </button>
           )}
         </div>
 
         {/* Stepper */}
         <nav aria-label="Onboarding steps" className="mt-5 grid gap-2 sm:grid-cols-5">
-          {STEPS.map((item) => {
+          {STEPS.map((item, idx) => {
             const active = item.id === step;
+            const completed = idx < currentStepIdx || state.completed;
             return (
               <button
                 key={item.id}
@@ -449,18 +456,24 @@ export function OnboardingWizard({
                 }}
                 className={`flex items-center gap-2 rounded-xl border px-3 py-2 text-left text-xs transition ${
                   active
-                    ? "border-sky-500/70 bg-sky-500/15 text-sky-200"
-                    : "border-slate-800 bg-slate-950/60 text-slate-400 hover:border-slate-700 hover:text-slate-200"
+                    ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--text-primary)]"
+                    : "border-[var(--border-subtle)] bg-[var(--bg-inset)] text-[var(--text-secondary)] hover:border-[var(--border-strong)]"
                 }`}
               >
                 <span
-                  className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold ${
+                  className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10.5px] font-semibold ${
                     active
-                      ? "bg-sky-500 text-slate-950"
-                      : "bg-slate-800 text-slate-300"
+                      ? "bg-[var(--accent)] text-[var(--text-inverse)]"
+                      : completed
+                        ? "bg-[var(--success-soft)] text-[var(--success)]"
+                        : "bg-[var(--bg-active)] text-[var(--text-secondary)]"
                   }`}
                 >
-                  {item.number}
+                  {completed && !active ? (
+                    <CheckCircleIcon className="h-3.5 w-3.5" />
+                  ) : (
+                    item.number
+                  )}
                 </span>
                 <span className="truncate font-medium">{item.label}</span>
               </button>
@@ -471,13 +484,13 @@ export function OnboardingWizard({
         {error && (
           <div
             role="alert"
-            className="mt-5 rounded-xl border border-rose-500/40 bg-rose-950/40 px-4 py-3 text-xs text-rose-200"
+            className="mt-5 rounded-xl border border-[var(--danger-border)] bg-[var(--danger-soft)] px-4 py-3 text-xs text-[var(--danger)]"
           >
             {error}
           </div>
         )}
         {notice && (
-          <div className="mt-5 rounded-xl border border-sky-500/30 bg-sky-950/30 px-4 py-3 text-xs text-sky-200">
+          <div className="mt-5 rounded-xl border border-[var(--accent-border)] bg-[var(--accent-soft)] px-4 py-3 text-xs text-[var(--text-primary)]">
             {notice}
           </div>
         )}
@@ -485,12 +498,12 @@ export function OnboardingWizard({
         {/* Step 1: Domain & HTTPS */}
         {step === "domain" && (
           <form onSubmit={(e) => void handleSaveDomain(e)} className="mt-6 space-y-5">
-            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-4">
               <div>
-                <p className="text-xs font-medium text-slate-300">
+                <p className="text-xs font-medium text-[var(--text-secondary)]">
                   Detected Server IP Address
                 </p>
-                <p className="mt-0.5 font-mono text-sm text-sky-300">
+                <p className="mt-0.5 font-mono text-sm font-medium text-[var(--accent)]">
                   {state.publicIp ?? "Auto-detection unavailable (local or private network)"}
                 </p>
               </div>
@@ -501,8 +514,9 @@ export function OnboardingWizard({
                     void navigator.clipboard?.writeText(state.publicIp ?? "");
                     setNotice(`Copied ${state.publicIp} to clipboard.`);
                   }}
-                  className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 hover:bg-slate-700"
+                  className="vps-btn-secondary inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium"
                 >
+                  <CopyIcon className="h-3.5 w-3.5" />
                   Copy IP
                 </button>
               )}
@@ -514,14 +528,14 @@ export function OnboardingWizard({
                 onClick={() => setDomainMode("domain")}
                 className={`rounded-xl border p-4 text-left transition ${
                   domainMode === "domain"
-                    ? "border-sky-500 bg-sky-500/10"
-                    : "border-slate-800 bg-slate-950/60 hover:border-slate-700"
+                    ? "border-[var(--accent)] bg-[var(--accent-soft)]"
+                    : "border-[var(--border-subtle)] bg-[var(--bg-inset)] hover:border-[var(--border-strong)]"
                 }`}
               >
-                <p className="text-sm font-medium text-slate-100">
+                <p className="text-sm font-semibold text-[var(--text-primary)]">
                   Connect a Custom Domain
                 </p>
-                <p className="mt-1 text-xs text-slate-400">
+                <p className="mt-1 text-xs text-[var(--text-secondary)]">
                   Recommended. Automatically enables Let&apos;s Encrypt HTTPS via Caddy.
                 </p>
               </button>
@@ -530,26 +544,26 @@ export function OnboardingWizard({
                 onClick={() => setDomainMode("ip-only")}
                 className={`rounded-xl border p-4 text-left transition ${
                   domainMode === "ip-only"
-                    ? "border-sky-500 bg-sky-500/10"
-                    : "border-slate-800 bg-slate-950/60 hover:border-slate-700"
+                    ? "border-[var(--accent)] bg-[var(--accent-soft)]"
+                    : "border-[var(--border-subtle)] bg-[var(--bg-inset)] hover:border-[var(--border-strong)]"
                 }`}
               >
-                <p className="text-sm font-medium text-slate-100">
+                <p className="text-sm font-semibold text-[var(--text-primary)]">
                   Use IP Setup Mode for Now
                 </p>
-                <p className="mt-1 text-xs text-slate-400">
-                  Skip domain setup for now and bind HTTPS later in Setup Wizard.
+                <p className="mt-1 text-xs text-[var(--text-secondary)]">
+                  Skip domain setup for now and bind HTTPS later in System Settings.
                 </p>
               </button>
             </div>
 
             {domainMode === "domain" && (
-              <div className="space-y-4 rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+              <div className="space-y-4 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-4">
                 <div className="grid gap-4 sm:grid-cols-2">
                   <div>
                     <label
                       htmlFor="wizard-domain"
-                      className="block text-xs font-medium text-slate-300"
+                      className="block text-xs font-medium text-[var(--text-secondary)]"
                     >
                       Dashboard Domain
                     </label>
@@ -559,13 +573,13 @@ export function OnboardingWizard({
                       value={domainInput}
                       onChange={(e) => setDomainInput(e.target.value)}
                       placeholder="os.yourdomain.com"
-                      className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
+                      className="vps-input mt-1.5 w-full rounded-xl px-3 py-2 text-sm"
                     />
                   </div>
                   <div>
                     <label
                       htmlFor="wizard-email"
-                      className="block text-xs font-medium text-slate-300"
+                      className="block text-xs font-medium text-[var(--text-secondary)]"
                     >
                       SSL Certificate Email
                     </label>
@@ -575,22 +589,22 @@ export function OnboardingWizard({
                       value={acmeEmail}
                       onChange={(e) => setAcmeEmail(e.target.value)}
                       placeholder="you@yourdomain.com"
-                      className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
+                      className="vps-input mt-1.5 w-full rounded-xl px-3 py-2 text-sm"
                     />
                   </div>
                 </div>
 
-                <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300">
-                  <p className="font-medium text-slate-200">
+                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-3 text-xs text-[var(--text-secondary)]">
+                  <p className="font-medium text-[var(--text-primary)]">
                     DNS Record Required at Your Registrar (Cloudflare, Namecheap, etc.):
                   </p>
-                  <p className="mt-1 font-mono text-[11px] text-slate-400">
-                    Type: <span className="text-sky-300">A</span> &nbsp;|&nbsp; Host:{" "}
-                    <span className="text-sky-300">
+                  <p className="mt-1 font-mono text-[11px] text-[var(--text-muted)]">
+                    Type: <span className="text-[var(--accent)]">A</span> &nbsp;|&nbsp; Host:{" "}
+                    <span className="text-[var(--accent)]">
                       {domainInput.trim() || "os.yourdomain.com"}
                     </span>{" "}
                     &nbsp;|&nbsp; Value:{" "}
-                    <span className="text-sky-300">
+                    <span className="text-[var(--accent)]">
                       {state.publicIp ?? "<YOUR_VPS_PUBLIC_IP>"}
                     </span>
                   </p>
@@ -598,10 +612,10 @@ export function OnboardingWizard({
 
                 {dnsCheck && (
                   <div
-                    className={`rounded-lg border px-3 py-2 text-xs ${
+                    className={`rounded-xl border px-3.5 py-2.5 text-xs ${
                       dnsCheck.matches
-                        ? "border-emerald-500/40 bg-emerald-950/30 text-emerald-200"
-                        : "border-amber-500/40 bg-amber-950/30 text-amber-200"
+                        ? "border-[var(--success-border)] bg-[var(--success-soft)] text-[var(--success)]"
+                        : "border-[var(--warning-border)] bg-[var(--warning-soft)] text-[var(--warning)]"
                     }`}
                   >
                     {dnsCheck.message}
@@ -616,7 +630,7 @@ export function OnboardingWizard({
                   type="button"
                   disabled={busy || !domainInput.trim()}
                   onClick={() => void handleVerifyDnsOnly()}
-                  className="rounded-lg border border-slate-700 bg-slate-800 px-4 py-2 text-xs font-medium text-slate-200 hover:bg-slate-700 disabled:opacity-50"
+                  className="vps-btn-secondary rounded-xl px-4 py-2 text-xs font-medium"
                 >
                   Check DNS Now
                 </button>
@@ -628,7 +642,7 @@ export function OnboardingWizard({
                   <button
                     type="button"
                     onClick={() => setStep("provider")}
-                    className="rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800"
+                    className="vps-btn-secondary rounded-xl px-4 py-2 text-xs font-medium"
                   >
                     Continue While DNS Propagates
                   </button>
@@ -636,7 +650,7 @@ export function OnboardingWizard({
                 <button
                   type="submit"
                   disabled={busy || (domainMode === "domain" && !domainInput.trim())}
-                  className="rounded-lg bg-sky-600 px-5 py-2 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+                  className="vps-btn-primary rounded-xl px-5 py-2 text-xs font-semibold"
                 >
                   {busy ? "Saving..." : "Save & Continue"}
                 </button>
@@ -660,27 +674,27 @@ export function OnboardingWizard({
                     onClick={() => selectProvider(entry.id)}
                     className={`rounded-xl border p-3.5 text-left transition ${
                       selected
-                        ? "border-sky-500 bg-sky-500/10 shadow-[0_0_0_1px_rgba(14,165,233,0.25)]"
-                        : "border-slate-800 bg-slate-950/60 hover:border-slate-700"
+                        ? "border-[var(--accent)] bg-[var(--accent-soft)]"
+                        : "border-[var(--border-subtle)] bg-[var(--bg-inset)] hover:border-[var(--border-strong)]"
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <span className="text-sm font-medium text-slate-100">
+                      <span className="text-sm font-semibold text-[var(--text-primary)]">
                         {entry.label}
                       </span>
                       {badgeText && (
                         <span
-                          className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                          className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
                             entry.id === "opencode"
-                              ? "bg-sky-500/20 text-sky-300"
-                              : "bg-emerald-500/15 text-emerald-300"
+                              ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                              : "bg-[var(--success-soft)] text-[var(--success)]"
                           }`}
                         >
                           {badgeText}
                         </span>
                       )}
                     </div>
-                    <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+                    <p className="mt-1 text-[11px] leading-relaxed text-[var(--text-secondary)]">
                       {entry.description}
                     </p>
                   </button>
@@ -688,10 +702,10 @@ export function OnboardingWizard({
               })}
             </div>
 
-            <div className="space-y-4 rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+            <div className="space-y-4 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-4">
               {activeCatalog?.endpointPresets && activeCatalog.endpointPresets.length > 0 && (
                 <div>
-                  <p className="text-xs font-medium text-slate-300">
+                  <p className="text-xs font-medium text-[var(--text-secondary)]">
                     {activeCatalog.label} Connection Mode
                   </p>
                   <div className="mt-2 grid gap-2 sm:grid-cols-3">
@@ -706,21 +720,21 @@ export function OnboardingWizard({
                             setProviderTestResult(null);
                             setDiscoveredModels([]);
                           }}
-                          className={`rounded-lg border p-2.5 text-left transition ${
+                          className={`rounded-xl border p-2.5 text-left transition ${
                             presetSelected
-                              ? "border-sky-500/70 bg-sky-500/10 text-slate-100"
-                              : "border-slate-800 bg-slate-950/70 text-slate-300 hover:border-slate-700"
+                              ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--text-primary)]"
+                              : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)] hover:border-[var(--border-strong)]"
                           }`}
                         >
                           <div className="flex items-center justify-between gap-1.5">
-                            <span className="text-xs font-medium">{preset.label}</span>
+                            <span className="text-xs font-semibold">{preset.label}</span>
                             {!preset.requiresApiKey && (
-                              <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] text-emerald-300">
+                              <span className="rounded bg-[var(--success-soft)] px-1.5 py-0.5 text-[9px] text-[var(--success)]">
                                 Optional key
                               </span>
                             )}
                           </div>
-                          <p className="mt-1 text-[10.5px] leading-snug text-slate-400">
+                          <p className="mt-1 text-[10.5px] leading-snug text-[var(--text-muted)]">
                             {preset.description}
                           </p>
                         </button>
@@ -734,7 +748,7 @@ export function OnboardingWizard({
                 <div>
                   <label
                     htmlFor="wizard-model"
-                    className="block text-xs font-medium text-slate-300"
+                    className="block text-xs font-medium text-[var(--text-secondary)]"
                   >
                     Model
                   </label>
@@ -743,7 +757,7 @@ export function OnboardingWizard({
                     type="text"
                     value={model}
                     onChange={(e) => setModel(e.target.value)}
-                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-sky-500 focus:outline-none"
+                    className="vps-input mt-1.5 w-full rounded-xl px-3 py-2 text-sm"
                   />
                   {activeCatalog && (
                     <div className="mt-2 flex flex-wrap gap-1.5">
@@ -755,10 +769,10 @@ export function OnboardingWizard({
                           key={suggested}
                           type="button"
                           onClick={() => setModel(suggested)}
-                          className={`rounded px-2 py-0.5 font-mono text-[11px] ${
+                          className={`rounded-lg border px-2 py-0.5 font-mono text-[11px] transition ${
                             model === suggested
-                              ? "bg-sky-600 text-white"
-                              : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                              ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--text-inverse)] font-medium"
+                              : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)] hover:border-[var(--border-strong)]"
                           }`}
                         >
                           {suggested}
@@ -772,7 +786,7 @@ export function OnboardingWizard({
                   <div>
                     <label
                       htmlFor="wizard-ollama-url"
-                      className="block text-xs font-medium text-slate-300"
+                      className="block text-xs font-medium text-[var(--text-secondary)]"
                     >
                       Ollama Endpoint URL
                     </label>
@@ -782,7 +796,7 @@ export function OnboardingWizard({
                       value={baseUrl}
                       onChange={(e) => setBaseUrl(e.target.value)}
                       placeholder="http://host.docker.internal:11434"
-                      className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-500 focus:outline-none"
+                      className="vps-input mt-1.5 w-full rounded-xl px-3 py-2 font-mono text-sm"
                     />
                   </div>
                 ) : (
@@ -790,7 +804,7 @@ export function OnboardingWizard({
                     <div className="flex items-center justify-between">
                       <label
                         htmlFor="wizard-api-key"
-                        className="block text-xs font-medium text-slate-300"
+                        className="block text-xs font-medium text-[var(--text-secondary)]"
                       >
                         {activePreset?.keyLabel ??
                           (provider === "opencode"
@@ -798,8 +812,8 @@ export function OnboardingWizard({
                             : "API Key")}
                       </label>
                       {state.llmConfigured && state.llmProvider === provider && (
-                        <span className="text-[11px] text-emerald-300">
-                          Key saved securely on server
+                        <span className="text-[11px] font-medium text-[var(--success)]">
+                          Key saved securely
                         </span>
                       )}
                     </div>
@@ -816,9 +830,9 @@ export function OnboardingWizard({
                             activeCatalog?.keyPlaceholder ??
                             "Enter API key")
                       }
-                      className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
+                      className="vps-input mt-1.5 w-full rounded-xl px-3 py-2 font-mono text-sm"
                     />
-                    <p className="mt-1.5 text-[11px] text-slate-500">
+                    <p className="mt-1.5 text-[11px] text-[var(--text-muted)]">
                       Stored with chmod 0600 on the server. Never sent back to the browser.
                     </p>
                   </div>
@@ -830,7 +844,7 @@ export function OnboardingWizard({
                   <button
                     type="button"
                     onClick={() => setShowAdvancedUrl((prev) => !prev)}
-                    className="text-[11px] text-slate-400 underline hover:text-slate-200"
+                    className="text-[11px] text-[var(--text-muted)] underline hover:text-[var(--text-primary)]"
                   >
                     {showAdvancedUrl
                       ? "Hide endpoint URL"
@@ -843,24 +857,24 @@ export function OnboardingWizard({
                       onChange={(e) => setBaseUrl(e.target.value)}
                       placeholder={activeCatalog?.defaultBaseUrl}
                       aria-label="Provider endpoint URL"
-                      className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-500 focus:outline-none"
+                      className="vps-input mt-2 w-full rounded-xl px-3 py-2 font-mono text-xs"
                     />
                   )}
                 </div>
               )}
 
               {activeCatalog?.setupHint && (
-                <p className="rounded-lg border border-slate-800/80 bg-slate-900/60 px-3 py-2 text-[11px] text-slate-400">
+                <p className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-2 text-[11px] text-[var(--text-secondary)]">
                   {activeCatalog.setupHint}
                 </p>
               )}
 
               {providerTestResult && (
                 <div
-                  className={`rounded-lg border px-3 py-2 text-xs ${
+                  className={`rounded-xl border px-3.5 py-2.5 text-xs ${
                     providerTestResult.ok
-                      ? "border-emerald-500/40 bg-emerald-950/30 text-emerald-200"
-                      : "border-rose-500/40 bg-rose-950/30 text-rose-200"
+                      ? "border-[var(--success-border)] bg-[var(--success-soft)] text-[var(--success)]"
+                      : "border-[var(--danger-border)] bg-[var(--danger-soft)] text-[var(--danger)]"
                   }`}
                 >
                   {providerTestResult.message}
@@ -873,7 +887,7 @@ export function OnboardingWizard({
                 <button
                   type="button"
                   onClick={() => setStep("domain")}
-                  className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800"
+                  className="vps-btn-secondary rounded-xl px-3.5 py-2 text-xs font-medium"
                 >
                   Back
                 </button>
@@ -881,7 +895,7 @@ export function OnboardingWizard({
                   type="button"
                   disabled={busy}
                   onClick={() => void handleTestProvider()}
-                  className="rounded-lg border border-slate-700 bg-slate-800 px-4 py-2 text-xs font-medium text-slate-200 hover:bg-slate-700 disabled:opacity-50"
+                  className="vps-btn-secondary rounded-xl px-4 py-2 text-xs font-medium"
                 >
                   Test Connection
                 </button>
@@ -890,14 +904,14 @@ export function OnboardingWizard({
                 <button
                   type="button"
                   onClick={() => setStep("persona")}
-                  className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-400 hover:bg-slate-800"
+                  className="vps-btn-secondary rounded-xl px-3.5 py-2 text-xs font-medium text-[var(--text-muted)]"
                 >
                   Skip AI for Now
                 </button>
                 <button
                   type="submit"
                   disabled={busy || !model.trim()}
-                  className="rounded-lg bg-sky-600 px-5 py-2 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+                  className="vps-btn-primary rounded-xl px-5 py-2 text-xs font-semibold"
                 >
                   {busy ? "Saving..." : "Save AI Provider & Continue"}
                 </button>
@@ -912,20 +926,20 @@ export function OnboardingWizard({
             onSubmit={(e) => void handleSavePersonaAndSecurity(e)}
             className="mt-6 space-y-5"
           >
-            <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-4">
               <div className="flex items-center justify-between">
-                <h3 className="text-sm font-medium text-slate-100">
-                  1. Dashboard Passphrase {passphraseConfigured ? "(Configured)" : "(Recommended)"}
+                <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+                  1. Dashboard Passphrase{" "}
+                  {passphraseConfigured ? "(Configured)" : "(Recommended)"}
                 </h3>
                 {passphraseConfigured && (
-                  <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-[11px] text-emerald-300">
+                  <span className="rounded-full bg-[var(--success-soft)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--success)]">
                     Active
                   </span>
                 )}
               </div>
-              <p className="mt-1 text-xs text-slate-400">
-                Set a memorable passphrase so you can sign in anytime without copying the
-                64-character Admin Token from SSH.
+              <p className="mt-1 text-xs text-[var(--text-secondary)]">
+                Set a memorable passphrase so you can sign in anytime without copying the 64-character Admin Token from SSH.
               </p>
               <div className="mt-3 grid gap-3 sm:grid-cols-2">
                 <input
@@ -938,7 +952,7 @@ export function OnboardingWizard({
                       : "At least 10 characters"
                   }
                   aria-label="New dashboard passphrase"
-                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
+                  className="vps-input rounded-xl px-3 py-2 text-sm"
                 />
                 <input
                   type="password"
@@ -946,20 +960,20 @@ export function OnboardingWizard({
                   onChange={(e) => setPassphraseConfirm(e.target.value)}
                   placeholder="Confirm passphrase"
                   aria-label="Confirm dashboard passphrase"
-                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
+                  className="vps-input rounded-xl px-3 py-2 text-sm"
                 />
               </div>
             </div>
 
-            <div className="space-y-4 rounded-xl border border-slate-800 bg-slate-950/50 p-4">
-              <h3 className="text-sm font-medium text-slate-100">
+            <div className="space-y-4 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-4">
+              <h3 className="text-sm font-semibold text-[var(--text-primary)]">
                 2. CTO Communication &amp; Safety Preferences (USER.md)
               </h3>
               <div className="grid gap-4 sm:grid-cols-2">
                 <div>
                   <label
                     htmlFor="wizard-owner-name"
-                    className="block text-xs font-medium text-slate-300"
+                    className="block text-xs font-medium text-[var(--text-secondary)]"
                   >
                     Your Name
                   </label>
@@ -968,13 +982,13 @@ export function OnboardingWizard({
                     type="text"
                     value={ownerName}
                     onChange={(e) => setOwnerName(e.target.value)}
-                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-sky-500 focus:outline-none"
+                    className="vps-input mt-1.5 w-full rounded-xl px-3 py-2 text-sm"
                   />
                 </div>
                 <div>
                   <label
                     htmlFor="wizard-style"
-                    className="block text-xs font-medium text-slate-300"
+                    className="block text-xs font-medium text-[var(--text-secondary)]"
                   >
                     Communication Style
                   </label>
@@ -986,7 +1000,7 @@ export function OnboardingWizard({
                         e.target.value as "plain-english" | "concise" | "detailed",
                       )
                     }
-                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-sky-500 focus:outline-none"
+                    className="vps-input mt-1.5 w-full rounded-xl px-3 py-2 text-sm"
                   >
                     <option value="plain-english">Plain English &amp; Reassuring</option>
                     <option value="concise">Short &amp; Direct</option>
@@ -999,28 +1013,28 @@ export function OnboardingWizard({
                 <button
                   type="button"
                   onClick={() => setTechnicalLevel("non-technical")}
-                  className={`rounded-lg border p-3 text-left text-xs ${
+                  className={`rounded-xl border p-3 text-left text-xs transition ${
                     technicalLevel === "non-technical"
-                      ? "border-sky-500 bg-sky-500/10 text-slate-100"
-                      : "border-slate-800 bg-slate-950 text-slate-400"
+                      ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--text-primary)]"
+                      : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)]"
                   }`}
                 >
                   <span className="font-semibold">Non-Linux Owner (Recommended)</span>
-                  <p className="mt-1 text-[11px] text-slate-400">
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">
                     Hide raw terminal output and explain actions in plain English.
                   </p>
                 </button>
                 <button
                   type="button"
                   onClick={() => setTechnicalLevel("developer")}
-                  className={`rounded-lg border p-3 text-left text-xs ${
+                  className={`rounded-xl border p-3 text-left text-xs transition ${
                     technicalLevel === "developer"
-                      ? "border-sky-500 bg-sky-500/10 text-slate-100"
-                      : "border-slate-800 bg-slate-950 text-slate-400"
+                      ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--text-primary)]"
+                      : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)]"
                   }`}
                 >
                   <span className="font-semibold">Developer / Technical</span>
-                  <p className="mt-1 text-[11px] text-slate-400">
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">
                     Include Compose, container, and networking details in summaries.
                   </p>
                 </button>
@@ -1030,49 +1044,51 @@ export function OnboardingWizard({
                 <button
                   type="button"
                   onClick={() => setApprovalMode("manual")}
-                  className={`rounded-lg border p-3 text-left text-xs ${
+                  className={`rounded-xl border p-3 text-left text-xs transition ${
                     approvalMode === "manual"
-                      ? "border-sky-500 bg-sky-500/10 text-slate-100"
-                      : "border-slate-800 bg-slate-950 text-slate-400"
+                      ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--text-primary)]"
+                      : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)]"
                   }`}
                 >
                   <span className="font-semibold">Ask Before Every Change (Safe Default)</span>
-                  <p className="mt-1 text-[11px] text-slate-400">
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">
                     Always present an Execution Plan and wait for approval before mutations.
                   </p>
                 </button>
                 <button
                   type="button"
                   onClick={() => setApprovalMode("smart")}
-                  className={`rounded-lg border p-3 text-left text-xs ${
+                  className={`rounded-xl border p-3 text-left text-xs transition ${
                     approvalMode === "smart"
-                      ? "border-sky-500 bg-sky-500/10 text-slate-100"
-                      : "border-slate-800 bg-slate-950 text-slate-400"
+                      ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--text-primary)]"
+                      : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)]"
                   }`}
                 >
                   <span className="font-semibold">Smart Mode</span>
-                  <p className="mt-1 text-[11px] text-slate-400">
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">
                     Auto-run read-only health checks; confirm all installs &amp; edits.
                   </p>
                 </button>
               </div>
             </div>
 
-            <div className="space-y-3 rounded-xl border border-slate-800 bg-slate-950/50 p-4">
-              <h3 className="text-sm font-medium text-slate-100">
+            <div className="space-y-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-4">
+              <h3 className="text-sm font-semibold text-[var(--text-primary)]">
                 3. Optional Mobile Chat Channels (Telegram / Discord)
               </h3>
-              <p className="text-xs text-slate-400">
+              <p className="text-xs text-[var(--text-secondary)]">
                 Connect a bot token if you want to chat with your CTO Agent from your phone.
               </p>
               <div className="grid gap-3 sm:grid-cols-2">
                 <div>
                   <div className="flex items-center justify-between text-xs">
-                    <label htmlFor="wizard-telegram" className="text-slate-300">
+                    <label htmlFor="wizard-telegram" className="text-[var(--text-secondary)]">
                       Telegram Bot Token
                     </label>
                     {state.telegramConfigured && (
-                      <span className="text-[11px] text-emerald-300">Configured</span>
+                      <span className="text-[11px] font-medium text-[var(--success)]">
+                        Configured
+                      </span>
                     )}
                   </div>
                   <input
@@ -1085,16 +1101,18 @@ export function OnboardingWizard({
                         ? "Saved (enter new token to replace)"
                         : "From @BotFather (optional)"
                     }
-                    className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
+                    className="vps-input mt-1 w-full rounded-xl px-3 py-2 font-mono text-xs"
                   />
                 </div>
                 <div>
                   <div className="flex items-center justify-between text-xs">
-                    <label htmlFor="wizard-discord" className="text-slate-300">
+                    <label htmlFor="wizard-discord" className="text-[var(--text-secondary)]">
                       Discord Bot Token
                     </label>
                     {state.discordConfigured && (
-                      <span className="text-[11px] text-emerald-300">Configured</span>
+                      <span className="text-[11px] font-medium text-[var(--success)]">
+                        Configured
+                      </span>
                     )}
                   </div>
                   <input
@@ -1107,7 +1125,7 @@ export function OnboardingWizard({
                         ? "Saved (enter new token to replace)"
                         : "Discord Developer Portal (optional)"
                     }
-                    className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
+                    className="vps-input mt-1 w-full rounded-xl px-3 py-2 font-mono text-xs"
                   />
                 </div>
               </div>
@@ -1117,14 +1135,14 @@ export function OnboardingWizard({
               <button
                 type="button"
                 onClick={() => setStep("provider")}
-                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800"
+                className="vps-btn-secondary rounded-xl px-3.5 py-2 text-xs font-medium"
               >
                 Back
               </button>
               <button
                 type="submit"
                 disabled={busy}
-                className="rounded-lg bg-sky-600 px-5 py-2 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+                className="vps-btn-primary rounded-xl px-5 py-2 text-xs font-semibold"
               >
                 {busy ? "Saving..." : "Save Preferences & Run Baseline Scan"}
               </button>
@@ -1137,10 +1155,10 @@ export function OnboardingWizard({
           <div className="mt-6 space-y-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h3 className="text-sm font-medium text-slate-100">
+                <h3 className="text-sm font-semibold text-[var(--text-primary)]">
                   Initial Server Health &amp; Readiness Scan
                 </h3>
-                <p className="text-xs text-slate-400">
+                <p className="text-xs text-[var(--text-secondary)]">
                   Verifies system resources, domain/TLS readiness, and seeds CTO memory (MEMORY.md).
                 </p>
               </div>
@@ -1148,7 +1166,7 @@ export function OnboardingWizard({
                 type="button"
                 disabled={busy}
                 onClick={() => void runBaselineScan()}
-                className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700 disabled:opacity-50"
+                className="vps-btn-secondary rounded-xl px-3.5 py-1.5 text-xs font-medium"
               >
                 {busy ? "Scanning..." : "Re-run Scan"}
               </button>
@@ -1157,30 +1175,30 @@ export function OnboardingWizard({
             {scanResult ? (
               <div className="space-y-4">
                 <div className="grid gap-3 sm:grid-cols-3">
-                  <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3.5">
-                    <p className="text-[11px] text-slate-400">Server &amp; OS</p>
-                    <p className="mt-1 truncate text-sm font-medium text-slate-100">
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-3.5">
+                    <p className="text-[11px] text-[var(--text-muted)]">Server &amp; OS</p>
+                    <p className="mt-1 truncate text-sm font-semibold text-[var(--text-primary)]">
                       {scanResult.hostname}
                     </p>
-                    <p className="text-xs text-slate-500">{scanResult.osRelease}</p>
+                    <p className="text-xs text-[var(--text-muted)]">{scanResult.osRelease}</p>
                   </div>
-                  <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3.5">
-                    <p className="text-[11px] text-slate-400">Compute &amp; RAM</p>
-                    <p className="mt-1 text-sm font-medium text-slate-100">
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-3.5">
+                    <p className="text-[11px] text-[var(--text-muted)]">Compute &amp; RAM</p>
+                    <p className="tabular-nums mt-1 text-sm font-semibold text-[var(--text-primary)]">
                       {scanResult.cpuCount} vCPU
                     </p>
-                    <p className="text-xs text-slate-500">
+                    <p className="tabular-nums text-xs text-[var(--text-muted)]">
                       {scanResult.memoryUsedMb} / {scanResult.memoryTotalMb} MB RAM
                     </p>
                   </div>
-                  <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3.5">
-                    <p className="text-[11px] text-slate-400">Disk Capacity</p>
-                    <p className="mt-1 text-sm font-medium text-slate-100">
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-3.5">
+                    <p className="text-[11px] text-[var(--text-muted)]">Disk Capacity</p>
+                    <p className="tabular-nums mt-1 text-sm font-semibold text-[var(--text-primary)]">
                       {scanResult.diskTotalGb !== null
                         ? `${scanResult.diskUsedGb} / ${scanResult.diskTotalGb} GB`
                         : "Unavailable"}
                     </p>
-                    <p className="text-xs text-slate-500">Root filesystem</p>
+                    <p className="text-xs text-[var(--text-muted)]">Root filesystem</p>
                   </div>
                 </div>
 
@@ -1188,14 +1206,14 @@ export function OnboardingWizard({
                   {scanResult.checks.map((check) => (
                     <li
                       key={check.id}
-                      className="flex items-start justify-between gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-xs"
+                      className="flex items-start justify-between gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] px-4 py-3 text-xs"
                     >
                       <div>
-                        <p className="font-medium text-slate-200">{check.label}</p>
-                        <p className="mt-0.5 text-slate-400">{check.detail}</p>
+                        <p className="font-semibold text-[var(--text-primary)]">{check.label}</p>
+                        <p className="mt-0.5 text-[var(--text-secondary)]">{check.detail}</p>
                       </div>
                       <span
-                        className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase ${statusBadgeClass(
+                        className={`shrink-0 rounded-full border px-2.5 py-0.5 text-[10px] font-semibold uppercase ${statusBadgeClass(
                           check.status,
                         )}`}
                       >
@@ -1206,7 +1224,7 @@ export function OnboardingWizard({
                 </ul>
               </div>
             ) : (
-              <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-6 text-center text-xs text-slate-400">
+              <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-6 text-center text-xs text-[var(--text-muted)]">
                 Running baseline server diagnostics...
               </div>
             )}
@@ -1215,7 +1233,7 @@ export function OnboardingWizard({
               <button
                 type="button"
                 onClick={() => setStep("persona")}
-                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800"
+                className="vps-btn-secondary rounded-xl px-3.5 py-2 text-xs font-medium"
               >
                 Back
               </button>
@@ -1223,7 +1241,7 @@ export function OnboardingWizard({
                 type="button"
                 onClick={() => setStep("complete")}
                 disabled={busy}
-                className="rounded-lg bg-sky-600 px-5 py-2 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+                className="vps-btn-primary rounded-xl px-5 py-2 text-xs font-semibold"
               >
                 Continue to Launch
               </button>
@@ -1234,43 +1252,42 @@ export function OnboardingWizard({
         {/* Step 5: Complete */}
         {step === "complete" && (
           <div className="mt-6 space-y-5">
-            <div className="rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-5">
-              <h3 className="text-base font-semibold text-emerald-200">
+            <div className="rounded-xl border border-[var(--success-border)] bg-[var(--success-soft)] p-5">
+              <h3 className="text-base font-semibold text-[var(--text-primary)]">
                 Your VPS OS Environment Is Ready
               </h3>
-              <p className="mt-1 text-xs text-slate-300">
-                All settings are saved safely on your server. You can re-open this Setup
-                Wizard anytime from the top header.
+              <p className="mt-1 text-xs text-[var(--text-secondary)]">
+                All settings are saved safely on your server. You can re-open this Setup Wizard anytime from System Settings.
               </p>
 
               <dl className="mt-4 grid gap-3 text-xs sm:grid-cols-2">
-                <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
-                  <dt className="text-slate-400">Ingress &amp; Domain</dt>
-                  <dd className="mt-1 font-medium text-slate-100">
+                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-3">
+                  <dt className="text-[var(--text-muted)]">Ingress &amp; Domain</dt>
+                  <dd className="mt-1 font-semibold text-[var(--text-primary)]">
                     {state.domainMode === "domain" && state.domain
                       ? `${state.domain} (${state.dnsVerified ? "DNS verified" : "DNS pending"})`
                       : "IP setup mode (:80)"}
                   </dd>
                 </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
-                  <dt className="text-slate-400">AI CTO Provider</dt>
-                  <dd className="mt-1 font-medium text-slate-100">
+                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-3">
+                  <dt className="text-[var(--text-muted)]">AI CTO Provider</dt>
+                  <dd className="mt-1 font-semibold text-[var(--text-primary)]">
                     {state.llmConfigured
                       ? `${state.llmProvider} (${state.llmModel})`
                       : "Not configured yet (dashboard-only mode)"}
                   </dd>
                 </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
-                  <dt className="text-slate-400">Approval Guardrail</dt>
-                  <dd className="mt-1 font-medium text-slate-100">
+                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-3">
+                  <dt className="text-[var(--text-muted)]">Approval Guardrail</dt>
+                  <dd className="mt-1 font-semibold text-[var(--text-primary)]">
                     {state.persona.approvalMode === "manual"
                       ? "Manual confirmation before every change"
                       : "Smart (auto-read, confirm mutations)"}
                   </dd>
                 </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
-                  <dt className="text-slate-400">Hermes CTO Gateway</dt>
-                  <dd className="mt-1 font-medium text-slate-100">
+                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-3">
+                  <dt className="text-[var(--text-muted)]">Hermes CTO Gateway</dt>
+                  <dd className="mt-1 font-semibold text-[var(--text-primary)]">
                     {hermesStatus.reachable ? "Online & ready" : hermesStatus.detail}
                   </dd>
                 </div>
@@ -1278,7 +1295,7 @@ export function OnboardingWizard({
             </div>
 
             <div>
-              <p className="text-xs font-medium text-slate-300">
+              <p className="text-xs font-medium text-[var(--text-secondary)]">
                 Or complete setup and start immediately with a CTO request:
               </p>
               <div className="mt-2 grid gap-2 sm:grid-cols-3">
@@ -1288,7 +1305,7 @@ export function OnboardingWizard({
                     type="button"
                     disabled={busy}
                     onClick={() => void handleCompleteSetup(prompt)}
-                    className="rounded-xl border border-slate-800 bg-slate-950/70 p-3 text-left text-xs text-slate-300 transition hover:border-sky-500/60 hover:text-sky-200 disabled:opacity-50"
+                    className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-3 text-left text-xs text-[var(--text-secondary)] transition hover:border-[var(--accent)] hover:text-[var(--text-primary)] disabled:opacity-50"
                   >
                     &ldquo;{prompt}&rdquo;
                   </button>
@@ -1300,7 +1317,7 @@ export function OnboardingWizard({
               <button
                 type="button"
                 onClick={() => setStep("scan")}
-                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800"
+                className="vps-btn-secondary rounded-xl px-3.5 py-2 text-xs font-medium"
               >
                 Back
               </button>
@@ -1308,7 +1325,7 @@ export function OnboardingWizard({
                 type="button"
                 disabled={busy}
                 onClick={() => void handleCompleteSetup()}
-                className="rounded-lg bg-emerald-600 px-5 py-2.5 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+                className="rounded-xl bg-emerald-600 px-5 py-2.5 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
               >
                 {busy ? "Finishing..." : "Complete Setup & Open Dashboard"}
               </button>

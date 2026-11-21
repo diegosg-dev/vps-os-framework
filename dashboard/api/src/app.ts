@@ -17,6 +17,8 @@ import {
 } from "@vps-os/shared";
 import {
   type DiskMetrics,
+  TelemetryHistoryBuffer,
+  type TelemetrySample,
   collectDiskMetrics,
   collectSystemMetrics,
 } from "./metrics.js";
@@ -66,6 +68,7 @@ export interface DashboardAppDeps {
   webDistDir?: string;
   getMetrics?: () => SystemMetrics;
   getDiskMetrics?: () => DiskMetrics | null;
+  initialMetricsHistory?: TelemetrySample[];
   rateLimitMax?: number;
   rateLimitWindowMs?: number;
   maxRateLimitKeys?: number;
@@ -131,6 +134,7 @@ const LifecycleRequestSchema = z.object({
 const AuditLimitQuerySchema = z.coerce.number().int().min(1).max(500);
 const PlansLimitQuerySchema = z.coerce.number().int().min(1).max(100);
 const LogsTailQuerySchema = z.coerce.number().int().min(1).max(500);
+const MetricsHistoryLimitQuerySchema = z.coerce.number().int().min(1).max(60);
 
 function toAppView(app: AppRecord): AppView {
   return {
@@ -227,6 +231,10 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
   const app = new Hono();
   const getMetrics = deps.getMetrics ?? collectSystemMetrics;
   const getDisk = deps.getDiskMetrics ?? collectDiskMetrics;
+  const metricsHistory = new TelemetryHistoryBuffer(
+    60,
+    deps.initialMetricsHistory ?? [],
+  );
   const maxRequests = Math.max(1, deps.rateLimitMax ?? 120);
   const windowMs = Math.max(100, deps.rateLimitWindowMs ?? 60_000);
   const maxRateLimitKeys = Math.max(
@@ -365,7 +373,30 @@ export function createDashboardApp(deps: DashboardAppDeps): Hono {
   app.get("/api/system/metrics", (c) => {
     const metrics = getMetrics();
     const disk = getDisk();
+    metricsHistory.record(metrics, disk);
     return c.json(disk ? { ...metrics, disk } : metrics);
+  });
+
+  app.get("/api/system/metrics/history", (c) => {
+    const rawLimit = c.req.query("limit");
+    let limit = 30;
+    if (rawLimit !== undefined) {
+      const parsedLimit = MetricsHistoryLimitQuerySchema.safeParse(rawLimit);
+      if (!parsedLimit.success) {
+        return c.json(
+          { error: "Query 'limit' must be an integer between 1 and 60." },
+          400,
+        );
+      }
+      limit = parsedLimit.data;
+    }
+    const existing = metricsHistory.list(limit);
+    if (existing.length === 0) {
+      const metrics = getMetrics();
+      const disk = getDisk();
+      metricsHistory.record(metrics, disk);
+    }
+    return c.json({ samples: metricsHistory.list(limit) });
   });
 
   app.get("/api/apps", async (c) => {

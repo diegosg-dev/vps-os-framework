@@ -9,6 +9,7 @@ import {
   type ChatToolCall,
   LLM_PROVIDER_CATALOG,
   type LlmProvider,
+  type ReasoningEffort,
   type StoredChatAttachmentRecord,
   type StoredPlan,
   type SystemMetrics,
@@ -74,6 +75,13 @@ export interface ResolvedProviderConfig {
   apiKey: string;
 }
 
+/** Built-in @mention tokens that ground the CTO agent in system tools instead of app slugs. */
+const BUILT_IN_SYSTEM_MENTION_TOKENS = new Set([
+  "host-metrics",
+  "audit-trail",
+  "pending-plans",
+]);
+
 export interface ChatEngineDeps {
   registry: SystemRegistryStore;
   getMetrics: () => SystemMetrics;
@@ -93,6 +101,8 @@ export interface RunAgentTurnInput {
   threadId: string;
   userText: string;
   mode: ChatMode;
+  effort?: ReasoningEffort | undefined;
+  mentionedSlugs?: string[] | undefined;
   attachments: StoredChatAttachmentRecord[];
   history: ChatMessage[];
   overrideProvider?: LlmProvider | undefined;
@@ -200,6 +210,7 @@ function resolveProviderConfig(
 function buildSystemPrompt(
   persona: ReturnType<SystemRegistryStore["getOnboardingState"]>["persona"],
   mode: ChatMode,
+  effort: ReasoningEffort,
   toolContext: string,
 ): string {
   const tone =
@@ -209,14 +220,25 @@ function buildSystemPrompt(
   const modeRule =
     mode === "plan"
       ? "The user is in PLAN mode: focus on verifying boundaries, risks, and clear approval steps."
-      : "The user is in AGENT mode: answer directly using the inspected server telemetry and attached files; never claim to have mutated the host without an approved ExecutionPlan.";
+      : mode === "ask"
+        ? "The user is in ASK (read-only) mode: answer questions clearly using inspected telemetry and context without proposing host mutations."
+        : "The user is in AGENT mode: answer directly using the inspected server telemetry and attached files; never claim to have mutated the host without an approved ExecutionPlan.";
+  const effortRule =
+    effort === "max"
+      ? "Reasoning depth: MAX — perform exhaustive root-cause and edge-case analysis."
+      : effort === "high"
+        ? "Reasoning depth: HIGH — verify dependencies, rollback paths, and resource headroom thoroughly."
+        : effort === "low"
+          ? "Reasoning depth: LOW — respond concisely and directly."
+          : "Reasoning depth: MEDIUM — balanced thoroughness and brevity.";
 
   return [
     "You are the VPS OS Autonomous CTO Agent managing an Ubuntu VPS with Locked Apartment Docker workloads.",
     `Owner: ${persona.ownerName || "Server Owner"}. ${tone}`,
     `Approval guardrail: ${persona.approvalMode}. ${modeRule}`,
+    effortRule,
     "Never print or ask to paste raw private keys or unredacted secrets.",
-    "Use clean Markdown formatting (short headings, bullet points, fenced code blocks when helpful).",
+    "Use clean Markdown formatting (short headings, bullet points, tables, fenced code blocks when helpful).",
     "",
     "### Live Inspected Server Context",
     toolContext,
@@ -709,16 +731,25 @@ export async function runAgentChatTurn(
     emit({ type: "reasoning_delta", blockId: initialReasoningId, delta });
   };
 
+  const effort: ReasoningEffort = input.effort ?? "medium";
+  const mentionedSlugs = (input.mentionedSlugs ?? [])
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
   const riskLevel = classifyGoalRisk(sanitizedGoal);
   const shouldProposePlan =
-    input.mode === "plan" ||
-    riskLevel !== "low" ||
-    /\b(deploy|install|create|provision|restart|stop|start|domain|backup|plan)\b/i.test(
-      sanitizedGoal,
-    );
+    input.mode !== "ask" &&
+    (input.mode === "plan" ||
+      riskLevel !== "low" ||
+      /\b(deploy|install|create|provision|restart|stop|start|domain|backup|plan)\b/i.test(
+        sanitizedGoal,
+      ));
 
   appendInitialThought(
-    `Classified request risk as **${riskLevel}** in \`${input.mode}\` mode${
+    `Classified request risk as **${riskLevel}** in \`${input.mode}\` mode (effort: \`${effort}\`)${
+      mentionedSlugs.length > 0
+        ? ` referencing ${mentionedSlugs.map((s) => `@${s}`).join(", ")}`
+        : ""
+    }${
       input.attachments.length > 0
         ? ` with ${input.attachments.length} attached file(s)`
         : ""
@@ -814,6 +845,21 @@ export async function runAgentChatTurn(
   );
   const apps = deps.registry.listApps();
 
+  // Surface @mentions that resolve neither to a registered app slug nor a
+  // built-in system token so users immediately spot typos without failing the turn.
+  const registeredSlugs = new Set(apps.map((app) => app.slug.toLowerCase()));
+  const unresolvedMentions = mentionedSlugs.filter(
+    (slug) =>
+      !BUILT_IN_SYSTEM_MENTION_TOKENS.has(slug) && !registeredSlugs.has(slug),
+  );
+  if (unresolvedMentions.length > 0) {
+    appendInitialThought(
+      `Unrecognized @mentions ignored: ${unresolvedMentions
+        .map((s) => `@${s}`)
+        .join(", ")}.`,
+    );
+  }
+
   // Tool 3: Inspect attached files if any
   if (input.attachments.length > 0) {
     await runTool(
@@ -836,15 +882,20 @@ export async function runAgentChatTurn(
     );
   }
 
-  // Tool 4: Inspect app logs if user asks for logs/errors on a registered app
+  // Tool 4: Inspect app logs if user asks for logs/errors or @mentions a registered app
   let inspectedLogs: { slug: string; lines: string[] } | null = null;
-  if (
-    deps.getLogs &&
-    /\b(log|logs|error|crash|fail|debug|troubleshoot|diagnos)\b/i.test(sanitizedGoal)
-  ) {
-    const matchedApp = apps.find((app) =>
-      sanitizedGoal.toLowerCase().includes(app.slug.toLowerCase()),
+  if (deps.getLogs) {
+    const mentionedApp = apps.find((app) =>
+      mentionedSlugs.includes(app.slug.toLowerCase()),
     );
+    const goalMatchedApp = /\b(log|logs|error|crash|fail|debug|troubleshoot|diagnos)\b/i.test(
+      sanitizedGoal,
+    )
+      ? apps.find((app) =>
+          sanitizedGoal.toLowerCase().includes(app.slug.toLowerCase()),
+        )
+      : undefined;
+    const matchedApp = mentionedApp ?? goalMatchedApp;
     if (matchedApp) {
       inspectedLogs = await runTool(
         "read_app_logs",
@@ -861,9 +912,12 @@ export async function runAgentChatTurn(
     }
   }
 
-  // Tool 5: Check recent audit events when asking about history/changes/security
+  // Tool 5: Check recent audit events when asking about history/changes/security or @audit-trail
   let auditSnapshot: unknown = null;
-  if (/\b(audit|history|recent|changed|security|backup|status|health)\b/i.test(sanitizedGoal)) {
+  if (
+    mentionedSlugs.includes("audit-trail") ||
+    /\b(audit|history|recent|changed|security|backup|status|health)\b/i.test(sanitizedGoal)
+  ) {
     auditSnapshot = await runTool(
       "list_audit_events",
       "Check recent redacted audit trail",
@@ -989,6 +1043,7 @@ export async function runAgentChatTurn(
     const systemPrompt = buildSystemPrompt(
       onboarding.persona,
       input.mode,
+      effort,
       contextPayload,
     );
     const userPrompt = buildUserContentWithAttachments(

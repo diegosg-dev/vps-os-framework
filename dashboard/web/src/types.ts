@@ -1,3 +1,21 @@
+export type WorkspaceView =
+  | "overview"
+  | "chat"
+  | "apps"
+  | "activity"
+  | "settings";
+
+export type ThemeMode = "dark" | "light";
+
+export type ToastTone = "success" | "info" | "warning" | "error";
+
+export interface ToastItem {
+  id: string;
+  title: string;
+  description?: string | undefined;
+  tone: ToastTone;
+}
+
 export interface DiskMetricsView {
   mountPath: string;
   totalMb: number;
@@ -7,6 +25,7 @@ export interface DiskMetricsView {
 
 export interface SystemMetricsView {
   hostname: string;
+  platform?: string;
   cpuCount: number;
   loadAverage1m: number;
   memoryUsedMb: number;
@@ -17,6 +36,16 @@ export interface SystemMetricsView {
   disk?: DiskMetricsView;
 }
 
+export interface TelemetrySampleView {
+  collectedAt: string;
+  loadAverage1m: number;
+  cpuCount: number;
+  cpuLoadPercent: number;
+  memoryUsagePercent: number;
+  memoryUsedMb: number;
+  diskUsagePercent: number | null;
+}
+
 export interface AppCardView {
   slug: string;
   name: string;
@@ -25,6 +54,8 @@ export interface AppCardView {
   status: string;
   cpuLimit: string;
   memoryLimitMb: number;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface AuditEventView {
@@ -106,7 +137,20 @@ export interface ProviderCatalogItem {
   setupHint?: string;
 }
 
-export type ChatMode = "agent" | "plan";
+export type ChatMode = "agent" | "plan" | "ask";
+
+export type ReasoningEffort = "low" | "medium" | "high" | "max";
+
+export interface QueuedChatMessage {
+  id: string;
+  threadId: string | null;
+  content: string;
+  mode: ChatMode;
+  effort: ReasoningEffort;
+  mentionedSlugs: string[];
+  attachments: ChatAttachmentView[];
+  createdAt: string;
+}
 
 export interface ChatAttachmentView {
   id: string;
@@ -162,6 +206,9 @@ export interface ChatThreadView {
   title: string;
   provider: string | null;
   model: string | null;
+  pinned?: boolean;
+  archived?: boolean;
+  parentThreadId?: string | null;
   messageCount: number;
   createdAt: string;
   updatedAt: string;

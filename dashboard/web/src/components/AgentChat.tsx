@@ -1,14 +1,20 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
-  type ClipboardEvent,
   type DragEvent,
-  type KeyboardEvent,
 } from "react";
+import {
+  formatBytes,
+  formatRelativeTime,
+  providerDisplayName,
+  triggerTextDownload,
+} from "../lib/format";
 import type {
   AppCardView,
+  AuditEventView,
   ChatAttachmentView,
   ChatMessageView,
   ChatMode,
@@ -18,471 +24,113 @@ import type {
   ExecutionPlanView,
   LlmProviderId,
   OnboardingPayload,
+  QueuedChatMessage,
+  ReasoningEffort,
   SystemMetricsView,
+  WorkspaceView,
 } from "../types";
+import { ChatComposer, type SlashCommandItem } from "./ChatComposer";
+import { ChatThreadRail } from "./ChatThreadRail";
+import { ChatTurnItem } from "./ChatTurnItem";
+import { ConfirmDialog, type ConfirmDialogState } from "./ConfirmDialog";
 import {
-  ArrowUpIcon,
-  BrainIcon,
-  CheckCircleIcon,
-  ChevronDownIcon,
-  ChevronRightIcon,
-  CopyIcon,
+  ArchiveIcon,
+  ArrowDownIcon,
+  AtSignIcon,
+  DownloadIcon,
   FileTextIcon,
+  GitForkIcon,
   ImageIcon,
-  MessageSquareIcon,
+  LayersIcon,
   PanelLeftIcon,
   PanelRightIcon,
   PaperclipIcon,
-  PlusIcon,
-  ServerIcon,
+  PinIcon,
   ShieldIcon,
-  SlidersIcon,
   SparklesIcon,
-  SpinnerIcon,
-  SquareStopIcon,
   TerminalIcon,
   TrashIcon,
-  WrenchIcon,
-  XCircleIcon,
   XIcon,
 } from "./Icons";
-import { MarkdownContent } from "./MarkdownContent";
 
 interface AgentChatProps {
   authHeaders: () => Record<string, string>;
   onboardingPayload: OnboardingPayload | null;
   metrics: SystemMetricsView | null;
   apps: AppCardView[];
+  auditEvents: AuditEventView[];
+  busyAppSlug: string | null;
   initialPrompt?: string | null;
   onConsumeInitialPrompt?: () => void;
   onOpenSetupWizard: () => void;
   onRefreshDashboard: () => Promise<void>;
+  onLifecycle: (slug: string, action: "start" | "stop" | "restart") => void;
+  onInspectApp: (app: AppCardView, tab?: "overview" | "logs") => void;
+  onNavigate: (view: WorkspaceView) => void;
   showInspector: boolean;
   onToggleInspector: () => void;
+  onNotify: (
+    title: string,
+    tone?: "success" | "info" | "warning" | "error",
+    description?: string,
+  ) => void;
+}
+
+interface DispatchTurnParams {
+  content: string;
+  mode: ChatMode;
+  effort: ReasoningEffort;
+  mentionedSlugs: string[];
+  attachments: ChatAttachmentView[];
+  truncateFromMessageId?: string | undefined;
+  targetThreadId?: string | null | undefined;
 }
 
 const STARTER_CARDS = [
   {
     title: "Deploy a personal agent",
-    prompt: "Create a personal life agent in its own isolated folder with Telegram access",
-    tag: "Workload",
+    prompt:
+      "Create a personal life agent in its own isolated folder with Telegram access",
+    tag: "Personal Agent",
+    mode: "plan" as ChatMode,
   },
   {
     title: "Inspect server health",
-    prompt: "Check server health, CPU/RAM headroom, running workloads, and recent audit status",
+    prompt:
+      "Check server health, CPU/RAM headroom, running workloads, and recent audit status",
     tag: "Diagnostics",
+    mode: "agent" as ChatMode,
   },
   {
     title: "Launch a web app with HTTPS",
-    prompt: "Deploy a billing web app at billing.example.com in its own locked container",
-    tag: "Deploy",
+    prompt:
+      "Deploy a billing web app at billing.example.com in its own locked container",
+    tag: "Auto-TLS Deploy",
+    mode: "plan" as ChatMode,
   },
   {
-    title: "Review config or logs",
-    prompt: "Analyze my server configuration and tell me if anything needs hardening or cleanup",
-    tag: "Security",
+    title: "Security & hardening review",
+    prompt:
+      "Analyze my server configuration and tell me if anything needs hardening or cleanup",
+    tag: "Read-only Audit",
+    mode: "ask" as ChatMode,
   },
 ];
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+function sortThreads(list: ChatThreadView[]): ChatThreadView[] {
+  return [...list].sort((a, b) => {
+    const pinDiff = Number(Boolean(b.pinned)) - Number(Boolean(a.pinned));
+    if (pinDiff !== 0) return pinDiff;
+    return b.updatedAt.localeCompare(a.updatedAt);
+  });
 }
 
-function formatDuration(ms: number | null | undefined): string {
-  if (ms === null || ms === undefined) return "";
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-}
-
-function formatRelativeTime(iso: string): string {
-  const diffSec = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
-  if (diffSec < 60) return "just now";
-  const mins = Math.floor(diffSec / 60);
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
-}
-
-function providerDisplayName(provider: string | null | undefined): string {
-  switch (provider) {
-    case "opencode":
-      return "OpenCode";
-    case "openai":
-      return "OpenAI";
-    case "anthropic":
-      return "Claude";
-    case "openrouter":
-      return "OpenRouter";
-    case "nous":
-      return "Nous";
-    case "ollama":
-      return "Ollama";
-    case "vps-os-cto":
-      return "VPS OS CTO";
-    default:
-      return provider || "VPS OS CTO";
-  }
-}
-
-/** Loads an authenticated attachment image via Bearer headers and caches a blob URL. */
-function AuthAttachmentImage({
-  attachment,
-  authHeaders,
-  className,
-  onClick,
-}: {
-  attachment: ChatAttachmentView;
-  authHeaders: () => Record<string, string>;
-  className?: string;
-  onClick?: (src: string) => void;
-}) {
-  const [src, setSrc] = useState<string | null>(attachment.localPreviewUrl ?? null);
-
-  useEffect(() => {
-    if (attachment.localPreviewUrl) {
-      setSrc(attachment.localPreviewUrl);
-      return;
+function revokeAttachmentPreviews(attachments: ChatAttachmentView[]) {
+  for (const att of attachments) {
+    if (att.localPreviewUrl) {
+      URL.revokeObjectURL(att.localPreviewUrl);
     }
-    let active = true;
-    let createdUrl: string | null = null;
-
-    void fetch(attachment.url, { headers: authHeaders() })
-      .then((res) => (res.ok ? res.blob() : null))
-      .then((blob) => {
-        if (!active || !blob) return;
-        createdUrl = URL.createObjectURL(blob);
-        setSrc(createdUrl);
-      })
-      .catch(() => {
-        // ignore preview fetch errors
-      });
-
-    return () => {
-      active = false;
-      if (createdUrl) {
-        URL.revokeObjectURL(createdUrl);
-      }
-    };
-  }, [attachment.localPreviewUrl, attachment.url, authHeaders]);
-
-  if (!src) {
-    return (
-      <div
-        className={`flex items-center justify-center rounded-lg border border-white/[0.08] bg-white/[0.03] text-slate-500 ${
-          className ?? "h-14 w-14"
-        }`}
-      >
-        <ImageIcon className="h-4 w-4" />
-      </div>
-    );
   }
-
-  return (
-    <button
-      type="button"
-      onClick={() => onClick?.(src)}
-      className="group relative overflow-hidden rounded-lg border border-white/[0.1] bg-black/40 transition hover:border-sky-400/50"
-      title={`Preview ${attachment.name}`}
-    >
-      <img
-        src={src}
-        alt={attachment.name}
-        className={className ?? "h-16 w-16 object-cover"}
-      />
-    </button>
-  );
-}
-
-/** Collapsible T3 Code-style reasoning trace disclosure. */
-function ReasoningTraceCard({ block }: { block: ChatReasoningBlockView }) {
-  const isStreaming = block.status === "streaming";
-  const [expanded, setExpanded] = useState(isStreaming);
-
-  useEffect(() => {
-    if (isStreaming) {
-      setExpanded(true);
-    }
-  }, [isStreaming]);
-
-  const label = isStreaming
-    ? `${block.title}...`
-    : block.durationMs > 0
-      ? `${block.title} · ${formatDuration(block.durationMs)}`
-      : block.title;
-
-  return (
-    <div className="rounded-xl border border-white/[0.07] bg-white/[0.02]">
-      <button
-        type="button"
-        onClick={() => setExpanded((prev) => !prev)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-slate-400 transition hover:text-slate-200"
-      >
-        {isStreaming ? (
-          <span className="inline-flex h-4 w-4 items-center justify-center">
-            <span className="h-2 w-2 rounded-full bg-violet-400 animate-pulse-dot" />
-          </span>
-        ) : (
-          <BrainIcon className="h-3.5 w-3.5 shrink-0 text-violet-400/80" />
-        )}
-        <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
-        {expanded ? (
-          <ChevronDownIcon className="h-3.5 w-3.5 shrink-0 text-slate-500" />
-        ) : (
-          <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-slate-500" />
-        )}
-      </button>
-      {expanded && block.content && (
-        <div className="border-t border-white/[0.05] px-3 py-2.5">
-          <div className="border-l-2 border-violet-500/35 pl-3 text-[12px] leading-relaxed text-slate-400 whitespace-pre-wrap">
-            {block.content}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Expandable T3 Code-style tool call row with Input/Output JSON inspector. */
-function ToolCallCard({ toolCall }: { toolCall: ChatToolCallView }) {
-  const [expanded, setExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
-
-  const outputText =
-    toolCall.output !== undefined
-      ? typeof toolCall.output === "string"
-        ? toolCall.output
-        : JSON.stringify(toolCall.output, null, 2)
-      : null;
-
-  function copyOutput() {
-    if (!outputText) return;
-    void navigator.clipboard?.writeText(outputText);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
-  }
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-white/[0.07] bg-[#0e1118]">
-      <button
-        type="button"
-        onClick={() => setExpanded((prev) => !prev)}
-        className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-xs transition hover:bg-white/[0.025]"
-      >
-        {toolCall.status === "running" && (
-          <SpinnerIcon className="h-3.5 w-3.5 shrink-0 text-sky-400" />
-        )}
-        {toolCall.status === "success" && (
-          <CheckCircleIcon className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
-        )}
-        {toolCall.status === "awaiting_approval" && (
-          <ShieldIcon className="h-3.5 w-3.5 shrink-0 text-amber-400" />
-        )}
-        {toolCall.status === "error" && (
-          <XCircleIcon className="h-3.5 w-3.5 shrink-0 text-rose-400" />
-        )}
-
-        <span className="min-w-0 flex-1 truncate font-medium text-slate-200">
-          {toolCall.label}
-        </span>
-
-        <span className="hidden rounded-md border border-white/[0.07] bg-white/[0.03] px-1.5 py-0.5 font-mono text-[10.5px] text-slate-400 sm:inline">
-          {toolCall.toolName}
-        </span>
-
-        {toolCall.durationMs !== null && (
-          <span className="shrink-0 font-mono text-[10.5px] text-slate-500">
-            {formatDuration(toolCall.durationMs)}
-          </span>
-        )}
-
-        {expanded ? (
-          <ChevronDownIcon className="h-3.5 w-3.5 shrink-0 text-slate-500" />
-        ) : (
-          <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-slate-500" />
-        )}
-      </button>
-
-      {expanded && (
-        <div className="space-y-2.5 border-t border-white/[0.06] bg-[#090b10] p-3 text-[11.5px]">
-          {Object.keys(toolCall.input ?? {}).length > 0 && (
-            <div>
-              <p className="mb-1 font-mono text-[10px] uppercase tracking-wider text-slate-500">
-                Input
-              </p>
-              <pre className="max-h-36 overflow-auto rounded-lg border border-white/[0.06] bg-black/40 p-2 font-mono text-[11px] text-slate-300">
-                {JSON.stringify(toolCall.input, null, 2)}
-              </pre>
-            </div>
-          )}
-
-          {toolCall.error && (
-            <div className="rounded-lg border border-rose-500/30 bg-rose-950/30 px-2.5 py-1.5 text-xs text-rose-200">
-              {toolCall.error}
-            </div>
-          )}
-
-          {outputText && (
-            <div>
-              <div className="mb-1 flex items-center justify-between">
-                <p className="font-mono text-[10px] uppercase tracking-wider text-slate-500">
-                  Output
-                </p>
-                <button
-                  type="button"
-                  onClick={copyOutput}
-                  className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-slate-400 hover:bg-white/[0.05] hover:text-slate-200"
-                >
-                  <CopyIcon className="h-3 w-3" />
-                  {copied ? "Copied" : "Copy"}
-                </button>
-              </div>
-              <pre className="max-h-56 overflow-auto rounded-lg border border-white/[0.06] bg-black/40 p-2 font-mono text-[11px] leading-relaxed text-slate-300">
-                {outputText}
-              </pre>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Inline Execution Plan approval & execution card embedded directly inside an agent turn. */
-function InlinePlanCard({
-  plan,
-  busy,
-  executionSummary,
-  onApprove,
-  onReject,
-  onExecute,
-}: {
-  plan: ExecutionPlanView;
-  busy: boolean;
-  executionSummary?: string | undefined;
-  onApprove: (planId: string) => void;
-  onReject: (planId: string) => void;
-  onExecute: (planId: string) => void;
-}) {
-  const statusStyles: Record<string, string> = {
-    pending: "border-amber-500/35 bg-amber-500/15 text-amber-200",
-    approved: "border-sky-500/35 bg-sky-500/15 text-sky-200",
-    executed: "border-emerald-500/35 bg-emerald-500/15 text-emerald-200",
-    rejected: "border-rose-500/35 bg-rose-500/15 text-rose-200",
-  };
-  const status = plan.status ?? "pending";
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-amber-500/25 bg-[#11141d]">
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.06] bg-amber-500/[0.05] px-3.5 py-2.5">
-        <div className="flex items-center gap-2">
-          <ShieldIcon className="h-4 w-4 text-amber-400" />
-          <span className="text-xs font-semibold text-slate-100">
-            Execution Plan
-          </span>
-        </div>
-        <span
-          className={`rounded-full border px-2 py-0.5 text-[10.5px] font-medium capitalize ${
-            statusStyles[status] ?? statusStyles.pending
-          }`}
-        >
-          {status}
-        </span>
-      </div>
-
-      <div className="space-y-3 p-3.5">
-        <p className="text-xs text-slate-300">{plan.summary}</p>
-        <ol className="space-y-2">
-          {plan.steps.map((step, index) => (
-            <li
-              key={step.id}
-              className="flex items-start gap-2.5 rounded-lg border border-white/[0.06] bg-black/25 px-3 py-2 text-xs"
-            >
-              <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-white/[0.07] font-mono text-[10px] text-slate-300">
-                {index + 1}
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="font-medium text-slate-100">{step.title}</span>
-                  {step.toolName && (
-                    <span className="rounded bg-white/[0.05] px-1.5 py-0.5 font-mono text-[10px] text-slate-400">
-                      {step.toolName}
-                    </span>
-                  )}
-                  <span
-                    className={`rounded px-1.5 py-0.5 text-[10px] uppercase ${
-                      step.riskLevel === "high"
-                        ? "bg-rose-500/15 text-rose-300"
-                        : step.riskLevel === "medium"
-                          ? "bg-amber-500/15 text-amber-300"
-                          : "bg-emerald-500/15 text-emerald-300"
-                    }`}
-                  >
-                    {step.riskLevel}
-                  </span>
-                </div>
-                <p className="mt-0.5 text-[11.5px] text-slate-400">
-                  {step.description}
-                </p>
-              </div>
-            </li>
-          ))}
-        </ol>
-
-        {plan.requiresUserApproval && status === "pending" && (
-          <div className="flex flex-wrap gap-2 pt-1">
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => onApprove(plan.id)}
-              className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-medium text-white transition hover:bg-emerald-500 disabled:opacity-50"
-            >
-              <CheckCircleIcon className="h-3.5 w-3.5" />
-              {busy ? "Saving..." : "Approve Plan"}
-            </button>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => onReject(plan.id)}
-              className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-white/[0.1] bg-white/[0.04] px-3 py-2 text-xs font-medium text-slate-300 transition hover:bg-white/[0.08] disabled:opacity-50"
-            >
-              <XCircleIcon className="h-3.5 w-3.5" />
-              Reject
-            </button>
-          </div>
-        )}
-
-        {status === "approved" && (
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-sky-500/25 bg-sky-500/[0.06] p-2.5">
-            <span className="text-[11.5px] text-sky-200">
-              Approved and ready to execute via the host runtime bridge.
-            </span>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => onExecute(plan.id)}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 px-3.5 py-1.5 text-xs font-medium text-white transition hover:bg-sky-500 disabled:opacity-50"
-            >
-              {busy ? (
-                <SpinnerIcon className="h-3.5 w-3.5" />
-              ) : (
-                <TerminalIcon className="h-3.5 w-3.5" />
-              )}
-              {busy ? "Executing..." : "Execute Approved Plan"}
-            </button>
-          </div>
-        )}
-
-        {executionSummary && (
-          <div className="rounded-lg border border-emerald-500/30 bg-emerald-950/35 px-3 py-2 text-xs text-emerald-200">
-            {executionSummary}
-          </div>
-        )}
-      </div>
-    </div>
-  );
 }
 
 export function AgentChat({
@@ -490,12 +138,18 @@ export function AgentChat({
   onboardingPayload,
   metrics,
   apps,
+  auditEvents,
+  busyAppSlug,
   initialPrompt,
   onConsumeInitialPrompt,
   onOpenSetupWizard,
   onRefreshDashboard,
+  onLifecycle,
+  onInspectApp,
+  onNavigate,
   showInspector,
   onToggleInspector,
+  onNotify,
 }: AgentChatProps) {
   const [threads, setThreads] = useState<ChatThreadView[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
@@ -503,38 +157,112 @@ export function AgentChat({
   const [plansById, setPlansById] = useState<Record<string, ExecutionPlanView>>({});
   const [executionNotes, setExecutionNotes] = useState<Record<string, string>>({});
 
+  // Composer & T3-Code session controls
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<ChatMode>("agent");
+  const [effort, setEffort] = useState<ReasoningEffort>("medium");
+  const [mentionedSlugs, setMentionedSlugs] = useState<string[]>([]);
   const [pendingAttachments, setPendingAttachments] = useState<ChatAttachmentView[]>(
     [],
   );
+  const [queuedMessages, setQueuedMessages] = useState<QueuedChatMessage[]>([]);
+  const [promptHistory, setPromptHistory] = useState<string[]>([]);
   const [uploadingFiles, setUploadingFiles] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
 
+  // Streaming & live timing
   const [streaming, setStreaming] = useState(false);
+  const [streamingThreadId, setStreamingThreadId] = useState<string | null>(null);
+  const [elapsedMs, setElapsedMs] = useState(0);
   const [chatError, setChatError] = useState<string | null>(null);
   const [planBusyId, setPlanBusyId] = useState<string | null>(null);
+
+  // Layout & modals
   const [showThreadsRail, setShowThreadsRail] = useState(true);
-  const [showModelMenu, setShowModelMenu] = useState(false);
+  const [mobileThreadsOpen, setMobileThreadsOpen] = useState(false);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState<LlmProviderId | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [lightboxImage, setLightboxImage] = useState<string | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
 
+  // Refs for race-free streaming, queueing, steering & smart scroll
   const abortRef = useRef<AbortController | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const scrollAnchorRef = useRef<HTMLDivElement | null>(null);
+  const isNearBottomRef = useRef(true);
+  const activeThreadIdRef = useRef<string | null>(null);
+  const streamingRef = useRef(false);
+  const queuedMessagesRef = useRef<QueuedChatMessage[]>([]);
+  const steeredItemRef = useRef<QueuedChatMessage | null>(null);
+  const streamingThreadIdRef = useRef<string | null>(null);
+  const manualStopRef = useRef(false);
+  const streamStartedAtRef = useRef<number>(0);
+
+  useEffect(() => {
+    activeThreadIdRef.current = activeThreadId;
+  }, [activeThreadId]);
+
+  useEffect(() => {
+    queuedMessagesRef.current = queuedMessages;
+  }, [queuedMessages]);
+
+  const activeThread = useMemo(
+    () => threads.find((t) => t.id === activeThreadId) ?? null,
+    [threads, activeThreadId],
+  );
+
+  const activeQueuedMessages = useMemo(
+    () => queuedMessages.filter((q) => q.threadId === activeThreadId),
+    [queuedMessages, activeThreadId],
+  );
 
   const configuredProvider = onboardingPayload?.state.llmProvider ?? null;
   const configuredModel = onboardingPayload?.state.llmModel ?? null;
   const effectiveProvider = selectedProvider ?? configuredProvider;
   const effectiveModel = selectedModel ?? configuredModel;
 
-  const activeCatalogEntry = onboardingPayload?.providerCatalog.find(
-    (entry) => entry.id === effectiveProvider,
-  );
+  const latestAssistantId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === "assistant") {
+        return messages[i]!.id;
+      }
+    }
+    return null;
+  }, [messages]);
 
-  // Sync starter prompt coming from OnboardingWizard
+  const threadPlans = useMemo(() => {
+    const seen = new Set<string>();
+    const list: ExecutionPlanView[] = [];
+    for (const msg of messages) {
+      if (msg.planId && !seen.has(msg.planId)) {
+        const plan = plansById[msg.planId];
+        if (plan) {
+          seen.add(msg.planId);
+          list.push(plan);
+        }
+      }
+    }
+    return list;
+  }, [messages, plansById]);
+
+  const threadAttachments = useMemo(() => {
+    const seen = new Set<string>();
+    const list: ChatAttachmentView[] = [];
+    for (const msg of messages) {
+      for (const att of msg.attachments) {
+        if (!seen.has(att.id)) {
+          seen.add(att.id);
+          list.push(att);
+        }
+      }
+    }
+    return list;
+  }, [messages]);
+
+  // Sync starter prompt coming from Overview, Workloads, or OnboardingWizard
   useEffect(() => {
     if (initialPrompt && initialPrompt.trim()) {
       setInput(initialPrompt);
@@ -548,23 +276,67 @@ export function AgentChat({
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }, [input]);
 
-  // Auto-scroll to latest message while streaming or appending
+  // Close image lightbox on Escape
   useEffect(() => {
-    scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, streaming]);
+    if (!lightboxImage) return;
+    function handleKey(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setLightboxImage(null);
+      }
+    }
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [lightboxImage]);
+
+  // Live elapsed timer during streaming
+  useEffect(() => {
+    if (!streaming) {
+      setElapsedMs(0);
+      return;
+    }
+    streamStartedAtRef.current = Date.now();
+    setElapsedMs(0);
+    const id = window.setInterval(() => {
+      setElapsedMs(Date.now() - streamStartedAtRef.current);
+    }, 100);
+    return () => window.clearInterval(id);
+  }, [streaming]);
+
+  // Smart auto-scroll: follow output only if user hasn't scrolled up to read earlier turns
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = "smooth") => {
+    isNearBottomRef.current = true;
+    setShowJumpToLatest(false);
+    scrollAnchorRef.current?.scrollIntoView({ behavior, block: "end" });
+  }, []);
+
+  useEffect(() => {
+    if (isNearBottomRef.current) {
+      scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+  }, [messages, streaming]);
+
+  function handleMessageListScroll() {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isNearBottomRef.current = distanceFromBottom < 96;
+    setShowJumpToLatest(distanceFromBottom > 180);
+  }
 
   const loadThreads = useCallback(async () => {
     try {
       const res = await fetch("/api/chat/threads", { headers: authHeaders() });
       if (!res.ok) return;
       const data = (await res.json()) as { threads: ChatThreadView[] };
-      setThreads(data.threads);
+      const sorted = sortThreads(data.threads);
+      setThreads(sorted);
       setActiveThreadId((current) => {
-        if (current && data.threads.some((t) => t.id === current)) return current;
-        return data.threads[0]?.id ?? null;
+        if (current && sorted.some((t) => t.id === current)) return current;
+        const firstActive = sorted.find((t) => !t.archived);
+        return (firstActive ?? sorted[0])?.id ?? null;
       });
     } catch {
       // handled gracefully by top-level offline banner
@@ -573,6 +345,11 @@ export function AgentChat({
 
   const loadThreadMessages = useCallback(
     async (threadId: string) => {
+      // Never re-fetch over a live stream: switching back to the streaming
+      // thread must keep the in-flight messages intact.
+      if (streamingRef.current && streamingThreadIdRef.current === threadId) {
+        return;
+      }
       try {
         const res = await fetch(`/api/chat/threads/${encodeURIComponent(threadId)}`, {
           headers: authHeaders(),
@@ -583,8 +360,11 @@ export function AgentChat({
           messages: ChatMessageView[];
           plansById: Record<string, ExecutionPlanView>;
         };
+        if (activeThreadIdRef.current !== threadId) return;
         setMessages(data.messages);
         setPlansById((prev) => ({ ...prev, ...data.plansById }));
+        isNearBottomRef.current = true;
+        setShowJumpToLatest(false);
       } catch {
         // ignore transient network error
       }
@@ -604,8 +384,8 @@ export function AgentChat({
     }
   }, [activeThreadId, loadThreadMessages]);
 
-  async function ensureActiveThread(): Promise<string> {
-    if (activeThreadId) return activeThreadId;
+  const ensureActiveThread = useCallback(async (): Promise<string> => {
+    if (activeThreadIdRef.current) return activeThreadIdRef.current;
     const res = await fetch("/api/chat/threads", {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders() },
@@ -619,14 +399,16 @@ export function AgentChat({
       throw new Error(`Could not create conversation thread (${res.status}).`);
     }
     const data = (await res.json()) as { thread: ChatThreadView };
-    setThreads((prev) => [data.thread, ...prev]);
+    activeThreadIdRef.current = data.thread.id;
+    setThreads((prev) => sortThreads([data.thread, ...prev]));
     setActiveThreadId(data.thread.id);
     return data.thread.id;
-  }
+  }, [authHeaders, effectiveModel, effectiveProvider]);
 
   async function handleNewThread() {
     if (streaming) return;
     setChatError(null);
+    setMobileThreadsOpen(false);
     try {
       const res = await fetch("/api/chat/threads", {
         method: "POST",
@@ -639,35 +421,242 @@ export function AgentChat({
       });
       if (!res.ok) throw new Error("Failed to create new thread.");
       const data = (await res.json()) as { thread: ChatThreadView };
-      setThreads((prev) => [data.thread, ...prev]);
+      activeThreadIdRef.current = data.thread.id;
+      setThreads((prev) => sortThreads([data.thread, ...prev]));
       setActiveThreadId(data.thread.id);
       setMessages([]);
       setPendingAttachments([]);
+      setMentionedSlugs([]);
       textareaRef.current?.focus();
     } catch (err) {
       setChatError(err instanceof Error ? err.message : "Could not create thread.");
     }
   }
 
-  async function handleDeleteThread(threadId: string) {
-    if (streaming && threadId === activeThreadId) return;
+  async function handleRenameThread(threadId: string, title: string) {
     try {
       const res = await fetch(`/api/chat/threads/${encodeURIComponent(threadId)}`, {
-        method: "DELETE",
-        headers: authHeaders(),
+        method: "PATCH",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ title }),
       });
       if (!res.ok) return;
-      setThreads((prev) => {
-        const next = prev.filter((t) => t.id !== threadId);
-        if (activeThreadId === threadId) {
-          setActiveThreadId(next[0]?.id ?? null);
-          if (next.length === 0) setMessages([]);
-        }
-        return next;
-      });
+      const data = (await res.json()) as { thread: ChatThreadView };
+      setThreads((prev) =>
+        sortThreads(prev.map((t) => (t.id === threadId ? data.thread : t))),
+      );
+      onNotify("Renamed thread", "success");
     } catch {
       // ignore
     }
+  }
+
+  async function handleTogglePin(thread: ChatThreadView) {
+    const nextPinned = !thread.pinned;
+    try {
+      const res = await fetch(`/api/chat/threads/${encodeURIComponent(thread.id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ pinned: nextPinned }),
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as { thread: ChatThreadView };
+      setThreads((prev) =>
+        sortThreads(prev.map((t) => (t.id === thread.id ? data.thread : t))),
+      );
+      onNotify(nextPinned ? "Pinned thread" : "Unpinned thread", "info");
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleToggleArchive(thread: ChatThreadView) {
+    const nextArchived = !thread.archived;
+    try {
+      const res = await fetch(`/api/chat/threads/${encodeURIComponent(thread.id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ archived: nextArchived }),
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as { thread: ChatThreadView };
+      const updated = sortThreads(
+        threads.map((t) => (t.id === thread.id ? data.thread : t)),
+      );
+      setThreads(updated);
+      if (nextArchived && activeThreadId === thread.id) {
+        const fallback = updated.find((t) => !t.archived && t.id !== thread.id);
+        setActiveThreadId(fallback?.id ?? null);
+        if (!fallback) setMessages([]);
+      }
+      onNotify(nextArchived ? "Thread archived" : "Thread restored", "info");
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleForkThread(threadId: string, upToMessageId?: string) {
+    if (streaming) return;
+    setChatError(null);
+    try {
+      const res = await fetch(
+        `/api/chat/threads/${encodeURIComponent(threadId)}/fork`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", ...authHeaders() },
+          body: JSON.stringify({
+            ...(upToMessageId ? { upToMessageId } : {}),
+          }),
+        },
+      );
+      if (!res.ok) {
+        const payload = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(payload.error ?? `Fork failed (${res.status})`);
+      }
+      const data = (await res.json()) as {
+        thread: ChatThreadView;
+        messages: ChatMessageView[];
+        plansById: Record<string, ExecutionPlanView>;
+      };
+      activeThreadIdRef.current = data.thread.id;
+      setThreads((prev) => sortThreads([data.thread, ...prev]));
+      setActiveThreadId(data.thread.id);
+      setMessages(data.messages);
+      setPlansById((prev) => ({ ...prev, ...data.plansById }));
+      setMobileThreadsOpen(false);
+      onNotify(
+        "Forked conversation",
+        "success",
+        upToMessageId
+          ? "Branched into a new thread up to the selected turn."
+          : "Created an independent branch of this thread.",
+      );
+    } catch (err) {
+      setChatError(err instanceof Error ? err.message : "Could not fork thread.");
+    }
+  }
+
+  async function handleExportThread(threadId: string) {
+    try {
+      const res = await fetch(
+        `/api/chat/threads/${encodeURIComponent(threadId)}/export`,
+        { headers: authHeaders() },
+      );
+      if (!res.ok) {
+        throw new Error(`Export failed (${res.status})`);
+      }
+      const markdown = await res.text();
+      const target = threads.find((t) => t.id === threadId);
+      const slug =
+        (target?.title ?? "cto-thread")
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 48) || "cto-thread";
+      triggerTextDownload(`${slug}.md`, markdown, "text/markdown;charset=utf-8");
+      onNotify("Exported Markdown transcript", "success", `${slug}.md`);
+    } catch (err) {
+      onNotify(
+        "Could not export thread",
+        "error",
+        err instanceof Error ? err.message : undefined,
+      );
+    }
+  }
+
+  function requestClearThread(threadId: string) {
+    if (streaming || messages.length === 0) return;
+    setConfirmDialog({
+      title: "Clear conversation history?",
+      description:
+        "All messages in this thread will be cleared so you can start with a fresh context. Existing execution plans and workloads remain untouched.",
+      confirmLabel: "Clear Thread",
+      tone: "warning",
+      onConfirm: async () => {
+        setConfirmBusy(true);
+        try {
+          const res = await fetch(
+            `/api/chat/threads/${encodeURIComponent(threadId)}/clear`,
+            {
+              method: "POST",
+              headers: authHeaders(),
+            },
+          );
+          if (!res.ok) throw new Error(`Clear failed (${res.status})`);
+          const data = (await res.json()) as { thread?: ChatThreadView };
+          revokeAttachmentPreviews(messages.flatMap((m) => m.attachments));
+          const threadQueued = queuedMessages.filter(
+            (q) => q.threadId === threadId,
+          );
+          for (const q of threadQueued) {
+            revokeAttachmentPreviews(q.attachments);
+          }
+          const keptQueued = queuedMessages.filter(
+            (q) => q.threadId !== threadId,
+          );
+          queuedMessagesRef.current = keptQueued;
+          setMessages([]);
+          setQueuedMessages(keptQueued);
+          if (data.thread) {
+            setThreads((prev) =>
+              sortThreads(prev.map((t) => (t.id === threadId ? data.thread! : t))),
+            );
+          }
+          setConfirmDialog(null);
+          onNotify("Thread context cleared", "info");
+        } catch (err) {
+          onNotify(
+            "Could not clear thread",
+            "error",
+            err instanceof Error ? err.message : undefined,
+          );
+        } finally {
+          setConfirmBusy(false);
+        }
+      },
+    });
+  }
+
+  function requestDeleteThread(thread: ChatThreadView) {
+    if (streaming && thread.id === streamingThreadId) return;
+    setConfirmDialog({
+      title: `Delete "${thread.title}"?`,
+      description:
+        "This permanently deletes the conversation transcript from the local registry. Deployed apps and audit records are not affected.",
+      confirmLabel: "Delete Thread",
+      tone: "danger",
+      onConfirm: async () => {
+        setConfirmBusy(true);
+        try {
+          const res = await fetch(
+            `/api/chat/threads/${encodeURIComponent(thread.id)}`,
+            {
+              method: "DELETE",
+              headers: authHeaders(),
+            },
+          );
+          if (!res.ok) throw new Error(`Delete failed (${res.status})`);
+          const next = threads.filter((t) => t.id !== thread.id);
+          setThreads(next);
+          if (activeThreadId === thread.id) {
+            const fallback = next.find((t) => !t.archived) ?? next[0] ?? null;
+            activeThreadIdRef.current = fallback?.id ?? null;
+            setActiveThreadId(fallback?.id ?? null);
+            if (!fallback) setMessages([]);
+          }
+          setConfirmDialog(null);
+          onNotify("Conversation deleted", "info");
+        } catch (err) {
+          onNotify(
+            "Could not delete thread",
+            "error",
+            err instanceof Error ? err.message : undefined,
+          );
+        } finally {
+          setConfirmBusy(false);
+        }
+      },
+    });
   }
 
   async function uploadFiles(fileList: FileList | File[]) {
@@ -676,12 +665,12 @@ export function AgentChat({
 
     setUploadingFiles(true);
     setChatError(null);
+    const localPreviewByName = new Map<string, string>();
     try {
       const formData = new FormData();
       if (activeThreadId) {
         formData.append("threadId", activeThreadId);
       }
-      const localPreviewByName = new Map<string, string>();
       for (const file of files) {
         formData.append("files", file);
         if (file.type.startsWith("image/") && file.type !== "image/svg+xml") {
@@ -705,25 +694,12 @@ export function AgentChat({
       });
       setPendingAttachments((prev) => [...prev, ...hydrated].slice(0, 5));
     } catch (err) {
+      for (const preview of localPreviewByName.values()) {
+        URL.revokeObjectURL(preview);
+      }
       setChatError(err instanceof Error ? err.message : "File upload failed.");
     } finally {
       setUploadingFiles(false);
-    }
-  }
-
-  function handlePaste(event: ClipboardEvent<HTMLTextAreaElement>) {
-    const items = event.clipboardData?.items;
-    if (!items) return;
-    const files: File[] = [];
-    for (const item of Array.from(items)) {
-      if (item.kind === "file") {
-        const f = item.getAsFile();
-        if (f) files.push(f);
-      }
-    }
-    if (files.length > 0) {
-      event.preventDefault();
-      void uploadFiles(files);
     }
   }
 
@@ -756,220 +732,560 @@ export function AgentChat({
     });
   }
 
-  function handleStopStream() {
-    abortRef.current?.abort();
-    abortRef.current = null;
-    setStreaming(false);
+  function addMention(slug: string) {
+    setMentionedSlugs((prev) => (prev.includes(slug) ? prev : [...prev, slug]));
+    textareaRef.current?.focus();
   }
 
-  async function handleSend(promptOverride?: string) {
-    const text = (promptOverride ?? input).trim();
-    if (!text || streaming || uploadingFiles) return;
+  function removeMention(slug: string) {
+    setMentionedSlugs((prev) => prev.filter((s) => s !== slug));
+  }
 
-    setChatError(null);
-    setStreaming(true);
+  function recordPromptHistory(text: string) {
+    setPromptHistory((prev) => [text, ...prev.filter((p) => p !== text)].slice(0, 30));
+  }
 
-    const attachedToSend = [...pendingAttachments];
-    if (!promptOverride) {
-      setInput("");
-    }
-    setPendingAttachments([]);
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    try {
-      const threadId = await ensureActiveThread();
-
-      const res = await fetch(
-        `/api/chat/threads/${encodeURIComponent(threadId)}/messages`,
-        {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            accept: "text/event-stream",
-            ...authHeaders(),
-          },
-          body: JSON.stringify({
-            content: text,
-            mode,
-            attachmentIds: attachedToSend.map((a) => a.id),
-            ...(selectedProvider ? { provider: selectedProvider } : {}),
-            ...(selectedModel ? { model: selectedModel } : {}),
-            stream: true,
-          }),
-          signal: controller.signal,
-        },
-      );
-
-      if (!res.ok) {
-        const payload = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(payload.error ?? `API returned ${res.status}`);
-      }
-
-      if (!res.body) {
-        throw new Error("Streaming response unavailable.");
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let activeAssistantId: string | null = null;
-
-      const updateAssistant = (
-        updater: (msg: ChatMessageView) => ChatMessageView,
-      ) => {
-        if (!activeAssistantId) return;
-        const targetId = activeAssistantId;
-        setMessages((prev) =>
-          prev.map((msg) => (msg.id === targetId ? updater(msg) : msg)),
-        );
-      };
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        const frames = buffer.split("\n\n");
-        buffer = frames.pop() ?? "";
-
-        for (const frame of frames) {
-          const dataLine = frame
-            .split("\n")
-            .find((line) => line.startsWith("data:"));
-          if (!dataLine) continue;
-
-          let evt: Record<string, unknown>;
-          try {
-            evt = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
-          } catch {
-            continue;
+  function handleSelectProviderModel(provider: LlmProviderId, model: string) {
+    setSelectedProvider(provider);
+    setSelectedModel(model);
+    if (activeThreadId) {
+      void fetch(`/api/chat/threads/${encodeURIComponent(activeThreadId)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ provider, model }),
+      })
+        .then((res) => (res.ok ? (res.json() as Promise<{ thread: ChatThreadView }>) : null))
+        .then((data) => {
+          if (data?.thread) {
+            setThreads((prev) =>
+              sortThreads(prev.map((t) => (t.id === data.thread.id ? data.thread : t))),
+            );
           }
+        })
+        .catch(() => {
+          // non-blocking preference update
+        });
+    }
+  }
 
-          switch (evt.type) {
-            case "message_start": {
-              const userMsg = evt.userMessage as ChatMessageView;
-              const assistantMsg = evt.assistantMessage as ChatMessageView;
-              // Preserve localPreviewUrl on user attachments for instant thumbnail render
-              const mergedUserMsg: ChatMessageView = {
-                ...userMsg,
-                attachments: userMsg.attachments.map((att) => {
-                  const local = attachedToSend.find((a) => a.id === att.id);
-                  return local?.localPreviewUrl
-                    ? { ...att, localPreviewUrl: local.localPreviewUrl }
-                    : att;
-                }),
-              };
-              activeAssistantId = assistantMsg.id;
-              setMessages((prev) => [...prev, mergedUserMsg, assistantMsg]);
-              break;
+  const dispatchTurn = useCallback(
+    async (params: DispatchTurnParams) => {
+      const text = params.content.trim();
+      if (!text) return;
+
+      setChatError(null);
+      setStreaming(true);
+      streamingRef.current = true;
+      manualStopRef.current = false;
+      isNearBottomRef.current = true;
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      let threadId: string | null = null;
+      let activeAssistantId: string | null = null;
+      let wasSteered = false;
+      let turnFailed = false;
+
+      try {
+        threadId = params.targetThreadId ?? (await ensureActiveThread());
+        setStreamingThreadId(threadId);
+        streamingThreadIdRef.current = threadId;
+
+        const res = await fetch(
+          `/api/chat/threads/${encodeURIComponent(threadId)}/messages`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              accept: "text/event-stream",
+              ...authHeaders(),
+            },
+            body: JSON.stringify({
+              content: text,
+              mode: params.mode,
+              effort: params.effort,
+              mentionedSlugs: params.mentionedSlugs,
+              attachmentIds: params.attachments.map((a) => a.id),
+              ...(params.truncateFromMessageId
+                ? { truncateFromMessageId: params.truncateFromMessageId }
+                : {}),
+              ...(selectedProvider ? { provider: selectedProvider } : {}),
+              ...(selectedModel ? { model: selectedModel } : {}),
+              stream: true,
+            }),
+            signal: controller.signal,
+          },
+        );
+
+        if (!res.ok) {
+          const payload = (await res.json().catch(() => ({}))) as { error?: string };
+          throw new Error(payload.error ?? `API returned ${res.status}`);
+        }
+        if (!res.body) {
+          throw new Error("Streaming response unavailable.");
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        const updateAssistant = (
+          updater: (msg: ChatMessageView) => ChatMessageView,
+        ) => {
+          if (!activeAssistantId || activeThreadIdRef.current !== threadId) return;
+          const targetId = activeAssistantId;
+          setMessages((prev) =>
+            prev.map((msg) => (msg.id === targetId ? updater(msg) : msg)),
+          );
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() ?? "";
+
+          for (const frame of frames) {
+            const dataLine = frame
+              .split("\n")
+              .find((line) => line.startsWith("data:"));
+            if (!dataLine) continue;
+
+            let evt: Record<string, unknown>;
+            try {
+              evt = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
+            } catch {
+              continue;
             }
-            case "reasoning_start": {
-              const block = evt.block as ChatReasoningBlockView;
-              updateAssistant((msg) => ({
-                ...msg,
-                reasoning: [...msg.reasoning, block],
-              }));
-              break;
-            }
-            case "reasoning_delta": {
-              const blockId = evt.blockId as string;
-              const delta = evt.delta as string;
-              updateAssistant((msg) => ({
-                ...msg,
-                reasoning: msg.reasoning.map((b) =>
-                  b.id === blockId ? { ...b, content: b.content + delta } : b,
-                ),
-              }));
-              break;
-            }
-            case "reasoning_done": {
-              const block = evt.block as ChatReasoningBlockView;
-              updateAssistant((msg) => ({
-                ...msg,
-                reasoning: msg.reasoning.map((b) => (b.id === block.id ? block : b)),
-              }));
-              break;
-            }
-            case "tool_start": {
-              const toolCall = evt.toolCall as ChatToolCallView;
-              updateAssistant((msg) => ({
-                ...msg,
-                toolCalls: [...msg.toolCalls, toolCall],
-              }));
-              break;
-            }
-            case "tool_done": {
-              const toolCall = evt.toolCall as ChatToolCallView;
-              updateAssistant((msg) => ({
-                ...msg,
-                toolCalls: msg.toolCalls.map((t) =>
-                  t.id === toolCall.id ? toolCall : t,
-                ),
-              }));
-              break;
-            }
-            case "plan_created": {
-              const plan = evt.plan as ExecutionPlanView;
-              setPlansById((prev) => ({ ...prev, [plan.id]: plan }));
-              updateAssistant((msg) => ({ ...msg, planId: plan.id }));
-              break;
-            }
-            case "text_delta": {
-              const delta = evt.delta as string;
-              updateAssistant((msg) => ({
-                ...msg,
-                content: msg.content + delta,
-              }));
-              break;
-            }
-            case "message_done": {
-              const finalAssistant = evt.assistantMessage as ChatMessageView;
-              const finalPlan = evt.plan as ExecutionPlanView | null;
-              const threadTitle = evt.threadTitle as string;
-              if (finalPlan) {
-                setPlansById((prev) => ({ ...prev, [finalPlan.id]: finalPlan }));
+
+            switch (evt.type) {
+              case "message_start": {
+                const userMsg = evt.userMessage as ChatMessageView;
+                const assistantMsg = evt.assistantMessage as ChatMessageView;
+                const mergedUserMsg: ChatMessageView = {
+                  ...userMsg,
+                  attachments: userMsg.attachments.map((att) => {
+                    const local = params.attachments.find((a) => a.id === att.id);
+                    return local?.localPreviewUrl
+                      ? { ...att, localPreviewUrl: local.localPreviewUrl }
+                      : att;
+                  }),
+                };
+                activeAssistantId = assistantMsg.id;
+                if (activeThreadIdRef.current === threadId) {
+                  setMessages((prev) => [...prev, mergedUserMsg, assistantMsg]);
+                }
+                break;
               }
-              updateAssistant(() => finalAssistant);
-              setThreads((prev) =>
-                prev.map((t) =>
-                  t.id === threadId
-                    ? {
-                        ...t,
-                        title: threadTitle || t.title,
-                        provider: finalAssistant.provider,
-                        model: finalAssistant.model,
-                        messageCount: t.messageCount + 2,
-                        updatedAt: finalAssistant.createdAt,
-                      }
-                    : t,
-                ),
-              );
-              break;
-            }
-            case "error": {
-              const errMsg = evt.message as string;
-              setChatError(errMsg);
-              updateAssistant((msg) => ({
-                ...msg,
-                status: "error",
-                content: msg.content || `Error: ${errMsg}`,
-              }));
-              break;
+              case "reasoning_start": {
+                const block = evt.block as ChatReasoningBlockView;
+                updateAssistant((msg) => ({
+                  ...msg,
+                  reasoning: [...msg.reasoning, block],
+                }));
+                break;
+              }
+              case "reasoning_delta": {
+                const blockId = evt.blockId as string;
+                const delta = evt.delta as string;
+                updateAssistant((msg) => ({
+                  ...msg,
+                  reasoning: msg.reasoning.map((b) =>
+                    b.id === blockId ? { ...b, content: b.content + delta } : b,
+                  ),
+                }));
+                break;
+              }
+              case "reasoning_done": {
+                const block = evt.block as ChatReasoningBlockView;
+                updateAssistant((msg) => ({
+                  ...msg,
+                  reasoning: msg.reasoning.map((b) => (b.id === block.id ? block : b)),
+                }));
+                break;
+              }
+              case "tool_start": {
+                const toolCall = evt.toolCall as ChatToolCallView;
+                updateAssistant((msg) => ({
+                  ...msg,
+                  toolCalls: [...msg.toolCalls, toolCall],
+                }));
+                break;
+              }
+              case "tool_done": {
+                const toolCall = evt.toolCall as ChatToolCallView;
+                updateAssistant((msg) => ({
+                  ...msg,
+                  toolCalls: msg.toolCalls.map((t) =>
+                    t.id === toolCall.id ? toolCall : t,
+                  ),
+                }));
+                break;
+              }
+              case "plan_created": {
+                const plan = evt.plan as ExecutionPlanView;
+                setPlansById((prev) => ({ ...prev, [plan.id]: plan }));
+                updateAssistant((msg) => ({ ...msg, planId: plan.id }));
+                break;
+              }
+              case "text_delta": {
+                const delta = evt.delta as string;
+                updateAssistant((msg) => ({
+                  ...msg,
+                  content: msg.content + delta,
+                }));
+                break;
+              }
+              case "message_done": {
+                const finalAssistant = evt.assistantMessage as ChatMessageView;
+                const finalPlan = evt.plan as ExecutionPlanView | null;
+                const threadTitle = evt.threadTitle as string;
+                if (finalPlan) {
+                  setPlansById((prev) => ({ ...prev, [finalPlan.id]: finalPlan }));
+                }
+                updateAssistant(() => finalAssistant);
+                setThreads((prev) =>
+                  sortThreads(
+                    prev.map((t) =>
+                      t.id === threadId
+                        ? {
+                            ...t,
+                            title: threadTitle || t.title,
+                            provider: finalAssistant.provider,
+                            model: finalAssistant.model,
+                            messageCount: params.truncateFromMessageId
+                              ? Math.max(2, t.messageCount)
+                              : t.messageCount + 2,
+                            updatedAt: finalAssistant.createdAt,
+                          }
+                        : t,
+                    ),
+                  ),
+                );
+                break;
+              }
+              case "error": {
+                const errMsg = evt.message as string;
+                turnFailed = true;
+                setChatError(errMsg);
+                updateAssistant((msg) => ({
+                  ...msg,
+                  status: "error",
+                  content: msg.content || `Error: ${errMsg}`,
+                }));
+                break;
+              }
             }
           }
         }
-      }
 
-      void onRefreshDashboard();
-    } catch (err) {
-      if ((err as Error).name !== "AbortError") {
-        setChatError(err instanceof Error ? err.message : "Failed to send message.");
+        void onRefreshDashboard();
+        if (params.truncateFromMessageId) {
+          void loadThreads();
+        }
+      } catch (err) {
+        const isAbort = (err as Error).name === "AbortError";
+        if (isAbort) {
+          wasSteered = Boolean(steeredItemRef.current);
+          if (activeAssistantId && activeThreadIdRef.current === threadId) {
+            const targetId = activeAssistantId;
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === targetId && msg.status === "streaming"
+                  ? {
+                      ...msg,
+                      status: "completed",
+                      content:
+                        msg.content ||
+                        (wasSteered
+                          ? "_Interrupted to steer to follow-up._"
+                          : "_Response stopped._"),
+                    }
+                  : msg,
+              ),
+            );
+          }
+        } else {
+          turnFailed = true;
+          setChatError(err instanceof Error ? err.message : "Failed to send message.");
+        }
+      } finally {
+        abortRef.current = null;
+        streamingRef.current = false;
+        setStreaming(false);
+        setStreamingThreadId(null);
+        streamingThreadIdRef.current = null;
+
+        // Priority 1: Steered message takes immediate control after interrupting active turn
+        const steered = steeredItemRef.current;
+        if (steered) {
+          steeredItemRef.current = null;
+          queueMicrotask(() => {
+            void dispatchTurn({
+              content: steered.content,
+              mode: steered.mode,
+              effort: steered.effort,
+              mentionedSlugs: steered.mentionedSlugs,
+              attachments: steered.attachments,
+              targetThreadId: steered.threadId,
+            });
+          });
+        } else if (
+          !manualStopRef.current &&
+          !turnFailed &&
+          queuedMessagesRef.current.length > 0
+        ) {
+          // Priority 2: Auto-drain the next queued message belonging to the
+          // thread that just finished; paused when the turn errored.
+          const nextItem = queuedMessagesRef.current.find(
+            (q) => q.threadId === threadId,
+          );
+          if (nextItem) {
+            const rest = queuedMessagesRef.current.filter(
+              (q) => q.id !== nextItem.id,
+            );
+            queuedMessagesRef.current = rest;
+            setQueuedMessages(rest);
+            queueMicrotask(() => {
+              void dispatchTurn({
+                content: nextItem.content,
+                mode: nextItem.mode,
+                effort: nextItem.effort,
+                mentionedSlugs: nextItem.mentionedSlugs,
+                attachments: nextItem.attachments,
+                targetThreadId: nextItem.threadId,
+              });
+            });
+          }
+        }
+        manualStopRef.current = false;
       }
-    } finally {
-      abortRef.current = null;
-      setStreaming(false);
+    },
+    [
+      authHeaders,
+      ensureActiveThread,
+      loadThreads,
+      onRefreshDashboard,
+      selectedModel,
+      selectedProvider,
+    ],
+  );
+
+  function handleSendOrQueue() {
+    const text = input.trim();
+    if (!text || uploadingFiles) return;
+
+    recordPromptHistory(text);
+
+    const payload: DispatchTurnParams = {
+      content: text,
+      mode,
+      effort,
+      mentionedSlugs: [...mentionedSlugs],
+      attachments: [...pendingAttachments],
+    };
+
+    setInput("");
+    setMentionedSlugs([]);
+    setPendingAttachments([]);
+
+    if (streamingRef.current) {
+      const queued: QueuedChatMessage = {
+        id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        threadId: activeThreadIdRef.current,
+        content: payload.content,
+        mode: payload.mode,
+        effort: payload.effort,
+        mentionedSlugs: payload.mentionedSlugs,
+        attachments: payload.attachments,
+        createdAt: new Date().toISOString(),
+      };
+      const next = [...queuedMessagesRef.current, queued];
+      queuedMessagesRef.current = next;
+      setQueuedMessages(next);
+      return;
+    }
+
+    void dispatchTurn(payload);
+  }
+
+  function handleStopStream() {
+    manualStopRef.current = true;
+    const pendingSteer = steeredItemRef.current;
+    if (pendingSteer) {
+      // Restore the pending steer to the front of the queue instead of losing it.
+      const next = [pendingSteer, ...queuedMessagesRef.current];
+      queuedMessagesRef.current = next;
+      setQueuedMessages(next);
+    }
+    steeredItemRef.current = null;
+    abortRef.current?.abort();
+  }
+
+  function handleEditQueued(id: string, newContent: string) {
+    setQueuedMessages((prev) => {
+      const next = prev.map((item) =>
+        item.id === id ? { ...item, content: newContent } : item,
+      );
+      queuedMessagesRef.current = next;
+      return next;
+    });
+  }
+
+  function handleRemoveQueued(id: string) {
+    const removed = queuedMessagesRef.current.find((item) => item.id === id);
+    if (removed) {
+      revokeAttachmentPreviews(removed.attachments);
+    }
+    const next = queuedMessagesRef.current.filter((item) => item.id !== id);
+    queuedMessagesRef.current = next;
+    setQueuedMessages(next);
+  }
+
+  function handleSteerQueued(id: string) {
+    const target = queuedMessagesRef.current.find((item) => item.id === id);
+    if (!target) return;
+
+    let rest = queuedMessagesRef.current.filter((item) => item.id !== id);
+    // If a steer is already pending mid-interrupt, push it back to the front
+    // of the queue instead of silently discarding it.
+    const pendingSteer = steeredItemRef.current;
+    if (pendingSteer) {
+      rest = [pendingSteer, ...rest];
+    }
+    queuedMessagesRef.current = rest;
+    setQueuedMessages(rest);
+
+    if (streamingRef.current) {
+      manualStopRef.current = false;
+      steeredItemRef.current = target;
+      abortRef.current?.abort();
+    } else {
+      steeredItemRef.current = null;
+      void dispatchTurn({
+        content: target.content,
+        mode: target.mode,
+        effort: target.effort,
+        mentionedSlugs: target.mentionedSlugs,
+        attachments: target.attachments,
+        targetThreadId: target.threadId,
+      });
+    }
+  }
+
+  function handleMoveQueued(id: string, dir: -1 | 1) {
+    const current = queuedMessagesRef.current;
+    const idx = current.findIndex((q) => q.id === id);
+    if (idx === -1) return;
+    const item = current[idx]!;
+    // Only swap with the adjacent item queued for the same thread.
+    let neighbor = -1;
+    if (dir === -1) {
+      for (let i = idx - 1; i >= 0; i--) {
+        if (current[i]!.threadId === item.threadId) {
+          neighbor = i;
+          break;
+        }
+      }
+    } else {
+      for (let i = idx + 1; i < current.length; i++) {
+        if (current[i]!.threadId === item.threadId) {
+          neighbor = i;
+          break;
+        }
+      }
+    }
+    if (neighbor === -1) return;
+    const next = [...current];
+    next[idx] = current[neighbor]!;
+    next[neighbor] = item;
+    queuedMessagesRef.current = next;
+    setQueuedMessages(next);
+  }
+
+  function handleEditAndResend(messageId: string, newContent: string) {
+    if (streamingRef.current) return;
+    const idx = messages.findIndex((m) => m.id === messageId);
+    if (idx === -1) return;
+    const existing = messages[idx]!;
+    // Revoke blob previews of the dropped turns, but keep the ones resent below.
+    const preservedIds = new Set(existing.attachments.map((a) => a.id));
+    for (const removed of messages.slice(idx + 1)) {
+      revokeAttachmentPreviews(
+        removed.attachments.filter((a) => !preservedIds.has(a.id)),
+      );
+    }
+    setMessages((prev) => prev.slice(0, idx));
+    recordPromptHistory(newContent);
+    void dispatchTurn({
+      content: newContent,
+      mode,
+      effort,
+      mentionedSlugs: [...mentionedSlugs],
+      attachments: existing.attachments,
+      truncateFromMessageId: messageId,
+    });
+  }
+
+  function handleRegenerate(assistantMessageId: string) {
+    if (streamingRef.current) return;
+    const assistantIdx = messages.findIndex((m) => m.id === assistantMessageId);
+    if (assistantIdx <= 0) return;
+
+    let prevUserIdx = -1;
+    for (let i = assistantIdx - 1; i >= 0; i--) {
+      if (messages[i]?.role === "user") {
+        prevUserIdx = i;
+        break;
+      }
+    }
+    if (prevUserIdx === -1) return;
+
+    const prevUser = messages[prevUserIdx]!;
+    // Revoke blob previews of the dropped turns, but keep the resent user
+    // message's attachments alive.
+    const preservedIds = new Set(prevUser.attachments.map((a) => a.id));
+    for (const removed of messages.slice(prevUserIdx + 1)) {
+      revokeAttachmentPreviews(
+        removed.attachments.filter((a) => !preservedIds.has(a.id)),
+      );
+    }
+    setMessages((prev) => prev.slice(0, prevUserIdx));
+    void dispatchTurn({
+      content: prevUser.content,
+      mode,
+      effort,
+      mentionedSlugs: [...mentionedSlugs],
+      attachments: prevUser.attachments,
+      truncateFromMessageId: prevUser.id,
+    });
+  }
+
+  function handleRunSlashAction(cmd: SlashCommandItem) {
+    if (cmd.action === "mode-plan") {
+      setMode("plan");
+      onNotify("Switched to Plan mode", "info", "Requests will generate approval-gated plans.");
+      return;
+    }
+    if (cmd.action === "fork") {
+      if (activeThreadId) {
+        void handleForkThread(activeThreadId);
+      }
+      return;
+    }
+    if (cmd.action === "export") {
+      if (activeThreadId) {
+        void handleExportThread(activeThreadId);
+      }
+      return;
+    }
+    if (cmd.action === "clear") {
+      if (activeThreadId) {
+        requestClearThread(activeThreadId);
+      }
     }
   }
 
@@ -983,7 +1299,7 @@ export function AgentChat({
         body: JSON.stringify({
           planId,
           approved,
-          decidedBy: "dashboard-admin",
+          decidedBy: onboardingPayload?.state.persona.ownerName || "dashboard-admin",
         }),
       });
       if (!res.ok) {
@@ -992,6 +1308,10 @@ export function AgentChat({
       }
       const data = (await res.json()) as { plan: ExecutionPlanView };
       setPlansById((prev) => ({ ...prev, [data.plan.id]: data.plan }));
+      onNotify(
+        approved ? "Execution plan approved" : "Execution plan rejected",
+        approved ? "success" : "info",
+      );
       void onRefreshDashboard();
     } catch (err) {
       setChatError(err instanceof Error ? err.message : "Could not record approval.");
@@ -1019,6 +1339,7 @@ export function AgentChat({
       };
       setPlansById((prev) => ({ ...prev, [data.plan.id]: data.plan }));
       setExecutionNotes((prev) => ({ ...prev, [planId]: data.execution.summary }));
+      onNotify("Plan executed", "success", data.execution.summary);
       void onRefreshDashboard();
     } catch (err) {
       setChatError(err instanceof Error ? err.message : "Could not execute plan.");
@@ -1027,29 +1348,22 @@ export function AgentChat({
     }
   }
 
-  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      void handleSend();
-    }
-  }
-
   return (
     <div
-      className="relative flex h-[calc(100vh-53px)] min-h-[540px] overflow-hidden bg-[#090a0e]"
+      className="relative flex h-[calc(100vh-56px)] min-h-[520px] overflow-hidden bg-[var(--bg-canvas)]"
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       {/* Drag-and-drop overlay */}
       {isDragging && (
-        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-sky-950/50 backdrop-blur-xs">
-          <div className="rounded-2xl border-2 border-dashed border-sky-400/70 bg-[#0d111a]/95 px-8 py-6 text-center shadow-2xl">
-            <PaperclipIcon className="mx-auto h-7 w-7 text-sky-400" />
-            <p className="mt-2 text-sm font-semibold text-slate-100">
+        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-[var(--bg-backdrop)] backdrop-blur-xs">
+          <div className="vps-elevated rounded-2xl border-2 border-dashed border-[var(--accent)] px-8 py-6 text-center">
+            <PaperclipIcon className="mx-auto h-7 w-7 text-[var(--accent)]" />
+            <p className="mt-2 text-sm font-semibold text-[var(--text-primary)]">
               Drop files to attach to your CTO prompt
             </p>
-            <p className="mt-1 text-xs text-slate-400">
+            <p className="mt-1 text-xs text-[var(--text-secondary)]">
               Images, Dockerfiles, Compose YAML, Caddyfiles, logs, JSON, scripts (up to 5 MB)
             </p>
           </div>
@@ -1083,247 +1397,239 @@ export function AgentChat({
         </div>
       )}
 
-      {/* Left Threads Rail */}
+      {/* Left Threads Rail (Desktop) */}
       {showThreadsRail && (
-        <aside className="hidden w-64 shrink-0 flex-col border-r border-white/[0.07] bg-[#0d0f15] md:flex">
-          <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] p-3">
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-              Threads
-            </span>
-            <button
-              type="button"
-              onClick={() => void handleNewThread()}
-              disabled={streaming}
-              className="inline-flex items-center gap-1 rounded-lg border border-white/[0.1] bg-white/[0.04] px-2.5 py-1 text-xs font-medium text-slate-200 transition hover:bg-white/[0.08] disabled:opacity-50"
-            >
-              <PlusIcon className="h-3.5 w-3.5" />
-              New
-            </button>
-          </div>
-
-          <div className="flex-1 space-y-1 overflow-y-auto p-2">
-            {threads.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-white/[0.07] p-4 text-center text-xs text-slate-500">
-                Start a conversation below to inspect your VPS or deploy apps.
-              </div>
-            ) : (
-              threads.map((thread) => {
-                const active = thread.id === activeThreadId;
-                return (
-                  <div
-                    key={thread.id}
-                    className={`group flex items-center gap-2 rounded-xl px-2.5 py-2 text-left transition ${
-                      active
-                        ? "bg-white/[0.08] text-slate-100"
-                        : "text-slate-400 hover:bg-white/[0.04] hover:text-slate-200"
-                    }`}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => setActiveThreadId(thread.id)}
-                      className="min-w-0 flex-1 text-left"
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <MessageSquareIcon className="h-3.5 w-3.5 shrink-0 text-slate-500" />
-                        <span className="truncate text-xs font-medium">
-                          {thread.title}
-                        </span>
-                      </div>
-                      <div className="mt-0.5 flex items-center gap-1.5 pl-5 text-[10.5px] text-slate-500">
-                        <span>{formatRelativeTime(thread.updatedAt)}</span>
-                        {thread.provider && (
-                          <>
-                            <span>·</span>
-                            <span className="truncate">
-                              {providerDisplayName(thread.provider)}
-                            </span>
-                          </>
-                        )}
-                      </div>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleDeleteThread(thread.id)}
-                      className="rounded p-1 text-slate-500 opacity-0 transition hover:bg-white/[0.08] hover:text-rose-300 group-hover:opacity-100"
-                      title="Delete thread"
-                      aria-label={`Delete thread ${thread.title}`}
-                    >
-                      <TrashIcon className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          {/* Pinned Host Telemetry Mini-Card */}
-          <div className="border-t border-white/[0.06] p-3">
-            <div className="rounded-xl border border-white/[0.07] bg-[#12151d] p-3">
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="inline-flex items-center gap-1.5 font-medium text-slate-300">
-                  <ServerIcon className="h-3.5 w-3.5 text-sky-400" />
-                  {metrics?.hostname ?? "VPS Host"}
-                </span>
-                <span className="font-mono text-[10px] text-slate-500">
-                  {apps.length} app{apps.length === 1 ? "" : "s"}
-                </span>
-              </div>
-              {metrics && (
-                <div className="mt-2.5 space-y-2">
-                  <div>
-                    <div className="flex justify-between text-[10.5px] text-slate-400">
-                      <span>RAM</span>
-                      <span className="font-mono">{metrics.memoryUsagePercent}%</span>
-                    </div>
-                    <div className="mt-1 h-1 overflow-hidden rounded-full bg-white/[0.08]">
-                      <div
-                        className="h-full rounded-full bg-sky-400"
-                        style={{
-                          width: `${Math.min(100, metrics.memoryUsagePercent)}%`,
-                        }}
-                      />
-                    </div>
-                  </div>
-                  {metrics.disk && (
-                    <div>
-                      <div className="flex justify-between text-[10.5px] text-slate-400">
-                        <span>Disk</span>
-                        <span className="font-mono">{metrics.disk.usagePercent}%</span>
-                      </div>
-                      <div className="mt-1 h-1 overflow-hidden rounded-full bg-white/[0.08]">
-                        <div
-                          className="h-full rounded-full bg-emerald-400"
-                          style={{
-                            width: `${Math.min(100, metrics.disk.usagePercent)}%`,
-                          }}
-                        />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        </aside>
+        <ChatThreadRail
+          threads={threads}
+          activeThreadId={activeThreadId}
+          streamingThreadId={streamingThreadId}
+          streaming={streaming}
+          onSelectThread={(id) => {
+            setActiveThreadId(id);
+            setChatError(null);
+          }}
+          onNewThread={() => void handleNewThread()}
+          onRenameThread={handleRenameThread}
+          onTogglePin={handleTogglePin}
+          onToggleArchive={handleToggleArchive}
+          onForkThread={(id) => handleForkThread(id)}
+          onRequestDeleteThread={requestDeleteThread}
+        />
       )}
 
-      {/* Center Conversation Stage */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        {/* Sub-toolbar */}
-        <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] bg-[#0b0d13]/80 px-4 py-2">
+      {/* Left Threads Drawer (Mobile) */}
+      {mobileThreadsOpen && (
+        <div
+          className="fixed inset-0 z-50 flex bg-[var(--bg-backdrop)] backdrop-blur-xs md:hidden"
+          onClick={() => setMobileThreadsOpen(false)}
+        >
+          <div
+            className="flex h-full w-72 bg-[var(--bg-rail)] shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <ChatThreadRail
+              threads={threads}
+              activeThreadId={activeThreadId}
+              streamingThreadId={streamingThreadId}
+              streaming={streaming}
+              className="flex h-full w-full flex-col border-r border-[var(--border-subtle)] bg-[var(--bg-rail)]"
+              onSelectThread={(id) => {
+                setActiveThreadId(id);
+                setMobileThreadsOpen(false);
+                setChatError(null);
+              }}
+              onNewThread={() => void handleNewThread()}
+              onRenameThread={handleRenameThread}
+              onTogglePin={handleTogglePin}
+              onToggleArchive={handleToggleArchive}
+              onForkThread={(id) => handleForkThread(id)}
+              onRequestDeleteThread={requestDeleteThread}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Center Conversation Canvas */}
+      <div className="relative flex min-w-0 flex-1 flex-col">
+        {/* T3-Code Thread Sub-Toolbar (solid surface, zero sticky backdrop glitch) */}
+        <div className="flex items-center justify-between gap-2 border-b border-[var(--border-subtle)] bg-[var(--bg-canvas)] px-3 py-2 sm:px-5">
           <div className="flex min-w-0 items-center gap-2">
+            {/* Desktop rail toggle */}
             <button
               type="button"
               onClick={() => setShowThreadsRail((prev) => !prev)}
-              className="hidden rounded-lg p-1.5 text-slate-400 transition hover:bg-white/[0.06] hover:text-slate-200 md:inline-flex"
-              title={showThreadsRail ? "Hide threads" : "Show threads"}
+              className="hidden rounded-lg p-1.5 text-[var(--text-secondary)] transition hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] md:inline-flex"
+              title={showThreadsRail ? "Hide threads panel" : "Show threads panel"}
               aria-label="Toggle threads sidebar"
             >
               <PanelLeftIcon className="h-4 w-4" />
             </button>
+            {/* Mobile drawer toggle */}
             <button
               type="button"
-              onClick={() => void handleNewThread()}
-              disabled={streaming}
-              className="inline-flex items-center gap-1 rounded-lg border border-white/[0.08] bg-white/[0.03] px-2 py-1 text-xs text-slate-300 hover:bg-white/[0.07] md:hidden"
+              onClick={() => setMobileThreadsOpen(true)}
+              className="inline-flex rounded-lg p-1.5 text-[var(--text-secondary)] transition hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] md:hidden"
+              title="Open threads"
+              aria-label="Open threads drawer"
             >
-              <PlusIcon className="h-3.5 w-3.5" />
-              New
+              <PanelLeftIcon className="h-4 w-4" />
             </button>
-            <h2 className="truncate text-xs font-medium text-slate-200">
-              {threads.find((t) => t.id === activeThreadId)?.title ??
-                "New CTO Conversation"}
-            </h2>
+
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="truncate text-xs font-semibold text-[var(--text-primary)]">
+                {activeThread?.title ?? "CTO Agent Studio"}
+              </span>
+              {activeThread?.parentThreadId && (
+                <span className="hidden items-center gap-1 rounded-full border border-[var(--violet-border)] bg-[var(--violet-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--violet)] sm:inline-flex">
+                  <GitForkIcon className="h-2.5 w-2.5" />
+                  Forked
+                </span>
+              )}
+              {activeThread?.archived && (
+                <span className="inline-flex items-center gap-1 rounded-full border border-[var(--warning-border)] bg-[var(--warning-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--warning)]">
+                  <ArchiveIcon className="h-2.5 w-2.5" />
+                  Archived
+                </span>
+              )}
+            </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onOpenSetupWizard}
-              className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.09] bg-white/[0.03] px-2.5 py-1 text-[11px] font-medium text-slate-300 transition hover:border-sky-500/40 hover:text-sky-200"
-            >
-              <span
-                className={`h-1.5 w-1.5 rounded-full ${
-                  onboardingPayload?.state.llmConfigured
-                    ? "bg-emerald-400"
-                    : "bg-amber-400"
-                }`}
-              />
-              <span>
-                {effectiveProvider
-                  ? `${providerDisplayName(effectiveProvider)}${
-                      effectiveModel ? ` · ${effectiveModel}` : ""
-                    }`
-                  : "Connect OpenCode / AI Provider"}
-              </span>
-            </button>
+          <div className="flex shrink-0 items-center gap-1">
+            {activeThread && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void handleTogglePin(activeThread)}
+                  className={`rounded-lg p-1.5 transition hover:bg-[var(--bg-hover)] ${
+                    activeThread.pinned
+                      ? "text-[var(--accent)]"
+                      : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                  }`}
+                  title={activeThread.pinned ? "Unpin thread" : "Pin thread"}
+                  aria-label={activeThread.pinned ? "Unpin thread" : "Pin thread"}
+                >
+                  <PinIcon className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  disabled={streaming}
+                  onClick={() => void handleForkThread(activeThread.id)}
+                  className="rounded-lg p-1.5 text-[var(--text-secondary)] transition hover:bg-[var(--bg-hover)] hover:text-[var(--violet)] disabled:opacity-40"
+                  title="Fork thread (/fork)"
+                  aria-label="Fork thread"
+                >
+                  <GitForkIcon className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  disabled={messages.length === 0}
+                  onClick={() => void handleExportThread(activeThread.id)}
+                  className="rounded-lg p-1.5 text-[var(--text-secondary)] transition hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40"
+                  title="Export Markdown (/export)"
+                  aria-label="Export conversation as Markdown"
+                >
+                  <DownloadIcon className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  disabled={streaming || messages.length === 0}
+                  onClick={() => requestClearThread(activeThread.id)}
+                  className="rounded-lg p-1.5 text-[var(--text-secondary)] transition hover:bg-[var(--bg-hover)] hover:text-[var(--danger)] disabled:opacity-40"
+                  title="Clear messages (/clear)"
+                  aria-label="Clear thread messages"
+                >
+                  <TrashIcon className="h-3.5 w-3.5" />
+                </button>
+              </>
+            )}
+
+            <span className="mx-0.5 hidden h-4 w-px bg-[var(--border-subtle)] xl:inline-block" />
+
             <button
               type="button"
               onClick={onToggleInspector}
-              className={`hidden rounded-lg p-1.5 transition lg:inline-flex ${
+              className={`hidden items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition xl:inline-flex ${
                 showInspector
-                  ? "bg-white/[0.08] text-sky-300"
-                  : "text-slate-400 hover:bg-white/[0.06] hover:text-slate-200"
+                  ? "border-[var(--accent-border)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                  : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
               }`}
-              title={showInspector ? "Hide server inspector" : "Show server inspector"}
-              aria-label="Toggle server inspector"
+              title="Toggle thread context & live server inspector"
             >
-              <PanelRightIcon className="h-4 w-4" />
+              <PanelRightIcon className="h-3.5 w-3.5" />
+              Context
             </button>
           </div>
         </div>
 
-        {/* Scrollable Message Stream */}
-        <div className="flex-1 overflow-y-auto px-4 py-6 sm:px-6">
+        {/* Messages Scroll Viewport with anchored "Jump to latest" pill */}
+        <div className="relative min-h-0 flex-1">
+        <div
+          ref={scrollContainerRef}
+          onScroll={handleMessageListScroll}
+          className="h-full overflow-y-auto px-4 py-6 sm:px-6"
+        >
           <div className="mx-auto max-w-3xl space-y-6">
             {messages.length === 0 ? (
-              <div className="py-10">
-                <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-2xl border border-sky-500/25 bg-sky-500/10 text-sky-300">
-                  <SparklesIcon className="h-5 w-5" />
+              <div className="flex flex-col items-center justify-center py-8 text-center sm:py-12">
+                <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-[var(--accent-border)] bg-[var(--accent-soft)] text-[var(--accent)] shadow-sm">
+                  <SparklesIcon className="h-6 w-6" />
                 </div>
-                <h3 className="mt-4 text-center text-lg font-semibold tracking-tight text-slate-100">
-                  Autonomous VPS CTO
-                </h3>
-                <p className="mx-auto mt-1.5 max-w-md text-center text-xs leading-relaxed text-slate-400">
-                  Inspect live host telemetry, analyze uploaded Dockerfiles or logs,
-                  and deploy isolated Locked Apartment apps with step-by-step
-                  reasoning, tool traces, and approval gates.
+                <h2 className="mt-4 text-2xl font-semibold tracking-tight text-[var(--text-primary)]">
+                  Autonomous CTO Agent
+                </h2>
+                <p className="mt-2 max-w-lg text-sm leading-relaxed text-[var(--text-secondary)]">
+                  Inspect telemetry, attach screenshots or configs, type{" "}
+                  <span className="font-mono text-[var(--accent)]">@</span> to ground
+                  answers in live workloads, queue follow-ups mid-turn, or switch between{" "}
+                  <strong className="text-[var(--text-primary)]">Agent</strong>,{" "}
+                  <strong className="text-[var(--warning)]">Plan</strong>, and{" "}
+                  <strong className="text-[var(--success)]">Ask</strong> modes with{" "}
+                  <kbd className="vps-kbd">Shift+Tab</kbd>.
                 </p>
 
                 {!onboardingPayload?.state.llmConfigured && (
-                  <div className="mx-auto mt-5 flex max-w-lg flex-wrap items-center justify-between gap-3 rounded-xl border border-sky-500/25 bg-sky-500/[0.06] px-4 py-3 text-xs">
-                    <span className="text-slate-300">
-                      Want live agentic LLM reasoning? Connect{" "}
-                      <strong className="text-sky-300">OpenCode</strong> directly in
-                      Setup Wizard.
+                  <div className="mt-5 flex flex-wrap items-center justify-center gap-2 rounded-xl border border-[var(--warning-border)] bg-[var(--warning-soft)] px-4 py-2.5 text-xs text-[var(--warning)]">
+                    <span>
+                      Running built-in deterministic CTO planner. Connect OpenCode,
+                      OpenAI, Claude, or Ollama for full reasoning.
                     </span>
                     <button
                       type="button"
                       onClick={onOpenSetupWizard}
-                      className="rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500"
+                      className="rounded-lg bg-amber-500/20 px-2.5 py-1 font-semibold hover:bg-amber-500/30"
                     >
-                      Configure OpenCode
+                      Configure AI
                     </button>
                   </div>
                 )}
 
-                <div className="mt-7 grid gap-2.5 sm:grid-cols-2">
+                <div className="mt-7 grid w-full gap-3 text-left sm:grid-cols-2">
                   {STARTER_CARDS.map((card) => (
                     <button
                       key={card.title}
                       type="button"
-                      onClick={() => void handleSend(card.prompt)}
-                      className="group rounded-xl border border-white/[0.08] bg-[#11141c] p-3.5 text-left transition hover:border-sky-500/40 hover:bg-[#151924]"
+                      onClick={() => {
+                        setMode(card.mode);
+                        recordPromptHistory(card.prompt);
+                        void dispatchTurn({
+                          content: card.prompt,
+                          mode: card.mode,
+                          effort,
+                          mentionedSlugs: [],
+                          attachments: [],
+                        });
+                      }}
+                      className="vps-card group rounded-2xl p-4 text-left transition hover:border-[var(--accent-border)]"
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-slate-100 group-hover:text-sky-200">
+                        <span className="text-xs font-semibold text-[var(--text-primary)] group-hover:text-[var(--accent)]">
                           {card.title}
                         </span>
-                        <span className="rounded bg-white/[0.05] px-1.5 py-0.5 text-[10px] text-slate-400">
+                        <span className="rounded-full border border-[var(--border-subtle)] bg-[var(--bg-inset)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-muted)]">
                           {card.tag}
                         </span>
                       </div>
-                      <p className="mt-1.5 text-[11.5px] leading-snug text-slate-400">
+                      <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-[var(--text-secondary)]">
                         {card.prompt}
                       </p>
                     </button>
@@ -1331,366 +1637,391 @@ export function AgentChat({
                 </div>
               </div>
             ) : (
-              messages.map((msg) => {
-                if (msg.role === "user") {
-                  return (
-                    <div key={msg.id} className="flex justify-end">
-                      <div className="max-w-[85%] space-y-2 rounded-2xl border border-white/[0.09] bg-[#161a24] px-4 py-3 text-[13.5px] leading-relaxed text-slate-100 shadow-sm">
-                        {msg.attachments.length > 0 && (
-                          <div className="flex flex-wrap gap-2 pb-1">
-                            {msg.attachments.map((att) =>
-                              att.kind === "image" ? (
-                                <AuthAttachmentImage
-                                  key={att.id}
-                                  attachment={att}
-                                  authHeaders={authHeaders}
-                                  onClick={(src) => setLightboxImage(src)}
-                                />
-                              ) : (
-                                <div
-                                  key={att.id}
-                                  className="inline-flex items-center gap-1.5 rounded-lg border border-white/[0.09] bg-black/30 px-2.5 py-1.5 text-[11.5px] text-slate-300"
-                                >
-                                  <FileTextIcon className="h-3.5 w-3.5 text-sky-400" />
-                                  <span className="max-w-[180px] truncate font-medium">
-                                    {att.name}
-                                  </span>
-                                  <span className="text-[10px] text-slate-500">
-                                    {formatBytes(att.sizeBytes)}
-                                  </span>
-                                </div>
-                              ),
-                            )}
-                          </div>
-                        )}
-                        <p className="whitespace-pre-wrap break-words">{msg.content}</p>
-                      </div>
-                    </div>
-                  );
-                }
-
-                const linkedPlan = msg.planId ? plansById[msg.planId] : null;
-
+              messages.map((message) => {
+                const linkedPlan = message.planId
+                  ? plansById[message.planId] ?? null
+                  : null;
                 return (
-                  <div key={msg.id} className="space-y-3">
-                    {/* Assistant Turn Header */}
-                    <div className="flex items-center gap-2 text-[11px] text-slate-400">
-                      <span className="flex h-6 w-6 items-center justify-center rounded-lg border border-sky-500/25 bg-sky-500/10 text-sky-300">
-                        <SparklesIcon className="h-3.5 w-3.5" />
-                      </span>
-                      <span className="font-semibold text-slate-200">
-                        {providerDisplayName(msg.provider)}
-                      </span>
-                      {msg.model && (
-                        <span className="rounded-md border border-white/[0.07] bg-white/[0.03] px-1.5 py-0.5 font-mono text-[10.5px] text-slate-400">
-                          {msg.model}
-                        </span>
-                      )}
-                      {msg.status === "streaming" ? (
-                        <span className="inline-flex items-center gap-1 text-sky-300">
-                          <SpinnerIcon className="h-3 w-3" />
-                          Working
-                        </span>
-                      ) : (
-                        <span className="text-slate-600">
-                          {new Date(msg.createdAt).toLocaleTimeString([], {
-                            hour: "2-digit",
-                            minute: "2-digit",
-                          })}
-                        </span>
-                      )}
-                    </div>
-
-                    <div className="space-y-2.5 pl-8">
-                      {/* Reasoning Traces */}
-                      {msg.reasoning.length > 0 && (
-                        <div className="space-y-2">
-                          {msg.reasoning.map((block) => (
-                            <ReasoningTraceCard key={block.id} block={block} />
-                          ))}
-                        </div>
-                      )}
-
-                      {/* Tool Call Activity Stack */}
-                      {msg.toolCalls.length > 0 && (
-                        <div className="space-y-1.5">
-                          <div className="flex items-center gap-1.5 text-[10.5px] font-medium uppercase tracking-wider text-slate-500">
-                            <WrenchIcon className="h-3 w-3" />
-                            <span>
-                              {msg.toolCalls.length} tool
-                              {msg.toolCalls.length === 1 ? "" : "s"} called
-                            </span>
-                          </div>
-                          {msg.toolCalls.map((toolCall) => (
-                            <ToolCallCard key={toolCall.id} toolCall={toolCall} />
-                          ))}
-                        </div>
-                      )}
-
-                      {/* Inline Execution Plan Card */}
-                      {linkedPlan && (
-                        <InlinePlanCard
-                          plan={linkedPlan}
-                          busy={planBusyId === linkedPlan.id}
-                          executionSummary={executionNotes[linkedPlan.id]}
-                          onApprove={(id) => void handlePlanDecision(id, true)}
-                          onReject={(id) => void handlePlanDecision(id, false)}
-                          onExecute={(id) => void handleExecutePlan(id)}
-                        />
-                      )}
-
-                      {/* Markdown Answer Body */}
-                      {msg.content && (
-                        <div className="pt-0.5">
-                          <MarkdownContent content={msg.content} />
-                        </div>
-                      )}
-                    </div>
-                  </div>
+                  <ChatTurnItem
+                    key={message.id}
+                    message={message}
+                    isLatestAssistant={message.id === latestAssistantId}
+                    linkedPlan={linkedPlan}
+                    streaming={streaming}
+                    elapsedMs={elapsedMs}
+                    planBusyId={planBusyId}
+                    executionSummary={
+                      linkedPlan ? executionNotes[linkedPlan.id] : undefined
+                    }
+                    authHeaders={authHeaders}
+                    onOpenLightbox={setLightboxImage}
+                    onEditAndResend={handleEditAndResend}
+                    onRegenerate={handleRegenerate}
+                    onForkFromMessage={(msgId) => {
+                      if (activeThreadId) {
+                        void handleForkThread(activeThreadId, msgId);
+                      }
+                    }}
+                    onApprovePlan={(id) => void handlePlanDecision(id, true)}
+                    onRejectPlan={(id) => void handlePlanDecision(id, false)}
+                    onExecutePlan={(id) => void handleExecutePlan(id)}
+                  />
                 );
               })
             )}
-
-            {chatError && (
-              <div
-                role="alert"
-                className="flex items-center justify-between gap-2 rounded-xl border border-rose-500/35 bg-rose-950/35 px-4 py-2.5 text-xs text-rose-200"
-              >
-                <span>{chatError}</span>
-                <button
-                  type="button"
-                  onClick={() => setChatError(null)}
-                  className="rounded p-0.5 hover:bg-rose-500/20"
-                  aria-label="Dismiss error"
-                >
-                  <XIcon className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            )}
-
             <div ref={scrollAnchorRef} />
           </div>
         </div>
 
-        {/* Floating T3 Code-Style Composer */}
-        <div className="border-t border-white/[0.06] bg-[#090a0e]/95 px-4 pt-3 pb-4 sm:px-6">
-          <div className="mx-auto max-w-3xl">
-            <div className="rounded-2xl border border-white/[0.1] bg-[#12151e] shadow-xl transition focus-within:border-sky-500/50 focus-within:ring-1 focus-within:ring-sky-500/25">
-              {/* Attachment Tray */}
-              {(pendingAttachments.length > 0 || uploadingFiles) && (
-                <div className="flex flex-wrap items-center gap-2 border-b border-white/[0.06] px-3.5 py-2.5">
-                  {pendingAttachments.map((att) => (
-                    <div
-                      key={att.id}
-                      className="group relative flex items-center gap-2 rounded-xl border border-white/[0.09] bg-[#181c28] px-2.5 py-1.5 text-xs text-slate-200"
-                    >
-                      {att.kind === "image" && att.localPreviewUrl ? (
-                        <img
-                          src={att.localPreviewUrl}
-                          alt={att.name}
-                          className="h-7 w-7 rounded object-cover"
-                        />
-                      ) : (
-                        <FileTextIcon className="h-4 w-4 shrink-0 text-sky-400" />
-                      )}
-                      <div className="min-w-0">
-                        <p className="max-w-[140px] truncate text-[11.5px] font-medium">
-                          {att.name}
-                        </p>
-                        <p className="text-[10px] text-slate-500">
-                          {formatBytes(att.sizeBytes)}
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => removePendingAttachment(att.id)}
-                        className="rounded-full p-0.5 text-slate-400 transition hover:bg-white/[0.1] hover:text-slate-100"
-                        aria-label={`Remove ${att.name}`}
-                      >
-                        <XIcon className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  ))}
-                  {uploadingFiles && (
-                    <span className="inline-flex items-center gap-1.5 text-xs text-sky-300">
-                      <SpinnerIcon className="h-3.5 w-3.5" />
-                      Uploading...
-                    </span>
-                  )}
-                </div>
-              )}
+        {/* Floating "Jump to latest" pill when scrolled up */}
+        {showJumpToLatest && messages.length > 0 && (
+          <div className="pointer-events-none absolute right-0 bottom-4 left-0 z-20 flex justify-center">
+            <button
+              type="button"
+              onClick={() => scrollToLatest("smooth")}
+              className="vps-elevated pointer-events-auto inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-medium text-[var(--text-primary)] transition hover:border-[var(--accent-border)] hover:text-[var(--accent)]"
+            >
+              <ArrowDownIcon className="h-3.5 w-3.5" />
+              Jump to latest
+            </button>
+          </div>
+        )}
+        </div>
 
-              {/* Textarea */}
-              <textarea
-                ref={textareaRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleComposerKeyDown}
-                onPaste={handlePaste}
-                rows={2}
-                placeholder={
-                  mode === "plan"
-                    ? "Describe a change to generate a risk-classified Execution Plan..."
-                    : "Ask your Autonomous CTO anything, drop logs/Dockerfiles, or paste a screenshot..."
-                }
-                className="block w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-[13.5px] text-slate-100 placeholder:text-slate-500 focus:outline-none"
-              />
-
-              {/* Bottom Composer Toolbar */}
-              <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-2.5 pt-1">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {/* File Picker */}
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    multiple
-                    className="hidden"
-                    accept="image/*,.txt,.md,.json,.yml,.yaml,.log,.sh,.conf,.caddy,.toml,.ini,.env.example,.ts,.tsx,.js,.py,.pdf"
-                    onChange={(e) => {
-                      if (e.target.files?.length) {
-                        void uploadFiles(e.target.files);
-                        e.target.value = "";
-                      }
-                    }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={uploadingFiles || pendingAttachments.length >= 5}
-                    className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs text-slate-400 transition hover:bg-white/[0.06] hover:text-slate-200 disabled:opacity-40"
-                    title="Attach files or screenshots (max 5 MB each)"
-                  >
-                    <PaperclipIcon className="h-3.5 w-3.5" />
-                    <span className="hidden sm:inline">Attach</span>
-                  </button>
-
-                  {/* Agent / Plan Mode Toggle */}
-                  <div className="inline-flex rounded-lg border border-white/[0.08] bg-black/30 p-0.5 text-[11px]">
-                    <button
-                      type="button"
-                      onClick={() => setMode("agent")}
-                      className={`rounded-md px-2 py-1 font-medium transition ${
-                        mode === "agent"
-                          ? "bg-white/[0.1] text-slate-100"
-                          : "text-slate-400 hover:text-slate-200"
-                      }`}
-                    >
-                      Agent
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setMode("plan")}
-                      className={`rounded-md px-2 py-1 font-medium transition ${
-                        mode === "plan"
-                          ? "bg-amber-500/20 text-amber-200"
-                          : "text-slate-400 hover:text-slate-200"
-                      }`}
-                    >
-                      Plan
-                    </button>
-                  </div>
-
-                  {/* Quick Provider / Model Selector */}
-                  <div className="relative">
-                    <button
-                      type="button"
-                      onClick={() => setShowModelMenu((prev) => !prev)}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 py-1 text-[11px] font-medium text-slate-300 transition hover:bg-white/[0.07]"
-                    >
-                      <SlidersIcon className="h-3 w-3 text-sky-400" />
-                      <span className="max-w-[160px] truncate">
-                        {effectiveModel ?? providerDisplayName(effectiveProvider)}
-                      </span>
-                      <ChevronDownIcon className="h-3 w-3 text-slate-500" />
-                    </button>
-
-                    {showModelMenu && (
-                      <div className="absolute bottom-full left-0 z-30 mb-2 w-64 rounded-xl border border-white/[0.1] bg-[#151924] p-2 shadow-2xl">
-                        <div className="flex items-center justify-between px-2 py-1">
-                          <span className="text-[10.5px] font-semibold uppercase tracking-wider text-slate-400">
-                            {effectiveProvider
-                              ? providerDisplayName(effectiveProvider)
-                              : "AI Provider"}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setShowModelMenu(false);
-                              onOpenSetupWizard();
-                            }}
-                            className="text-[11px] text-sky-400 hover:text-sky-300"
-                          >
-                            Configure
-                          </button>
-                        </div>
-
-                        {activeCatalogEntry ? (
-                          <div className="mt-1 space-y-0.5">
-                            {activeCatalogEntry.suggestedModels.map((m) => (
-                              <button
-                                key={m}
-                                type="button"
-                                onClick={() => {
-                                  setSelectedProvider(activeCatalogEntry.id);
-                                  setSelectedModel(m);
-                                  setShowModelMenu(false);
-                                }}
-                                className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left font-mono text-[11.5px] transition ${
-                                  effectiveModel === m
-                                    ? "bg-sky-500/15 text-sky-200"
-                                    : "text-slate-300 hover:bg-white/[0.05]"
-                                }`}
-                              >
-                                <span className="truncate">{m}</span>
-                                {effectiveModel === m && (
-                                  <CheckCircleIcon className="h-3.5 w-3.5 shrink-0 text-sky-400" />
-                                )}
-                              </button>
-                            ))}
-                          </div>
-                        ) : (
-                          <p className="px-2 py-2 text-xs text-slate-400">
-                            No external provider configured yet. Connect OpenCode or
-                            another provider in Setup Wizard.
-                          </p>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <span className="hidden text-[10.5px] text-slate-500 sm:inline">
-                    Enter to send · Shift+Enter newline
-                  </span>
-                  {streaming ? (
-                    <button
-                      type="button"
-                      onClick={handleStopStream}
-                      className="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-rose-600/90 text-white transition hover:bg-rose-500"
-                      title="Stop streaming"
-                      aria-label="Stop response"
-                    >
-                      <SquareStopIcon className="h-3.5 w-3.5" />
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => void handleSend()}
-                      disabled={!input.trim() || uploadingFiles}
-                      className="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-sky-500 text-slate-950 transition hover:bg-sky-400 disabled:bg-white/[0.08] disabled:text-slate-500"
-                      title="Send message"
-                      aria-label="Send message"
-                    >
-                      <ArrowUpIcon className="h-4 w-4" />
-                    </button>
-                  )}
-                </div>
-              </div>
+        {/* Inline Error Banner */}
+        {chatError && (
+          <div className="mx-auto w-full max-w-3xl px-4 pb-2 sm:px-6">
+            <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--danger-border)] bg-[var(--danger-soft)] px-3.5 py-2 text-xs text-[var(--danger)]">
+              <span>{chatError}</span>
+              <button
+                type="button"
+                onClick={() => setChatError(null)}
+                className="rounded p-0.5 hover:bg-rose-500/20"
+                aria-label="Dismiss error"
+              >
+                <XIcon className="h-3.5 w-3.5" />
+              </button>
             </div>
           </div>
-        </div>
+        )}
+
+        {/* T3-Code Composer */}
+        <ChatComposer
+          textareaRef={textareaRef}
+          input={input}
+          mode={mode}
+          effort={effort}
+          mentionedSlugs={mentionedSlugs}
+          pendingAttachments={pendingAttachments}
+          queuedMessages={activeQueuedMessages}
+          uploadingFiles={uploadingFiles}
+          streaming={streaming}
+          elapsedMs={elapsedMs}
+          apps={apps}
+          onboardingPayload={onboardingPayload}
+          effectiveProvider={effectiveProvider}
+          effectiveModel={effectiveModel}
+          promptHistory={promptHistory}
+          onChangeInput={setInput}
+          onChangeMode={setMode}
+          onChangeEffort={setEffort}
+          onAddMention={addMention}
+          onRemoveMention={removeMention}
+          onSelectProviderModel={handleSelectProviderModel}
+          onUploadFiles={(files) => void uploadFiles(files)}
+          onRemoveAttachment={removePendingAttachment}
+          onSendOrQueue={handleSendOrQueue}
+          onStopStream={handleStopStream}
+          onRunSlashAction={handleRunSlashAction}
+          onEditQueued={handleEditQueued}
+          onRemoveQueued={handleRemoveQueued}
+          onSteerQueued={handleSteerQueued}
+          onMoveQueued={handleMoveQueued}
+          onOpenSetupWizard={onOpenSetupWizard}
+        />
       </div>
+
+      {/* Right Context & Live Server Inspector (T3-Code Studio Panel) */}
+      {showInspector && (
+        <aside className="hidden h-full w-80 shrink-0 flex-col gap-4 overflow-y-auto border-l border-[var(--border-subtle)] bg-[var(--bg-rail)] p-4 xl:flex">
+          {/* Active Session Summary */}
+          <div className="vps-card rounded-2xl p-3.5">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                <LayersIcon className="h-3.5 w-3.5 text-[var(--accent)]" />
+                Session Context
+              </h3>
+              <span className="rounded-full border border-[var(--border-subtle)] bg-[var(--bg-inset)] px-2 py-0.5 font-mono text-[10px] capitalize text-[var(--text-secondary)]">
+                {mode} · {effort}
+              </span>
+            </div>
+
+            <div className="mt-2.5 grid grid-cols-2 gap-2 text-xs">
+              <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-2">
+                <p className="text-[10px] text-[var(--text-muted)]">Messages</p>
+                <p className="tabular-nums mt-0.5 font-mono font-semibold text-[var(--text-primary)]">
+                  {messages.length}
+                </p>
+              </div>
+              <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-2">
+                <p className="text-[10px] text-[var(--text-muted)]">Queued</p>
+                <p className="tabular-nums mt-0.5 font-mono font-semibold text-[var(--text-primary)]">
+                  {activeQueuedMessages.length}
+                </p>
+              </div>
+            </div>
+
+            {metrics && (
+              <button
+                type="button"
+                onClick={() => addMention("host-metrics")}
+                className="vps-btn-secondary mt-2.5 flex w-full items-center justify-between rounded-xl px-2.5 py-1.5 text-[11px]"
+              >
+                <span className="inline-flex items-center gap-1.5 truncate">
+                  <AtSignIcon className="h-3 w-3 text-[var(--accent)]" />
+                  <span className="truncate font-mono">@host-metrics</span>
+                </span>
+                <span className="tabular-nums text-[10px] text-[var(--text-muted)]">
+                  RAM {metrics.memoryUsagePercent}%
+                </span>
+              </button>
+            )}
+          </div>
+
+          {/* Thread Execution Plans */}
+          {threadPlans.length > 0 && (
+            <div className="vps-card rounded-2xl p-3.5">
+              <div className="flex items-center justify-between">
+                <h3 className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  <ShieldIcon className="h-3.5 w-3.5 text-[var(--warning)]" />
+                  Thread Plans ({threadPlans.length})
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => onNavigate("activity")}
+                  className="text-[11px] font-medium text-[var(--accent)] hover:underline"
+                >
+                  Approvals
+                </button>
+              </div>
+              <ul className="mt-2.5 space-y-2">
+                {threadPlans.map((plan) => (
+                  <li
+                    key={plan.id}
+                    className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-2.5 text-[11px]"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate font-semibold text-[var(--text-primary)]">
+                        {plan.goal}
+                      </span>
+                      <span className="shrink-0 rounded-full border border-[var(--border-default)] bg-[var(--bg-surface)] px-1.5 py-0.5 text-[9.5px] font-semibold capitalize text-[var(--text-secondary)]">
+                        {plan.status}
+                      </span>
+                    </div>
+                    <p className="mt-0.5 line-clamp-2 text-[10.5px] text-[var(--text-muted)]">
+                      {plan.steps.length} step{plan.steps.length === 1 ? "" : "s"} ·{" "}
+                      {plan.summary}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Thread Attachments */}
+          {threadAttachments.length > 0 && (
+            <div className="vps-card rounded-2xl p-3.5">
+              <h3 className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                Thread Files ({threadAttachments.length})
+              </h3>
+              <ul className="mt-2.5 space-y-1.5">
+                {threadAttachments.map((att) => (
+                  <li
+                    key={att.id}
+                    className="flex items-center justify-between gap-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] px-2.5 py-1.5 text-[11px]"
+                  >
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      {att.kind === "image" ? (
+                        <ImageIcon className="h-3.5 w-3.5 shrink-0 text-[var(--violet)]" />
+                      ) : (
+                        <FileTextIcon className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                      )}
+                      <span className="truncate font-medium text-[var(--text-primary)]">
+                        {att.name}
+                      </span>
+                    </span>
+                    <span className="shrink-0 font-mono text-[10px] text-[var(--text-muted)]">
+                      {formatBytes(att.sizeBytes)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Live Workloads with @mention, Restart & Logs */}
+          <div className="vps-card rounded-2xl p-3.5">
+            <div className="flex items-center justify-between">
+              <h3 className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                Workloads ({apps.length})
+              </h3>
+              <button
+                type="button"
+                onClick={() => onNavigate("apps")}
+                className="text-[11px] font-medium text-[var(--accent)] hover:underline"
+              >
+                Manage all
+              </button>
+            </div>
+
+            {apps.length === 0 ? (
+              <p className="mt-2.5 text-xs leading-relaxed text-[var(--text-muted)]">
+                No isolated workloads yet. Ask the CTO Agent to deploy a web app or
+                personal agent.
+              </p>
+            ) : (
+              <div className="mt-2.5 space-y-2">
+                {apps.map((app) => {
+                  const running = app.status === "running";
+                  const isMentioned = mentionedSlugs.includes(app.slug);
+                  return (
+                    <div
+                      key={app.slug}
+                      className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-2.5"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="truncate text-xs font-semibold text-[var(--text-primary)]">
+                          {app.name}
+                        </span>
+                        <span
+                          className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium capitalize ${
+                            running
+                              ? "bg-[var(--success-soft)] text-[var(--success)]"
+                              : "bg-[var(--bg-surface)] text-[var(--text-muted)]"
+                          }`}
+                        >
+                          <span
+                            className={`h-1.5 w-1.5 rounded-full ${
+                              running ? "bg-[var(--success)]" : "bg-[var(--text-muted)]"
+                            }`}
+                          />
+                          {app.status}
+                        </span>
+                      </div>
+                      <p className="mt-0.5 truncate font-mono text-[10.5px] text-[var(--text-muted)]">
+                        {app.domain ?? "internal network"}
+                      </p>
+                      <div className="mt-2 flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            isMentioned
+                              ? removeMention(app.slug)
+                              : addMention(app.slug)
+                          }
+                          className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[10.5px] font-medium transition ${
+                            isMentioned
+                              ? "border-[var(--accent-border)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                              : "vps-btn-secondary"
+                          }`}
+                          title="Attach this workload's live logs & status to your next message"
+                        >
+                          <AtSignIcon className="h-3 w-3" />
+                          {isMentioned ? "Attached" : "Mention"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busyAppSlug === app.slug}
+                          onClick={() =>
+                            onLifecycle(app.slug, running ? "restart" : "start")
+                          }
+                          className="vps-btn-secondary flex-1 rounded-lg px-2 py-1 text-[10.5px] font-medium"
+                        >
+                          {running ? "Restart" : "Start"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onInspectApp(app, "logs")}
+                          className="vps-btn-secondary inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[10.5px] font-medium text-[var(--accent)]"
+                        >
+                          <TerminalIcon className="h-3 w-3" />
+                          Logs
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Recent Audit Mini-Feed */}
+          <div className="vps-card rounded-2xl p-3.5">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                Recent Audit
+              </h3>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => addMention("audit-trail")}
+                  className="font-mono text-[10.5px] text-[var(--accent)] hover:underline"
+                  title="Attach audit trail context to next message"
+                >
+                  +@audit
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onNavigate("activity")}
+                  className="text-[11px] font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                >
+                  All
+                </button>
+              </div>
+            </div>
+            {auditEvents.length === 0 ? (
+              <p className="mt-2 text-xs text-[var(--text-muted)]">No events yet.</p>
+            ) : (
+              <ul className="mt-2.5 space-y-2">
+                {auditEvents.slice(0, 6).map((evt) => (
+                  <li
+                    key={evt.id}
+                    className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] px-2.5 py-2 text-[11px]"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate font-mono font-medium text-[var(--text-primary)]">
+                        {evt.action}
+                      </span>
+                      <span className="tabular-nums shrink-0 text-[10px] text-[var(--text-muted)]">
+                        {formatRelativeTime(evt.createdAt)}
+                      </span>
+                    </div>
+                    <p className="mt-0.5 truncate text-[10.5px] text-[var(--text-secondary)]">
+                      {evt.summary}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          {/* Active Model Footer */}
+          <div className="px-1 text-[10.5px] text-[var(--text-muted)]">
+            Active engine:{" "}
+            <span className="font-medium text-[var(--text-secondary)]">
+              {providerDisplayName(effectiveProvider)}
+              {effectiveModel ? ` · ${effectiveModel}` : ""}
+            </span>
+          </div>
+        </aside>
+      )}
+
+      {/* Safe Confirmation Dialog for Thread Delete / Clear */}
+      <ConfirmDialog
+        dialog={confirmDialog}
+        busy={confirmBusy}
+        onClose={() => setConfirmDialog(null)}
+      />
     </div>
   );
 }

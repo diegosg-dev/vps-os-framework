@@ -422,3 +422,65 @@ test("readStaticUiAsset blocks traversal and symlinks, and metrics helpers succe
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 });
+
+test("Dashboard Control API exposes bounded telemetry history with auth and limit validation", async () => {
+  const registry = new SystemRegistryStore(":memory:");
+  let tick = 0;
+  const app = createDashboardApp({
+    registry,
+    adminToken: "metrics-history-token-1234",
+    getMetrics: () => {
+      tick++;
+      return {
+        hostname: "prod-01",
+        platform: "linux",
+        uptimeSeconds: 1000 + tick * 15,
+        cpuCount: 4,
+        loadAverage1m: 0.4 + tick * 0.1,
+        memoryTotalMb: 8192,
+        memoryUsedMb: 2048 + tick * 128,
+        memoryUsagePercent: 25 + tick * 1.5,
+        collectedAt: new Date(Date.UTC(2026, 10, 20, 12, 0, tick * 10)).toISOString(),
+      };
+    },
+    getDiskMetrics: () => ({
+      mountPath: "/",
+      totalMb: 102400,
+      usedMb: 30720,
+      usagePercent: 30,
+    }),
+  });
+
+  const headers = { authorization: "Bearer metrics-history-token-1234" };
+
+  try {
+    // Requires auth
+    assert.equal((await app.request("/api/system/metrics/history")).status, 401);
+
+    // Invalid limit rejected with 400
+    assert.equal(
+      (await app.request("/api/system/metrics/history?limit=0", { headers })).status,
+      400,
+    );
+    assert.equal(
+      (await app.request("/api/system/metrics/history?limit=120", { headers })).status,
+      400,
+    );
+
+    // Polling /api/system/metrics populates bounded history
+    assert.equal((await app.request("/api/system/metrics", { headers })).status, 200);
+    assert.equal((await app.request("/api/system/metrics", { headers })).status, 200);
+    assert.equal((await app.request("/api/system/metrics", { headers })).status, 200);
+
+    const histRes = await app.request("/api/system/metrics/history?limit=2", { headers });
+    assert.equal(histRes.status, 200);
+    const histJson = (await histRes.json()) as {
+      samples: Array<{ cpuLoadPercent: number; memoryUsagePercent: number; diskUsagePercent: number | null }>;
+    };
+    assert.equal(histJson.samples.length, 2);
+    assert.equal(histJson.samples[1]!.diskUsagePercent, 30);
+    assert.equal(histJson.samples[1]!.memoryUsagePercent > histJson.samples[0]!.memoryUsagePercent, true);
+  } finally {
+    registry.close();
+  }
+});

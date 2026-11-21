@@ -1,22 +1,50 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ActivityView } from "./components/ActivityView";
 import { AgentChat } from "./components/AgentChat";
 import { AuthGate } from "./components/AuthGate";
+import { CommandPalette } from "./components/CommandPalette";
+import { ConfirmDialog, type ConfirmDialogState } from "./components/ConfirmDialog";
 import {
+  ActivityIcon,
+  BoxIcon,
+  CommandIcon,
+  LayoutGridIcon,
+  LockIcon,
+  MenuIcon,
   MessageSquareIcon,
+  MoonIcon,
+  RefreshIcon,
   ServerIcon,
   SlidersIcon,
-  SparklesIcon,
+  SunIcon,
+  VpsOsLogo,
+  XIcon,
 } from "./components/Icons";
 import { OnboardingWizard } from "./components/OnboardingWizard";
+import { OverviewView } from "./components/OverviewView";
+import { SettingsView } from "./components/SettingsView";
+import { CapacityBar } from "./components/TelemetryCharts";
+import { ToastStack } from "./components/ToastStack";
+import { WorkloadDrawer } from "./components/WorkloadDrawer";
+import { WorkloadsView } from "./components/WorkloadsView";
+import { formatUptime, providerDisplayName } from "./lib/format";
 import type {
   AppCardView,
   AuditEventView,
+  ExecutionPlanView,
   OnboardingBootStatus,
   OnboardingPayload,
   SystemMetricsView,
+  TelemetrySampleView,
+  ThemeMode,
+  ToastItem,
+  ToastTone,
+  WorkspaceView,
 } from "./types";
 
 const TOKEN_STORAGE_KEY = "vps_os_admin_token";
+const THEME_STORAGE_KEY = "vps_os_theme";
+const POLL_STORAGE_KEY = "vps_os_poll_ms";
 
 function readStoredToken(): string {
   return (
@@ -41,60 +69,93 @@ function persistToken(value: string, remember: boolean): void {
   }
 }
 
-function formatUptime(seconds: number): string {
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  const mins = Math.floor((seconds % 3600) / 60);
-  if (days > 0) return `${days}d ${hours}h ${mins}m`;
-  if (hours > 0) return `${hours}h ${mins}m`;
-  return `${mins}m`;
+function readStoredTheme(): ThemeMode {
+  const saved = localStorage.getItem(THEME_STORAGE_KEY);
+  return saved === "light" ? "light" : "dark";
 }
 
-function providerBadgeLabel(provider: string | null | undefined): string {
-  switch (provider) {
-    case "opencode":
-      return "OpenCode";
-    case "openai":
-      return "OpenAI";
-    case "anthropic":
-      return "Claude";
-    case "openrouter":
-      return "OpenRouter";
-    case "nous":
-      return "Nous";
-    case "ollama":
-      return "Ollama";
-    default:
-      return provider || "CTO";
-  }
+function readStoredPollMs(): number {
+  const raw = localStorage.getItem(POLL_STORAGE_KEY);
+  if (raw === null) return 15_000;
+  const parsed = Number(raw);
+  return [0, 5_000, 15_000, 30_000].includes(parsed) ? parsed : 15_000;
 }
+
+const VIEW_META: Record<WorkspaceView, { label: string; subtitle: string }> = {
+  overview: { label: "Overview", subtitle: "Mission Control" },
+  chat: { label: "CTO Agent", subtitle: "Autonomous Studio" },
+  apps: { label: "Workloads", subtitle: "Apps & Agents" },
+  activity: { label: "Approvals & Audit", subtitle: "Governance" },
+  settings: { label: "System & Settings", subtitle: "Configuration" },
+};
 
 export function App() {
   const [token, setToken] = useState<string>(() => readStoredToken());
+  const [theme, setTheme] = useState<ThemeMode>(() => readStoredTheme());
+  const [pollIntervalMs, setPollIntervalMs] = useState<number>(() => readStoredPollMs());
+
   const [bootStatus, setBootStatus] = useState<OnboardingBootStatus | null>(null);
   const [onboardingPayload, setOnboardingPayload] = useState<OnboardingPayload | null>(
     null,
   );
   const [wizardManualOpen, setWizardManualOpen] = useState(false);
-  const [activeView, setActiveView] = useState<"chat" | "server">("chat");
-  const [showInspector, setShowInspector] = useState(true);
+  const [activeView, setActiveView] = useState<WorkspaceView>("overview");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [showChatInspector, setShowChatInspector] = useState(false);
   const [starterPrompt, setStarterPrompt] = useState<string | null>(null);
+
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [deployModalOpen, setDeployModalOpen] = useState(false);
+  const [inspectedSlug, setInspectedSlug] = useState<string | null>(null);
+  const [inspectedTab, setInspectedTab] = useState<"overview" | "logs">("overview");
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
   const [metrics, setMetrics] = useState<SystemMetricsView | null>(null);
+  const [metricsHistory, setMetricsHistory] = useState<TelemetrySampleView[]>([]);
   const [apps, setApps] = useState<AppCardView[]>([]);
+  const [plans, setPlans] = useState<ExecutionPlanView[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEventView[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [offline, setOffline] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+
   const [busyAppSlug, setBusyAppSlug] = useState<string | null>(null);
-  const [appMessage, setAppMessage] = useState<string | null>(null);
-  const [logsView, setLogsView] = useState<{
-    slug: string;
-    lines: string[];
-  } | null>(null);
+  const [planBusyId, setPlanBusyId] = useState<string | null>(null);
+  const [executionNotes, setExecutionNotes] = useState<Record<string, string>>({});
+
+  const goChordRef = useRef<number>(0);
+
+  // Sync theme token attribute on <html>
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
+
+  const handlePollChange = useCallback((ms: number) => {
+    setPollIntervalMs(ms);
+    localStorage.setItem(POLL_STORAGE_KEY, String(ms));
+  }, []);
+
+  const notify = useCallback(
+    (title: string, tone: ToastTone = "info", description?: string) => {
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setToasts((prev) => [...prev.slice(-3), { id, title, tone, description }]);
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((item) => item.id !== id));
+      }, 4200);
+    },
+    [],
+  );
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((item) => item.id !== id));
+  }, []);
 
   const authHeaders = useCallback((): Record<string, string> => {
     return token ? { authorization: `Bearer ${token}` } : {};
@@ -233,12 +294,15 @@ export function App() {
       }
 
       const headers = authHeaders();
-      const [onboardingRes, metricsRes, appsRes, auditRes] = await Promise.all([
-        fetch("/api/onboarding/state", { headers }),
-        fetch("/api/system/metrics", { headers }),
-        fetch("/api/apps", { headers }),
-        fetch("/api/audit?limit=15", { headers }),
-      ]);
+      const [onboardingRes, metricsRes, historyRes, appsRes, plansRes, auditRes] =
+        await Promise.all([
+          fetch("/api/onboarding/state", { headers }),
+          fetch("/api/system/metrics", { headers }),
+          fetch("/api/system/metrics/history?limit=30", { headers }),
+          fetch("/api/apps", { headers }),
+          fetch("/api/chat/plans?limit=50", { headers }),
+          fetch("/api/audit?limit=100", { headers }),
+        ]);
 
       if (
         onboardingRes.status === 401 ||
@@ -249,32 +313,45 @@ export function App() {
         persistToken("", false);
         setToken("");
         setOnboardingPayload(null);
-        setAuthError("Your session expired or token was invalid. Please sign in again.");
+        setAuthError(
+          "Your session expired or token was invalid. Please sign in again.",
+        );
         return;
       }
 
-      const firstFailure = [onboardingRes, metricsRes, appsRes, auditRes].find(
+      const criticalFailure = [onboardingRes, metricsRes, appsRes, auditRes].find(
         (res) => !res.ok,
       );
-      if (firstFailure) {
-        setError(`Control API returned ${firstFailure.status}.`);
+      if (criticalFailure) {
+        setError(`Control API returned ${criticalFailure.status}.`);
       }
 
       if (onboardingRes.ok) {
         setOnboardingPayload((await onboardingRes.json()) as OnboardingPayload);
       }
       if (metricsRes.ok) {
-        setMetrics((await metricsRes.json()) as SystemMetricsView);
+        const latest = (await metricsRes.json()) as SystemMetricsView;
+        setMetrics(latest);
+      }
+      if (historyRes.ok) {
+        const hData = (await historyRes.json()) as {
+          samples: TelemetrySampleView[];
+        };
+        setMetricsHistory(hData.samples ?? []);
       }
       if (appsRes.ok) {
         const data = (await appsRes.json()) as { apps: AppCardView[] };
         setApps(data.apps);
       }
+      if (plansRes.ok) {
+        const data = (await plansRes.json()) as { plans: ExecutionPlanView[] };
+        setPlans(data.plans ?? []);
+      }
       if (auditRes.ok) {
         const data = (await auditRes.json()) as { events: AuditEventView[] };
         setAuditEvents(data.events);
       }
-      if (!firstFailure) {
+      if (!criticalFailure) {
         setError(null);
       }
     } catch {
@@ -289,87 +366,12 @@ export function App() {
 
   useEffect(() => {
     void loadState();
+    if (pollIntervalMs <= 0) return;
     const intervalId = window.setInterval(() => {
       void loadState();
-    }, 15_000);
+    }, pollIntervalMs);
     return () => window.clearInterval(intervalId);
-  }, [loadState]);
-
-  function handleLockToken() {
-    persistToken("", false);
-    setToken("");
-    setOnboardingPayload(null);
-    setWizardManualOpen(false);
-    setMetrics(null);
-    setApps([]);
-    setAuditEvents([]);
-    setAppMessage(null);
-    setLogsView(null);
-    setError(null);
-    setAuthError(null);
-  }
-
-  function handleTokenRotated(newToken: string) {
-    const keepPersistent = localStorage.getItem(TOKEN_STORAGE_KEY) !== null;
-    persistToken(newToken, keepPersistent);
-    setToken(newToken);
-  }
-
-  async function handleLifecycle(
-    slug: string,
-    action: "start" | "stop" | "restart",
-  ) {
-    setBusyAppSlug(slug);
-    setAppMessage(null);
-    setError(null);
-    try {
-      const response = await fetch(
-        `/api/apps/${encodeURIComponent(slug)}/lifecycle`,
-        {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            ...authHeaders(),
-          },
-          body: JSON.stringify({ action }),
-        },
-      );
-      if (!response.ok) {
-        throw new Error(await extractApiError(response));
-      }
-      const data = (await response.json()) as { app: AppCardView };
-      setAppMessage(`${slug}: ${action} -> ${data.app.status}`);
-      void loadState();
-    } catch (err) {
-      setAppMessage(
-        err instanceof Error ? err.message : `Could not ${action} ${slug}.`,
-      );
-    } finally {
-      setBusyAppSlug(null);
-    }
-  }
-
-  async function handleViewLogs(slug: string) {
-    setBusyAppSlug(slug);
-    setAppMessage(null);
-    try {
-      const response = await fetch(
-        `/api/apps/${encodeURIComponent(slug)}/logs?tail=50`,
-        { headers: authHeaders() },
-      );
-      if (!response.ok) {
-        throw new Error(await extractApiError(response));
-      }
-      const data = (await response.json()) as { slug: string; lines: string[] };
-      setLogsView(data);
-    } catch (err) {
-      setAppMessage(
-        err instanceof Error ? err.message : `Could not load logs for ${slug}.`,
-      );
-    } finally {
-      setBusyAppSlug(null);
-    }
-  }
+  }, [loadState, pollIntervalMs]);
 
   const isAuthenticated = Boolean(
     bootStatus && (!bootStatus.authRequired || token),
@@ -380,563 +382,759 @@ export function App() {
       (!onboardingPayload.state.completed || wizardManualOpen),
   );
 
-  return (
-    <div className="min-h-screen bg-[#090a0e] text-slate-100">
-      {/* Compact T3-Style Top Command Bar */}
-      <header className="sticky top-0 z-30 border-b border-white/[0.07] bg-[#0d0f15]/95 px-4 py-2.5 backdrop-blur-sm">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2">
-              <span className="flex h-7 w-7 items-center justify-center rounded-lg border border-sky-500/30 bg-sky-500/10 text-sky-300">
-                <SparklesIcon className="h-4 w-4" />
-              </span>
-              <span className="text-sm font-semibold tracking-tight text-slate-100">
-                VPS OS
-              </span>
-            </div>
+  // Global keyboard shortcuts (Ctrl/Cmd+K for Command Palette, G+letter nav)
+  useEffect(() => {
+    if (!isAuthenticated || showWizard) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setCommandPaletteOpen((prev) => !prev);
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      const inEditable =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable);
+      if (inEditable || event.metaKey || event.ctrlKey || event.altKey) return;
 
+      const key = event.key.toLowerCase();
+      const now = Date.now();
+      if (key === "g") {
+        goChordRef.current = now;
+        return;
+      }
+      if (now - goChordRef.current < 800) {
+        if (key === "o") setActiveView("overview");
+        else if (key === "c") setActiveView("chat");
+        else if (key === "w") setActiveView("apps");
+        else if (key === "a") setActiveView("activity");
+        else if (key === "s") setActiveView("settings");
+        goChordRef.current = 0;
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isAuthenticated, showWizard]);
+
+  function handleLockToken() {
+    persistToken("", false);
+    setToken("");
+    setOnboardingPayload(null);
+    setWizardManualOpen(false);
+    setMetrics(null);
+    setMetricsHistory([]);
+    setApps([]);
+    setPlans([]);
+    setAuditEvents([]);
+    setInspectedSlug(null);
+    setError(null);
+    setAuthError(null);
+    notify("Session locked", "info");
+  }
+
+  function handleTokenRotated(newToken: string) {
+    const keepPersistent = localStorage.getItem(TOKEN_STORAGE_KEY) !== null;
+    persistToken(newToken, keepPersistent);
+    setToken(newToken);
+  }
+
+  const executeLifecycle = useCallback(
+    async (slug: string, action: "start" | "stop" | "restart") => {
+      setBusyAppSlug(slug);
+      setError(null);
+      try {
+        const response = await fetch(
+          `/api/apps/${encodeURIComponent(slug)}/lifecycle`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              ...authHeaders(),
+            },
+            body: JSON.stringify({ action }),
+          },
+        );
+        if (!response.ok) {
+          throw new Error(await extractApiError(response));
+        }
+        const data = (await response.json()) as { app: AppCardView };
+        notify(
+          `${slug} ${action} succeeded`,
+          "success",
+          `Current status: ${data.app.status}`,
+        );
+        await loadState();
+      } catch (err) {
+        notify(
+          `Could not ${action} ${slug}`,
+          "error",
+          err instanceof Error ? err.message : undefined,
+        );
+      } finally {
+        setBusyAppSlug(null);
+      }
+    },
+    [authHeaders, extractApiError, loadState, notify],
+  );
+
+  const handleLifecycleRequest = useCallback(
+    (slug: string, action: "start" | "stop" | "restart") => {
+      if (action === "stop") {
+        const target = apps.find((a) => a.slug === slug);
+        setConfirmDialog({
+          title: `Stop ${target?.name ?? slug}?`,
+          description: target?.domain
+            ? `Stopping this workload will make https://${target.domain} temporarily unavailable until you start it again.`
+            : "This isolated container will stop gracefully. Persistent workspace files and data volumes stay intact.",
+          confirmLabel: "Stop Workload",
+          tone: "danger",
+          onConfirm: async () => {
+            setConfirmBusy(true);
+            try {
+              await executeLifecycle(slug, "stop");
+              setConfirmDialog(null);
+            } finally {
+              setConfirmBusy(false);
+            }
+          },
+        });
+        return;
+      }
+      void executeLifecycle(slug, action);
+    },
+    [apps, executeLifecycle],
+  );
+
+  const handleCreateDeployPlan = useCallback(
+    async (goal: string) => {
+      try {
+        const res = await fetch("/api/chat/plan", {
+          method: "POST",
+          headers: { "content-type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ goal }),
+        });
+        if (!res.ok) {
+          throw new Error(await extractApiError(res));
+        }
+        await loadState();
+        setActiveView("activity");
+        notify(
+          "Deployment plan created",
+          "success",
+          "Review the steps in Approvals & Audit before executing.",
+        );
+      } catch (err) {
+        notify(
+          "Could not create deployment plan",
+          "error",
+          err instanceof Error ? err.message : undefined,
+        );
+      }
+    },
+    [authHeaders, extractApiError, loadState, notify],
+  );
+
+  const handlePlanDecision = useCallback(
+    async (planId: string, approved: boolean) => {
+      setPlanBusyId(planId);
+      try {
+        const res = await fetch("/api/chat/approve", {
+          method: "POST",
+          headers: { "content-type": "application/json", ...authHeaders() },
+          body: JSON.stringify({
+            planId,
+            approved,
+            decidedBy: onboardingPayload?.state.persona.ownerName || "dashboard-admin",
+          }),
+        });
+        if (!res.ok) {
+          throw new Error(await extractApiError(res));
+        }
+        await loadState();
+        notify(
+          approved ? "Execution plan approved" : "Execution plan rejected",
+          approved ? "success" : "info",
+          approved ? "Click Execute Approved Plan to run it safely." : undefined,
+        );
+      } catch (err) {
+        notify(
+          "Could not update plan",
+          "error",
+          err instanceof Error ? err.message : undefined,
+        );
+      } finally {
+        setPlanBusyId(null);
+      }
+    },
+    [authHeaders, extractApiError, loadState, notify, onboardingPayload?.state.persona.ownerName],
+  );
+
+  const handleExecutePlan = useCallback(
+    async (planId: string) => {
+      setPlanBusyId(planId);
+      try {
+        const res = await fetch("/api/chat/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ planId }),
+        });
+        if (!res.ok) {
+          throw new Error(await extractApiError(res));
+        }
+        const data = (await res.json()) as {
+          execution: { summary: string };
+        };
+        setExecutionNotes((prev) => ({ ...prev, [planId]: data.execution.summary }));
+        await loadState();
+        notify("Execution plan completed", "success", data.execution.summary);
+      } catch (err) {
+        notify(
+          "Plan execution failed",
+          "error",
+          err instanceof Error ? err.message : undefined,
+        );
+      } finally {
+        setPlanBusyId(null);
+      }
+    },
+    [authHeaders, extractApiError, loadState, notify],
+  );
+
+  function handleQuickAskCto(prompt: string) {
+    setStarterPrompt(prompt);
+    setActiveView("chat");
+  }
+
+  function handleInspectApp(app: AppCardView, tab: "overview" | "logs" = "overview") {
+    setInspectedSlug(app.slug);
+    setInspectedTab(tab);
+  }
+
+  const inspectedApp = inspectedSlug
+    ? apps.find((a) => a.slug === inspectedSlug) ?? null
+    : null;
+  const pendingPlansCount = plans.filter((p) => p.status === "pending").length;
+  const runningAppsCount = apps.filter((a) => a.status === "running").length;
+
+  const navItems: Array<{
+    id: WorkspaceView;
+    label: string;
+    icon: "overview" | "chat" | "apps" | "activity" | "settings";
+    badge?: string | number | undefined;
+    badgeTone?: "default" | "warning" | undefined;
+  }> = [
+    { id: "overview", label: "Overview", icon: "overview" },
+    { id: "chat", label: "CTO Agent", icon: "chat" },
+    {
+      id: "apps",
+      label: "Workloads",
+      icon: "apps",
+      badge: `${runningAppsCount}/${apps.length}`,
+    },
+    {
+      id: "activity",
+      label: "Approvals & Audit",
+      icon: "activity",
+      badge: pendingPlansCount > 0 ? pendingPlansCount : undefined,
+      badgeTone: pendingPlansCount > 0 ? "warning" : "default",
+    },
+    { id: "settings", label: "System & Settings", icon: "settings" },
+  ];
+
+  function renderNavIcon(kind: (typeof navItems)[number]["icon"]) {
+    const cls = "h-4 w-4 shrink-0";
+    switch (kind) {
+      case "overview":
+        return <LayoutGridIcon className={cls} />;
+      case "chat":
+        return <MessageSquareIcon className={cls} />;
+      case "apps":
+        return <BoxIcon className={cls} />;
+      case "activity":
+        return <ActivityIcon className={cls} />;
+      case "settings":
+        return <SlidersIcon className={cls} />;
+    }
+  }
+
+  const renderSidebarContent = () => (
+    <div className="flex h-full flex-col">
+      {/* Brand Header */}
+      <div className="flex h-14 items-center justify-between gap-2 border-b border-[var(--border-subtle)] px-4">
+        <button
+          type="button"
+          onClick={() => {
+            setActiveView("overview");
+            setWizardManualOpen(false);
+            setMobileNavOpen(false);
+          }}
+          className="flex items-center gap-2.5 text-left"
+        >
+          <VpsOsLogo className="h-8 w-8 shrink-0" />
+          <div className="min-w-0">
+            <p className="text-sm font-semibold leading-none tracking-tight text-[var(--text-primary)]">
+              VPS OS
+            </p>
+            <p className="mt-0.5 text-[10.5px] text-[var(--text-muted)]">
+              Personal Cloud OS
+            </p>
+          </div>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setMobileNavOpen(false)}
+          className="rounded-lg p-1.5 text-[var(--text-muted)] hover:bg-[var(--bg-hover)] lg:hidden"
+          aria-label="Close navigation menu"
+        >
+          <XIcon className="h-4 w-4" />
+        </button>
+      </div>
+
+      {/* Primary Navigation */}
+      <nav aria-label="Primary navigation" className="flex-1 space-y-1 p-3">
+        <p className="px-2.5 pb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+          Control Plane
+        </p>
+        {navItems.map((item) => {
+          const active = !showWizard && activeView === item.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => {
+                setWizardManualOpen(false);
+                setActiveView(item.id);
+                setMobileNavOpen(false);
+              }}
+              className={`flex w-full items-center justify-between gap-2 rounded-xl px-3 py-2 text-left text-xs font-medium transition ${
+                active
+                  ? "bg-[var(--accent-soft)] text-[var(--accent)] shadow-[inset_0_0_0_1px_var(--accent-border)]"
+                  : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              }`}
+            >
+              <span className="flex items-center gap-2.5 truncate">
+                {renderNavIcon(item.icon)}
+                <span className="truncate">{item.label}</span>
+              </span>
+              {item.badge !== undefined && (
+                <span
+                  className={`tabular-nums rounded-full px-1.5 py-0.5 font-mono text-[10px] font-semibold ${
+                    item.badgeTone === "warning"
+                      ? "bg-amber-500/20 text-[var(--warning)]"
+                      : "bg-[var(--bg-inset)] text-[var(--text-muted)]"
+                  }`}
+                >
+                  {item.badge}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </nav>
+
+      {/* Pinned Compact Host Status Card */}
+      <div className="border-t border-[var(--border-subtle)] p-3">
+        <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-3">
+          <div className="flex items-center justify-between gap-2">
+            <span className="inline-flex min-w-0 items-center gap-1.5 text-[11.5px] font-semibold text-[var(--text-primary)]">
+              <ServerIcon className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+              <span className="truncate">{metrics?.hostname ?? "Awaiting host"}</span>
+            </span>
             <span
-              className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium ${
+              className={`h-2 w-2 shrink-0 rounded-full ${
+                offline ? "bg-[var(--danger)]" : "bg-[var(--success)] animate-pulse-dot"
+              }`}
+              title={offline ? "Control API offline" : "Control API connected"}
+            />
+          </div>
+          {metrics && (
+            <div className="mt-2.5 space-y-2">
+              <div>
+                <div className="flex justify-between text-[10.5px] text-[var(--text-muted)]">
+                  <span>RAM</span>
+                  <span className="tabular-nums font-mono">{metrics.memoryUsagePercent}%</span>
+                </div>
+                <div className="mt-1">
+                  <CapacityBar percent={metrics.memoryUsagePercent} tone="violet" heightClass="h-1" />
+                </div>
+              </div>
+              {metrics.disk && (
+                <div>
+                  <div className="flex justify-between text-[10.5px] text-[var(--text-muted)]">
+                    <span>Disk</span>
+                    <span className="tabular-nums font-mono">{metrics.disk.usagePercent}%</span>
+                  </div>
+                  <div className="mt-1">
+                    <CapacityBar percent={metrics.disk.usagePercent} tone="success" heightClass="h-1" />
+                  </div>
+                </div>
+              )}
+              <div className="flex items-center justify-between pt-0.5 text-[10px] text-[var(--text-muted)]">
+                <span>Uptime {formatUptime(metrics.uptimeSeconds)}</span>
+                <span className="truncate">
+                  {providerDisplayName(onboardingPayload?.state.llmProvider)}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  // Unauthenticated or First-Boot Minimal Header Shell
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-screen bg-[var(--bg-canvas)] text-[var(--text-primary)]">
+        <header className="flex h-14 items-center justify-between border-b border-[var(--border-subtle)] bg-[var(--bg-rail)] px-4 sm:px-6">
+          <div className="flex items-center gap-2.5">
+            <VpsOsLogo className="h-7 w-7" />
+            <span className="text-sm font-semibold tracking-tight">VPS OS</span>
+            <span
+              className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium ${
                 offline
-                  ? "bg-rose-500/15 text-rose-300"
-                  : "bg-emerald-500/15 text-emerald-300"
+                  ? "border-[var(--danger-border)] bg-[var(--danger-soft)] text-[var(--danger)]"
+                  : "border-[var(--success-border)] bg-[var(--success-soft)] text-[var(--success)]"
               }`}
             >
               <span
                 className={`h-1.5 w-1.5 rounded-full ${
-                  offline ? "bg-rose-400" : "bg-emerald-400"
+                  offline ? "bg-[var(--danger)]" : "bg-[var(--success)]"
                 }`}
               />
               {offline ? "Offline" : "Connected"}
             </span>
-
-            {isAuthenticated && !showWizard && (
-              <nav
-                aria-label="Workspace views"
-                className="ml-1 inline-flex rounded-lg border border-white/[0.08] bg-black/30 p-0.5 text-xs"
-              >
-                <button
-                  type="button"
-                  onClick={() => setActiveView("chat")}
-                  className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition ${
-                    activeView === "chat"
-                      ? "bg-white/[0.1] text-slate-100"
-                      : "text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  <MessageSquareIcon className="h-3.5 w-3.5" />
-                  Agent Chat
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveView("server")}
-                  className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition ${
-                    activeView === "server"
-                      ? "bg-white/[0.1] text-slate-100"
-                      : "text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  <ServerIcon className="h-3.5 w-3.5" />
-                  Server &amp; Apps
-                  <span className="rounded bg-white/[0.08] px-1.5 py-0.2 font-mono text-[10px] text-slate-300">
-                    {apps.length}
-                  </span>
-                </button>
-              </nav>
-            )}
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            {onboardingPayload?.state.llmConfigured && (
-              <button
-                type="button"
-                onClick={() => setWizardManualOpen(true)}
-                className="hidden items-center gap-1.5 rounded-lg border border-sky-500/25 bg-sky-500/10 px-2.5 py-1 text-[11px] font-medium text-sky-200 transition hover:bg-sky-500/15 sm:inline-flex"
-              >
-                <SlidersIcon className="h-3 w-3" />
-                {providerBadgeLabel(onboardingPayload.state.llmProvider)}
-                {onboardingPayload.state.llmModel
-                  ? ` · ${onboardingPayload.state.llmModel}`
-                  : ""}
-              </button>
+          <button
+            type="button"
+            onClick={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))}
+            className="vps-btn-secondary inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs"
+            aria-label="Toggle appearance theme"
+          >
+            {theme === "dark" ? (
+              <SunIcon className="h-3.5 w-3.5" />
+            ) : (
+              <MoonIcon className="h-3.5 w-3.5" />
             )}
+            <span className="hidden sm:inline">
+              {theme === "dark" ? "Light" : "Dark"}
+            </span>
+          </button>
+        </header>
+
+        {bootStatus ? (
+          <AuthGate
+            bootStatus={bootStatus}
+            error={authError}
+            busy={authBusy}
+            onClaimCode={handleClaimCode}
+            onLoginPassphrase={handleLoginPassphrase}
+            onUnlockToken={handleUnlockToken}
+          />
+        ) : (
+          <div className="flex min-h-[70vh] items-center justify-center p-6 text-xs text-[var(--text-muted)]">
+            {error ?? "Connecting to VPS OS Control API..."}
+          </div>
+        )}
+        <ToastStack toasts={toasts} onDismiss={dismissToast} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex min-h-screen bg-[var(--bg-canvas)] text-[var(--text-primary)]">
+      {/* Desktop Persistent Sidebar Rail */}
+      <aside className="sticky top-0 hidden h-screen w-60 shrink-0 border-r border-[var(--border-subtle)] bg-[var(--bg-rail)] lg:block">
+        {renderSidebarContent()}
+      </aside>
+
+      {/* Mobile Slide-Over Navigation Drawer */}
+      {mobileNavOpen && (
+        <div
+          className="fixed inset-0 z-50 flex bg-[var(--bg-backdrop)] backdrop-blur-xs lg:hidden"
+          onClick={() => setMobileNavOpen(false)}
+        >
+          <aside
+            className="h-full w-64 border-r border-[var(--border-default)] bg-[var(--bg-rail)] shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {renderSidebarContent()}
+          </aside>
+        </div>
+      )}
+
+      {/* Main Content Area */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* Contextual Top Bar */}
+        <header className="sticky top-0 z-30 flex h-14 items-center justify-between gap-3 border-b border-[var(--border-subtle)] bg-[var(--bg-rail)] px-4 sm:px-6">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen(true)}
+              className="rounded-lg p-1.5 text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] lg:hidden"
+              aria-label="Open navigation menu"
+            >
+              <MenuIcon className="h-4.5 w-4.5" />
+            </button>
+
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="truncate text-sm font-semibold text-[var(--text-primary)]">
+                {showWizard ? "Setup Wizard" : VIEW_META[activeView].label}
+              </span>
+              <span className="hidden text-xs text-[var(--text-muted)] sm:inline">
+                / {showWizard ? "Onboarding" : VIEW_META[activeView].subtitle}
+              </span>
+            </div>
+          </div>
+
+          {/* Center Command Palette Trigger */}
+          {!showWizard && (
+            <button
+              type="button"
+              onClick={() => setCommandPaletteOpen(true)}
+              className="hidden max-w-xs flex-1 items-center justify-between gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] px-3 py-1.5 text-xs text-[var(--text-muted)] transition hover:border-[var(--border-strong)] hover:text-[var(--text-secondary)] md:flex"
+            >
+              <span className="inline-flex items-center gap-2 truncate">
+                <CommandIcon className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">Search commands, apps, actions...</span>
+              </span>
+              <kbd className="vps-kbd">Ctrl K</kbd>
+            </button>
+          )}
+
+          {/* Right Global Controls */}
+          <div className="flex items-center gap-1.5 sm:gap-2">
+            <span
+              className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${
+                offline
+                  ? "border-[var(--danger-border)] bg-[var(--danger-soft)] text-[var(--danger)]"
+                  : "border-[var(--success-border)] bg-[var(--success-soft)] text-[var(--success)]"
+              }`}
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  offline ? "bg-[var(--danger)]" : "bg-[var(--success)] animate-pulse-dot"
+                }`}
+              />
+              <span className="hidden sm:inline">{offline ? "Offline" : "Live"}</span>
+            </span>
+
             <button
               type="button"
               onClick={() => void loadState()}
               disabled={refreshing}
-              className="rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 py-1 text-xs font-medium text-slate-300 transition hover:bg-white/[0.07] disabled:opacity-50"
+              className="vps-btn-secondary inline-flex h-8 w-8 items-center justify-center rounded-lg"
+              title="Refresh telemetry and workloads"
+              aria-label="Refresh dashboard"
             >
-              {refreshing ? "Syncing..." : "Refresh"}
+              <RefreshIcon
+                className={`h-3.5 w-3.5 ${refreshing ? "animate-spin text-[var(--accent)]" : ""}`}
+              />
             </button>
-            {isAuthenticated && onboardingPayload && (
-              <button
-                type="button"
-                onClick={() => setWizardManualOpen((prev) => !prev)}
-                className="rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 py-1 text-xs font-medium text-sky-300 transition hover:bg-white/[0.07]"
-              >
-                {showWizard && onboardingPayload.state.completed
-                  ? "Back to Workspace"
-                  : "Setup"}
-              </button>
-            )}
+
+            <button
+              type="button"
+              onClick={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))}
+              className="vps-btn-secondary inline-flex h-8 w-8 items-center justify-center rounded-lg"
+              title={`Switch to ${theme === "dark" ? "Light" : "Dark"} mode`}
+              aria-label="Toggle color theme"
+            >
+              {theme === "dark" ? (
+                <SunIcon className="h-3.5 w-3.5" />
+              ) : (
+                <MoonIcon className="h-3.5 w-3.5" />
+              )}
+            </button>
+
             {token && (
               <button
                 type="button"
                 onClick={handleLockToken}
-                className="rounded-lg border border-white/[0.08] bg-transparent px-2.5 py-1 text-xs font-medium text-slate-400 transition hover:bg-white/[0.05] hover:text-slate-200"
+                className="vps-btn-secondary inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-[var(--text-secondary)]"
+                title="Lock dashboard session"
               >
-                Lock
+                <LockIcon className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Lock</span>
               </button>
             )}
           </div>
-        </div>
-      </header>
+        </header>
 
-      {bootStatus && !isAuthenticated && (
-        <AuthGate
-          bootStatus={bootStatus}
-          error={authError}
-          busy={authBusy}
-          onClaimCode={handleClaimCode}
-          onLoginPassphrase={handleLoginPassphrase}
-          onUnlockToken={handleUnlockToken}
-        />
-      )}
+        {/* Global Offline / API Error Alert Bar */}
+        {(offline || error) && !showWizard && activeView !== "chat" && (
+          <div className="border-b border-[var(--danger-border)] bg-[var(--danger-soft)] px-4 py-2.5 sm:px-6">
+            <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 text-xs text-[var(--danger)]">
+              <span>{error ?? "Control API unreachable. Telemetry may be stale."}</span>
+              <button
+                type="button"
+                onClick={() => void loadState()}
+                className="rounded-lg bg-rose-600 px-3 py-1 font-medium text-white hover:bg-rose-500"
+              >
+                Retry
+              </button>
+            </div>
+          </div>
+        )}
 
-      {showWizard && onboardingPayload && (
-        <OnboardingWizard
-          payload={onboardingPayload}
-          authHeaders={authHeaders}
-          onTokenRotated={handleTokenRotated}
-          onRefreshState={loadState}
-          onComplete={(prompt) => {
-            setWizardManualOpen(false);
-            setActiveView("chat");
-            if (prompt) {
-              setStarterPrompt(prompt);
-            }
-          }}
-          onCancel={
-            onboardingPayload.state.completed
-              ? () => setWizardManualOpen(false)
-              : undefined
-          }
-        />
-      )}
-
-      {/* Primary Workspace: Agentic Chat + Collapsible Live Server Inspector */}
-      {isAuthenticated && !showWizard && activeView === "chat" && (
-        <div className="flex min-w-0">
-          <div className="min-w-0 flex-1">
+        {/* Active Workspace View */}
+        <main className={`vps-aura min-w-0 flex-1 ${activeView === "chat" && !showWizard ? "overflow-hidden" : ""}`}>
+          {showWizard && onboardingPayload ? (
+            <OnboardingWizard
+              payload={onboardingPayload}
+              authHeaders={authHeaders}
+              onTokenRotated={handleTokenRotated}
+              onRefreshState={loadState}
+              onComplete={(prompt) => {
+                setWizardManualOpen(false);
+                if (prompt) {
+                  setStarterPrompt(prompt);
+                  setActiveView("chat");
+                } else {
+                  setActiveView("overview");
+                }
+                notify("Setup saved", "success", "Your VPS OS workspace is ready.");
+              }}
+              onCancel={
+                onboardingPayload.state.completed
+                  ? () => setWizardManualOpen(false)
+                  : undefined
+              }
+            />
+          ) : activeView === "overview" ? (
+            <OverviewView
+              metrics={metrics}
+              history={metricsHistory}
+              apps={apps}
+              plans={plans}
+              auditEvents={auditEvents}
+              onboardingPayload={onboardingPayload}
+              offline={offline}
+              onNavigate={setActiveView}
+              onQuickAskCto={handleQuickAskCto}
+              onInspectApp={handleInspectApp}
+              onOpenDeployModal={() => {
+                setActiveView("apps");
+                setDeployModalOpen(true);
+              }}
+              onOpenSetupWizard={() => setWizardManualOpen(true)}
+            />
+          ) : activeView === "chat" ? (
             <AgentChat
               authHeaders={authHeaders}
               onboardingPayload={onboardingPayload}
               metrics={metrics}
               apps={apps}
+              auditEvents={auditEvents}
+              busyAppSlug={busyAppSlug}
               initialPrompt={starterPrompt}
               onConsumeInitialPrompt={() => setStarterPrompt(null)}
               onOpenSetupWizard={() => setWizardManualOpen(true)}
               onRefreshDashboard={loadState}
-              showInspector={showInspector}
-              onToggleInspector={() => setShowInspector((prev) => !prev)}
+              onLifecycle={handleLifecycleRequest}
+              onInspectApp={handleInspectApp}
+              onNavigate={setActiveView}
+              showInspector={showChatInspector}
+              onToggleInspector={() => setShowChatInspector((prev) => !prev)}
+              onNotify={notify}
             />
-          </div>
-
-          {showInspector && (
-            <aside className="hidden h-[calc(100vh-53px)] w-80 shrink-0 flex-col gap-4 overflow-y-auto border-l border-white/[0.07] bg-[#0d0f15] p-4 lg:flex">
-              {offline && (
-                <div
-                  role="alert"
-                  className="rounded-xl border border-rose-500/35 bg-rose-950/35 px-3 py-2 text-xs text-rose-200"
-                >
-                  Control API unreachable. Telemetry may be stale.
-                </div>
-              )}
-
-              {/* Compact Telemetry Card */}
-              <div className="rounded-xl border border-white/[0.07] bg-[#12151d] p-3.5">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                    Server Telemetry
-                  </h3>
-                  <span className="font-mono text-[10.5px] text-slate-500">
-                    {metrics ? formatUptime(metrics.uptimeSeconds) : "—"}
-                  </span>
-                </div>
-                <p className="mt-1 truncate text-sm font-medium text-slate-100">
-                  {metrics?.hostname ?? "Awaiting host"}
-                </p>
-                <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                  <div className="rounded-lg border border-white/[0.06] bg-black/25 p-2">
-                    <span className="text-[10px] text-slate-500">CPU / Load</span>
-                    <p className="mt-0.5 font-mono text-xs text-slate-200">
-                      {metrics
-                        ? `${metrics.cpuCount}c · ${metrics.loadAverage1m}`
-                        : "—"}
-                    </p>
-                  </div>
-                  <div className="rounded-lg border border-white/[0.06] bg-black/25 p-2">
-                    <span className="text-[10px] text-slate-500">Memory</span>
-                    <p className="mt-0.5 font-mono text-xs text-slate-200">
-                      {metrics ? `${metrics.memoryUsagePercent}%` : "—"}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Live Installed Apps */}
-              <div className="rounded-xl border border-white/[0.07] bg-[#12151d] p-3.5">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                    Workloads ({apps.length})
-                  </h3>
-                  <button
-                    type="button"
-                    onClick={() => setActiveView("server")}
-                    className="text-[11px] text-sky-400 hover:text-sky-300"
-                  >
-                    Manage all
-                  </button>
-                </div>
-
-                {appMessage && (
-                  <p className="mt-2 rounded-lg bg-black/40 px-2.5 py-1.5 text-[11px] text-sky-300">
-                    {appMessage}
-                  </p>
-                )}
-
-                {apps.length === 0 ? (
-                  <p className="mt-2.5 text-xs leading-relaxed text-slate-500">
-                    No isolated workloads yet. Ask the CTO Agent to deploy an app or
-                    personal agent.
-                  </p>
-                ) : (
-                  <div className="mt-2.5 space-y-2">
-                    {apps.map((app) => (
-                      <div
-                        key={app.slug}
-                        className="rounded-lg border border-white/[0.06] bg-black/25 p-2.5"
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="truncate text-xs font-medium text-slate-100">
-                            {app.name}
-                          </span>
-                          <span
-                            className={`rounded px-1.5 py-0.5 text-[10px] ${
-                              app.status === "running"
-                                ? "bg-emerald-500/15 text-emerald-300"
-                                : app.status === "error"
-                                  ? "bg-rose-500/15 text-rose-300"
-                                  : "bg-white/[0.07] text-slate-300"
-                            }`}
-                          >
-                            {app.status}
-                          </span>
-                        </div>
-                        <p className="mt-0.5 truncate text-[10.5px] text-slate-500">
-                          {app.domain ?? "internal network"}
-                        </p>
-                        <div className="mt-2 flex flex-wrap gap-1">
-                          {(["start", "stop", "restart"] as const).map((action) => (
-                            <button
-                              key={action}
-                              type="button"
-                              disabled={busyAppSlug === app.slug}
-                              onClick={() => void handleLifecycle(app.slug, action)}
-                              className="rounded border border-white/[0.08] bg-white/[0.03] px-1.5 py-0.5 text-[10px] capitalize text-slate-300 hover:bg-white/[0.08] disabled:opacity-50"
-                            >
-                              {action}
-                            </button>
-                          ))}
-                          <button
-                            type="button"
-                            disabled={busyAppSlug === app.slug}
-                            onClick={() => void handleViewLogs(app.slug)}
-                            className="rounded border border-white/[0.08] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-sky-300 hover:bg-white/[0.08] disabled:opacity-50"
-                          >
-                            Logs
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {logsView && (
-                  <div className="mt-3 rounded-lg border border-white/[0.08] bg-black/50 p-2.5">
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono text-[10.5px] text-slate-300">
-                        {logsView.slug} logs
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setLogsView(null)}
-                        className="text-[10.5px] text-slate-400 hover:text-slate-200"
-                      >
-                        Close
-                      </button>
-                    </div>
-                    <pre className="mt-1.5 max-h-36 overflow-auto font-mono text-[10.5px] text-slate-300">
-                      {logsView.lines.length > 0
-                        ? logsView.lines.join("\n")
-                        : "(no log lines)"}
-                    </pre>
-                  </div>
-                )}
-              </div>
-
-              {/* Recent Audit Mini-Feed */}
-              <div className="rounded-xl border border-white/[0.07] bg-[#12151d] p-3.5">
-                <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                  Recent Audit
-                </h3>
-                {auditEvents.length === 0 ? (
-                  <p className="mt-2 text-xs text-slate-500">No events yet.</p>
-                ) : (
-                  <ul className="mt-2.5 space-y-2">
-                    {auditEvents.slice(0, 6).map((evt) => (
-                      <li
-                        key={evt.id}
-                        className="rounded-lg border border-white/[0.05] bg-black/25 px-2.5 py-1.5 text-[11px]"
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="truncate font-mono text-slate-200">
-                            {evt.action}
-                          </span>
-                          <span className="shrink-0 text-[10px] text-slate-500">
-                            {new Date(evt.createdAt).toLocaleTimeString([], {
-                              hour: "2-digit",
-                              minute: "2-digit",
-                            })}
-                          </span>
-                        </div>
-                        <p className="mt-0.5 truncate text-[10.5px] text-slate-400">
-                          {evt.summary}
-                        </p>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            </aside>
+          ) : activeView === "apps" ? (
+            <WorkloadsView
+              apps={apps}
+              totalHostMemoryMb={metrics?.memoryTotalMb ?? 4096}
+              totalHostCpus={metrics?.cpuCount ?? 2}
+              busyAppSlug={busyAppSlug}
+              deployModalOpen={deployModalOpen}
+              onOpenDeployModal={() => setDeployModalOpen(true)}
+              onCloseDeployModal={() => setDeployModalOpen(false)}
+              onLifecycle={handleLifecycleRequest}
+              onInspectApp={handleInspectApp}
+              onCreateDeployPlan={handleCreateDeployPlan}
+              onAskCto={handleQuickAskCto}
+              onNotify={notify}
+            />
+          ) : activeView === "activity" ? (
+            <ActivityView
+              plans={plans}
+              auditEvents={auditEvents}
+              planBusyId={planBusyId}
+              executionNotes={executionNotes}
+              onApprovePlan={(id) => void handlePlanDecision(id, true)}
+              onRejectPlan={(id) => void handlePlanDecision(id, false)}
+              onExecutePlan={(id) => void handleExecutePlan(id)}
+              onNotify={notify}
+            />
+          ) : (
+            <SettingsView
+              onboardingPayload={onboardingPayload}
+              theme={theme}
+              pollIntervalMs={pollIntervalMs}
+              canLock={Boolean(token)}
+              authHeaders={authHeaders}
+              onChangeTheme={setTheme}
+              onChangePollInterval={handlePollChange}
+              onOpenSetupWizard={() => setWizardManualOpen(true)}
+              onRefreshState={loadState}
+              onLock={handleLockToken}
+              onNotify={notify}
+            />
           )}
-        </div>
-      )}
-
-      {/* Full Server & Apps Operations View */}
-      {isAuthenticated && !showWizard && activeView === "server" && (
-        <main className="mx-auto max-w-6xl space-y-6 px-6 py-8">
-          {(offline || error) && (
-            <div
-              role="alert"
-              className="flex items-center justify-between rounded-xl border border-rose-500/40 bg-rose-950/40 px-4 py-3 text-xs text-rose-200"
-            >
-              <span>
-                {error ?? "Control API is unreachable. Telemetry may be stale."}
-              </span>
-              <button
-                type="button"
-                onClick={() => void loadState()}
-                className="rounded bg-rose-800/60 px-2.5 py-1 font-medium hover:bg-rose-700/60"
-              >
-                Retry
-              </button>
-            </div>
-          )}
-
-          {onboardingPayload && !onboardingPayload.state.llmConfigured && (
-            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/40 bg-amber-950/30 px-4 py-3 text-xs text-amber-200">
-              <span>
-                AI CTO provider is not connected yet. Connect OpenCode, OpenAI,
-                Claude, or Ollama in Setup Wizard.
-              </span>
-              <button
-                type="button"
-                onClick={() => setWizardManualOpen(true)}
-                className="rounded-lg bg-amber-600/80 px-3 py-1 font-medium text-white hover:bg-amber-500"
-              >
-                Open Setup Wizard
-              </button>
-            </div>
-          )}
-
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <div className="rounded-xl border border-white/[0.08] bg-[#12151d] p-4">
-              <p className="text-xs text-slate-400">Host</p>
-              <p className="mt-1 truncate text-base font-medium">
-                {metrics?.hostname ?? "—"}
-              </p>
-              <p className="text-xs text-slate-500">
-                {metrics
-                  ? `${metrics.cpuCount} vCPU · load ${metrics.loadAverage1m}`
-                  : "Awaiting telemetry"}
-              </p>
-            </div>
-            <div className="rounded-xl border border-white/[0.08] bg-[#12151d] p-4">
-              <p className="text-xs text-slate-400">Memory</p>
-              <p className="mt-1 text-base font-medium">
-                {metrics
-                  ? `${metrics.memoryUsedMb} / ${metrics.memoryTotalMb} MB`
-                  : "—"}
-              </p>
-              <p className="text-xs text-slate-500">
-                {metrics ? `${metrics.memoryUsagePercent}% used` : "Idle"}
-              </p>
-            </div>
-            <div className="rounded-xl border border-white/[0.08] bg-[#12151d] p-4">
-              <p className="text-xs text-slate-400">Disk</p>
-              <p className="mt-1 text-base font-medium">
-                {metrics?.disk
-                  ? `${Math.round(metrics.disk.usedMb / 1024)} / ${Math.round(metrics.disk.totalMb / 1024)} GB`
-                  : "—"}
-              </p>
-              <p className="text-xs text-slate-500">
-                {metrics?.disk ? `${metrics.disk.usagePercent}% used` : "Unavailable"}
-              </p>
-            </div>
-            <div className="rounded-xl border border-white/[0.08] bg-[#12151d] p-4">
-              <p className="text-xs text-slate-400">Uptime &amp; Apps</p>
-              <p className="mt-1 text-base font-medium">
-                {metrics ? formatUptime(metrics.uptimeSeconds) : "—"}
-              </p>
-              <p className="text-xs text-slate-500">
-                {apps.length} isolated workloads
-              </p>
-            </div>
-          </div>
-
-          <div className="rounded-xl border border-white/[0.08] bg-[#12151d] p-5">
-            <div className="flex items-center justify-between gap-2">
-              <h2 className="text-sm font-semibold text-slate-200">
-                Installed Apps &amp; Personal Agents
-              </h2>
-              {metrics?.collectedAt && (
-                <span className="text-[11px] text-slate-500">
-                  Updated {new Date(metrics.collectedAt).toLocaleTimeString()}
-                </span>
-              )}
-            </div>
-            {appMessage && (
-              <p className="mt-2 rounded bg-black/40 px-3 py-1.5 text-xs text-sky-300">
-                {appMessage}
-              </p>
-            )}
-            {apps.length === 0 ? (
-              <p className="mt-3 text-sm text-slate-400">
-                No workloads provisioned yet. Switch to Agent Chat to deploy an
-                isolated web app or personal agent container.
-              </p>
-            ) : (
-              <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                {apps.map((app) => (
-                  <div
-                    key={app.slug}
-                    className="rounded-lg border border-white/[0.07] bg-black/25 p-4"
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium text-slate-100">{app.name}</span>
-                      <span className="rounded bg-white/[0.08] px-2 py-0.5 text-xs text-slate-300">
-                        {app.status}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-xs text-slate-400">
-                      {app.kind} · {app.domain ?? "internal only"}
-                    </p>
-                    <p className="mt-2 text-xs text-slate-500">
-                      Limits: {app.cpuLimit} CPU / {app.memoryLimitMb} MB RAM
-                    </p>
-                    <div className="mt-3 flex flex-wrap gap-1.5">
-                      {(["start", "stop", "restart"] as const).map((action) => (
-                        <button
-                          key={action}
-                          type="button"
-                          disabled={busyAppSlug === app.slug}
-                          onClick={() => void handleLifecycle(app.slug, action)}
-                          className="rounded border border-white/[0.1] bg-white/[0.03] px-2 py-1 text-[11px] capitalize text-slate-300 hover:bg-white/[0.08] disabled:opacity-50"
-                        >
-                          {action}
-                        </button>
-                      ))}
-                      <button
-                        type="button"
-                        disabled={busyAppSlug === app.slug}
-                        onClick={() => void handleViewLogs(app.slug)}
-                        className="rounded border border-white/[0.1] bg-white/[0.03] px-2 py-1 text-[11px] text-sky-300 hover:bg-white/[0.08] disabled:opacity-50"
-                      >
-                        Logs
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {logsView && (
-              <div className="mt-4 rounded-lg border border-white/[0.08] bg-black/50 p-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium text-slate-300">
-                    Logs: {logsView.slug}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setLogsView(null)}
-                    className="text-xs text-slate-400 hover:text-slate-200"
-                  >
-                    Close
-                  </button>
-                </div>
-                <pre className="mt-2 max-h-48 overflow-auto font-mono text-[11px] text-slate-300">
-                  {logsView.lines.length > 0
-                    ? logsView.lines.join("\n")
-                    : "(no log lines)"}
-                </pre>
-              </div>
-            )}
-          </div>
-
-          <div className="rounded-xl border border-white/[0.08] bg-[#12151d] p-5">
-            <h2 className="text-sm font-semibold text-slate-200">
-              Recent Audit Trail
-            </h2>
-            {auditEvents.length === 0 ? (
-              <p className="mt-3 text-xs text-slate-400">
-                No audit events recorded yet.
-              </p>
-            ) : (
-              <ul className="mt-3 space-y-2">
-                {auditEvents.map((evt) => (
-                  <li
-                    key={evt.id}
-                    className="flex items-start justify-between gap-3 rounded-lg border border-white/[0.07] bg-black/25 px-3 py-2 text-xs"
-                  >
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="font-mono font-medium text-slate-200">
-                          {evt.action}
-                        </span>
-                        {evt.targetSlug && (
-                          <span className="rounded bg-white/[0.07] px-1.5 py-0.5 font-mono text-[10px] text-slate-300">
-                            {evt.targetSlug}
-                          </span>
-                        )}
-                        <span className="text-[10px] uppercase text-slate-500">
-                          {evt.riskLevel}
-                        </span>
-                      </div>
-                      <p className="mt-0.5 truncate text-[11px] text-slate-400">
-                        {evt.summary}
-                      </p>
-                    </div>
-                    <span className="shrink-0 text-[11px] text-slate-500">
-                      {new Date(evt.createdAt).toLocaleTimeString()}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
         </main>
-      )}
+      </div>
+
+      {/* Global Slide-Over Workload Inspector & Log Viewer */}
+      <WorkloadDrawer
+        app={inspectedApp}
+        initialTab={inspectedTab}
+        totalHostMemoryMb={metrics?.memoryTotalMb ?? 4096}
+        totalHostCpus={metrics?.cpuCount ?? 2}
+        busy={Boolean(inspectedApp && busyAppSlug === inspectedApp.slug)}
+        authHeaders={authHeaders}
+        onClose={() => setInspectedSlug(null)}
+        onLifecycle={handleLifecycleRequest}
+        onAskCto={handleQuickAskCto}
+        onNotify={notify}
+      />
+
+      {/* Global Command Palette (Ctrl+K / Cmd+K) */}
+      <CommandPalette
+        open={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        apps={apps}
+        theme={theme}
+        pendingPlansCount={pendingPlansCount}
+        canLock={Boolean(token)}
+        onNavigate={(view) => {
+          setWizardManualOpen(false);
+          setActiveView(view);
+        }}
+        onInspectApp={(app) => handleInspectApp(app, "overview")}
+        onOpenDeployModal={() => {
+          setWizardManualOpen(false);
+          setActiveView("apps");
+          setDeployModalOpen(true);
+        }}
+        onToggleTheme={() =>
+          setTheme((prev) => (prev === "dark" ? "light" : "dark"))
+        }
+        onRefresh={() => void loadState()}
+        onOpenSetupWizard={() => setWizardManualOpen(true)}
+        onLock={handleLockToken}
+      />
+
+      {/* Safe Confirmation Dialog for Risky Actions */}
+      <ConfirmDialog
+        dialog={confirmDialog}
+        busy={confirmBusy}
+        onClose={() => setConfirmDialog(null)}
+      />
+
+      {/* Toast Notification Stack */}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }
