@@ -29,7 +29,7 @@ import { readOnboardingEnvValues } from "./onboarding.js";
 export type ChatStreamEvent =
   | {
       type: "message_start";
-      userMessage: ChatMessage;
+      userMessage?: ChatMessage;
       assistantMessage: ChatMessage;
     }
   | {
@@ -253,6 +253,7 @@ function buildSystemPrompt(
     "Use clean Markdown formatting (short headings, bullet points, tables, fenced code blocks when helpful).",
     "NEVER claim a plan was approved, executed, or deployed unless that exact state appears in Live Inspected Server Context or executed tool results — typing 'approve' in chat does not approve or execute a pending Execution Plan card.",
     "When an Execution Plan card is attached to your turn with status 'pending', NEVER ask the user to type 'approve' in chat — instead direct them to click Approve & Execute on the Execution Plan card below your message.",
+    "When proposedPlan.status is 'executed' (auto-executed in YOLO mode), confirm that it ALREADY ran, report the live workload status, folder, port, and public/internal URL from workloads & autoExecutedSummary, and state any next step clearly.",
     "When an app has domain=null, state clearly that it is currently internal-network-only (listening on its internal port) and needs a domain/route attached before it has a public HTTP(S) link.",
     "If key details are missing or you want the user to pick between options before acting (and no Execution Plan card is attached), ask concisely and optionally append at the very end a single fenced block:\n```vps-questions\n{\"questions\":[{\"question\":\"...\",\"options\":[\"...\",\"...\"]}]}\n```",
     "",
@@ -334,8 +335,19 @@ function buildFallbackResponse(input: {
   apps: AppRecord[];
   attachments: StoredChatAttachmentRecord[];
   plan: StoredPlan | null;
+  yoloExecutionSummary?: string | null;
+  registry?: SystemRegistryStore;
   providerNote: string | null;
 }): string {
+  if (input.plan?.status === "executed" && input.yoloExecutionSummary && input.registry) {
+    const base = formatPlanExecutionMarkdown(
+      input.plan,
+      input.yoloExecutionSummary,
+      input.registry,
+    );
+    return input.providerNote ? `${base}\n\n> ${input.providerNote}` : base;
+  }
+
   const lines: string[] = [];
 
   if (input.plan) {
@@ -345,7 +357,7 @@ function buildFallbackResponse(input: {
     lines.push("");
     if (input.plan.requiresUserApproval) {
       lines.push(
-        "Because this modifies server workloads or configuration, review the steps in the plan card below and click **Approve Plan** before execution.",
+        "Because this modifies server workloads or configuration, review the steps in the plan card below and click **Approve & Execute** before execution.",
       );
     } else {
       lines.push(
@@ -751,6 +763,128 @@ async function callAnthropicStream(
   return { text: fullText, reasoning: fullReasoning };
 }
 
+export function formatSseFrame(event: ChatStreamEvent): Uint8Array {
+  const payload = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+  return new TextEncoder().encode(payload);
+}
+
+async function streamLlmWithReasoning(params: {
+  providerCfg: ResolvedProviderConfig | null;
+  threadId: string;
+  systemPrompt: string;
+  history: ChatMessage[];
+  userPrompt: string;
+  attachments: StoredChatAttachmentRecord[];
+  fetchFn: typeof fetch;
+  signal: AbortSignal | undefined;
+  reasoningBlocks: ChatReasoningBlock[];
+  emit: (event: ChatStreamEvent) => void;
+}): Promise<{ assistantText: string; providerNote: string | null }> {
+  const { providerCfg, emit } = params;
+  let assistantText = "";
+  let providerNote: string | null = null;
+
+  if (!providerCfg) {
+    return {
+      assistantText,
+      providerNote:
+        "Running with the built-in VPS OS CTO planner. Connect **OpenCode** or another AI provider in Setup Wizard for full multi-turn LLM reasoning.",
+    };
+  }
+
+  const llmReasoningId = crypto.randomUUID();
+  const llmReasoningStarted = Date.now();
+  let llmReasoningBlock: ChatReasoningBlock | null = null;
+
+  const ensureLlmReasoningStarted = () => {
+    if (!llmReasoningBlock) {
+      llmReasoningBlock = {
+        id: llmReasoningId,
+        title: `${providerCfg.provider === "opencode" ? "OpenCode" : providerCfg.provider} reasoning`,
+        content: "",
+        durationMs: 0,
+        status: "streaming",
+      };
+      params.reasoningBlocks.push(llmReasoningBlock);
+      emit({ type: "reasoning_start", block: { ...llmReasoningBlock } });
+    }
+  };
+
+  const onLlmReasoningDelta = (delta: string) => {
+    ensureLlmReasoningStarted();
+    if (llmReasoningBlock) {
+      llmReasoningBlock.content += delta;
+      emit({ type: "reasoning_delta", blockId: llmReasoningId, delta });
+    }
+  };
+
+  const onLlmTextDelta = (delta: string) => {
+    assistantText += delta;
+    emit({ type: "text_delta", delta });
+  };
+
+  try {
+    if (
+      providerCfg.provider === "opencode" &&
+      isOpenCodeLocalServerUrl(providerCfg.baseUrl)
+    ) {
+      await callOpenCodeLocalServer(
+        providerCfg,
+        params.systemPrompt,
+        params.userPrompt,
+        params.fetchFn,
+        params.signal,
+        onLlmReasoningDelta,
+        onLlmTextDelta,
+      );
+    } else if (providerCfg.provider === "anthropic") {
+      await callAnthropicStream(
+        providerCfg,
+        params.systemPrompt,
+        params.history,
+        params.userPrompt,
+        params.fetchFn,
+        params.signal,
+        onLlmReasoningDelta,
+        onLlmTextDelta,
+      );
+    } else {
+      await callOpenAiCompatibleStream(
+        providerCfg,
+        params.threadId,
+        params.systemPrompt,
+        params.history,
+        params.userPrompt,
+        params.attachments,
+        params.fetchFn,
+        params.signal,
+        onLlmReasoningDelta,
+        onLlmTextDelta,
+      );
+    }
+
+    if (llmReasoningBlock) {
+      const finishedBlock: ChatReasoningBlock = llmReasoningBlock;
+      finishedBlock.durationMs = Math.max(1, Date.now() - llmReasoningStarted);
+      finishedBlock.status = "done";
+      emit({ type: "reasoning_done", block: { ...finishedBlock } });
+    }
+  } catch (err) {
+    const safeErr = redactSecrets(
+      err instanceof Error ? err.message : "Provider request failed.",
+    );
+    providerNote = `Live provider (${providerCfg.provider} · ${providerCfg.model}) could not be reached (${safeErr}). Showing built-in CTO inspection summary.`;
+    if (llmReasoningBlock) {
+      const finishedBlock: ChatReasoningBlock = llmReasoningBlock;
+      finishedBlock.durationMs = Math.max(1, Date.now() - llmReasoningStarted);
+      finishedBlock.status = "done";
+      emit({ type: "reasoning_done", block: { ...finishedBlock } });
+    }
+  }
+
+  return { assistantText, providerNote };
+}
+
 /**
  * Executes a full agentic CTO turn:
  * 1. Runs grounded, read-only VPS inspection tools & attachment analysis
@@ -800,20 +934,25 @@ export async function runAgentChatTurn(
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
   const riskLevel = classifyGoalRisk(sanitizedGoal);
+  const isQuestionAnswerReply = /^[-*]\s+\*\*[^*]+\*\*/m.test(sanitizedGoal);
   const isConversationalQuestion =
+    isQuestionAnswerReply ||
     /^(what|whats|what's|how|why|when|where|which|who|can|could|would|should|do|does|is|are|explain|tell)\b/i.test(
       sanitizedGoal,
-    ) || sanitizedGoal.endsWith("?");
+    ) ||
+    sanitizedGoal.endsWith("?");
   const hasExecutableDeployOrLifecycle =
-    extractDeploySpecFromGoal(sanitizedGoal) !== null ||
-    /^\s*(start|stop|restart)\s+(?:the\s+)?(?:app\s+|container\s+|workload\s+)?[a-z0-9][a-z0-9-]{1,47}/i.test(
-      sanitizedGoal,
-    );
+    !isQuestionAnswerReply &&
+    (extractDeploySpecFromGoal(sanitizedGoal) !== null ||
+      /^\s*(start|stop|restart)\s+(?:the\s+)?(?:app\s+|container\s+|workload\s+)?[a-z0-9][a-z0-9-]{1,47}/i.test(
+        sanitizedGoal,
+      ));
   const hasExplicitMutationVerb =
-    riskLevel === "high" ||
-    /\b(deploy|install|create|provision|restart|stop|start|domain|backup|plan|route|expose|remove|delete)\b/i.test(
-      sanitizedGoal,
-    );
+    !isQuestionAnswerReply &&
+    (riskLevel === "high" ||
+      /\b(deploy|install|create|provision|restart|stop|start|domain|backup|plan|route|expose|remove|delete)\b/i.test(
+        sanitizedGoal,
+      ));
   const shouldProposePlan =
     input.mode !== "ask" &&
     (input.mode === "plan" ||
@@ -946,7 +1085,7 @@ export async function runAgentChatTurn(
   const disk = deps.getDisk();
 
   // Tool 2: Inspect registered apps (traced only when relevant, silent context otherwise)
-  const appsResult = shouldTraceApps
+  let appsResult = shouldTraceApps
     ? await runTool(
         "inspect_apps",
         "Inspect isolated workloads & statuses",
@@ -954,7 +1093,7 @@ export async function runAgentChatTurn(
         collectAppsSummary,
       )
     : await collectAppsSummary();
-  const apps = deps.registry.listApps();
+  let apps = deps.registry.listApps();
 
   // Surface @mentions that resolve neither to a registered app slug nor a
   // built-in system token so users immediately spot typos without failing the turn.
@@ -1138,6 +1277,8 @@ export async function runAgentChatTurn(
           );
           if (execRes) {
             appendInitialThought(`YOLO execution succeeded: ${execRes.summary}`);
+            appsResult = await collectAppsSummary();
+            apps = deps.registry.listApps();
           }
         }
       } else {
@@ -1161,37 +1302,6 @@ export async function runAgentChatTurn(
   let providerNote: string | null = null;
 
   if (providerCfg) {
-    const llmReasoningId = crypto.randomUUID();
-    const llmReasoningStarted = Date.now();
-    let llmReasoningBlock: ChatReasoningBlock | null = null;
-
-    const ensureLlmReasoningStarted = () => {
-      if (!llmReasoningBlock) {
-        llmReasoningBlock = {
-          id: llmReasoningId,
-          title: `${providerCfg.provider === "opencode" ? "OpenCode" : providerCfg.provider} reasoning`,
-          content: "",
-          durationMs: 0,
-          status: "streaming",
-        };
-        reasoningBlocks.push(llmReasoningBlock);
-        emit({ type: "reasoning_start", block: { ...llmReasoningBlock } });
-      }
-    };
-
-    const onLlmReasoningDelta = (delta: string) => {
-      ensureLlmReasoningStarted();
-      if (llmReasoningBlock) {
-        llmReasoningBlock.content += delta;
-        emit({ type: "reasoning_delta", blockId: llmReasoningId, delta });
-      }
-    };
-
-    const onLlmTextDelta = (delta: string) => {
-      assistantText += delta;
-      emit({ type: "text_delta", delta });
-    };
-
     const contextPayload = JSON.stringify(
       {
         telemetry,
@@ -1235,64 +1345,20 @@ export async function runAgentChatTurn(
       input.attachments,
     );
 
-    try {
-      if (
-        providerCfg.provider === "opencode" &&
-        isOpenCodeLocalServerUrl(providerCfg.baseUrl)
-      ) {
-        await callOpenCodeLocalServer(
-          providerCfg,
-          systemPrompt,
-          userPrompt,
-          fetchFn,
-          input.signal,
-          onLlmReasoningDelta,
-          onLlmTextDelta,
-        );
-      } else if (providerCfg.provider === "anthropic") {
-        await callAnthropicStream(
-          providerCfg,
-          systemPrompt,
-          input.history,
-          userPrompt,
-          fetchFn,
-          input.signal,
-          onLlmReasoningDelta,
-          onLlmTextDelta,
-        );
-      } else {
-        await callOpenAiCompatibleStream(
-          providerCfg,
-          input.threadId,
-          systemPrompt,
-          input.history,
-          userPrompt,
-          input.attachments,
-          fetchFn,
-          input.signal,
-          onLlmReasoningDelta,
-          onLlmTextDelta,
-        );
-      }
-
-      if (llmReasoningBlock) {
-        const finishedBlock: ChatReasoningBlock = llmReasoningBlock;
-        finishedBlock.durationMs = Math.max(1, Date.now() - llmReasoningStarted);
-        finishedBlock.status = "done";
-        emit({ type: "reasoning_done", block: { ...finishedBlock } });
-      }
-    } catch (err) {
-      const safeErr = redactSecrets(
-        err instanceof Error ? err.message : "Provider request failed.",
-      );
-      providerNote = `Live provider (${providerCfg.provider} · ${providerCfg.model}) could not be reached (${safeErr}). Showing built-in CTO inspection summary.`;
-      if (llmReasoningBlock) {
-        const finishedBlock: ChatReasoningBlock = llmReasoningBlock;
-        finishedBlock.durationMs = Math.max(1, Date.now() - llmReasoningStarted);
-        finishedBlock.status = "done";
-        emit({ type: "reasoning_done", block: { ...finishedBlock } });
-      }
-    }
+    const streamed = await streamLlmWithReasoning({
+      providerCfg,
+      threadId: input.threadId,
+      systemPrompt,
+      history: input.history,
+      userPrompt,
+      attachments: input.attachments,
+      fetchFn,
+      signal: input.signal,
+      reasoningBlocks,
+      emit,
+    });
+    assistantText = streamed.assistantText;
+    providerNote = streamed.providerNote;
   } else {
     providerNote =
       "Running with the built-in VPS OS CTO planner. Connect **OpenCode** or another AI provider in Setup Wizard for full multi-turn LLM reasoning.";
@@ -1307,9 +1373,25 @@ export async function runAgentChatTurn(
       apps,
       attachments: input.attachments,
       plan: createdPlan,
+      yoloExecutionSummary,
+      registry: deps.registry,
       providerNote,
     });
     emit({ type: "text_delta", delta: assistantText });
+  } else if (
+    createdPlan?.status === "executed" &&
+    yoloExecutionSummary &&
+    !assistantText.includes("Workloads")
+  ) {
+    // Ensure YOLO turns always include concrete workload details if the LLM omitted them.
+    const stepDetails = formatPlanExecutionMarkdown(
+      createdPlan,
+      yoloExecutionSummary,
+      deps.registry,
+    );
+    const addition = `\n\n${stepDetails}`;
+    assistantText += addition;
+    emit({ type: "text_delta", delta: addition });
   }
 
   const publicAttachments: ChatAttachment[] = [];
@@ -1331,6 +1413,276 @@ export async function runAgentChatTurn(
   return {
     assistantMessage,
     plan: createdPlan,
+    providerLabel,
+    modelLabel,
+  };
+}
+
+export interface RunPlanExecutionTurnInput {
+  threadId: string;
+  plan: StoredPlan;
+  leaseOwnerId: string;
+  executePlan: (
+    plan: StoredPlan,
+    options: { leaseOwnerId: string },
+  ) => Promise<{ summary: string }> | { summary: string };
+  messageId?: string | undefined;
+  overrideProvider?: LlmProvider | undefined;
+  overrideModel?: string | undefined;
+  signal?: AbortSignal | undefined;
+  onEvent?: (event: ChatStreamEvent) => void;
+}
+
+export interface RunPlanExecutionTurnResult {
+  ok: boolean;
+  plan: StoredPlan;
+  summary: string;
+  errorMessage?: string;
+  assistantMessage: ChatMessage;
+  providerLabel: string;
+  modelLabel: string;
+}
+
+/**
+ * Executes an approved ExecutionPlan as a full traced CTO chat turn with live
+ * reasoning, `execute_plan` + `inspect_apps` tool calls, and a streamed LLM
+ * confirmation (or deterministic fallback report).
+ */
+export async function runPlanExecutionChatTurn(
+  deps: ChatEngineDeps,
+  input: RunPlanExecutionTurnInput,
+): Promise<RunPlanExecutionTurnResult> {
+  const emit = input.onEvent ?? (() => {});
+  const fetchFn = deps.fetchFn ?? fetch;
+  const onboarding = deps.registry.getOnboardingState();
+  const providerCfg = deps.disableExternalLlm
+    ? null
+    : resolveProviderConfig(deps, input.overrideProvider, input.overrideModel);
+  const providerLabel = providerCfg?.provider ?? "vps-os-cto";
+  const modelLabel = providerCfg?.model ?? "deterministic-planner";
+
+  const reasoningBlocks: ChatReasoningBlock[] = [];
+  const toolCalls: ChatToolCall[] = [];
+
+  const execReasoningId = crypto.randomUUID();
+  const execReasoningStarted = Date.now();
+  const execReasoning: ChatReasoningBlock = {
+    id: execReasoningId,
+    title: "Executing approved plan",
+    content: `Running ${input.plan.steps.length}-step approved plan for "${redactSecrets(input.plan.goal)}".`,
+    durationMs: 0,
+    status: "streaming",
+  };
+  reasoningBlocks.push(execReasoning);
+  emit({ type: "reasoning_start", block: { ...execReasoning } });
+
+  const appendThought = (line: string) => {
+    const delta = `\n${redactSecrets(line)}`;
+    execReasoning.content += delta;
+    emit({ type: "reasoning_delta", blockId: execReasoningId, delta });
+  };
+
+  let executionSummary = "";
+  let executionError: string | null = null;
+  let finalPlan = input.plan;
+
+  const execTool: ChatToolCall = {
+    id: crypto.randomUUID(),
+    toolName: "execute_plan",
+    label: `Execute ${input.plan.steps.length}-step approved plan`,
+    status: "running",
+    input: {
+      planId: input.plan.id,
+      steps: input.plan.steps.map((s) => s.title),
+    },
+    output: undefined,
+    error: null,
+    durationMs: null,
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+  };
+  toolCalls.push(execTool);
+  emit({ type: "tool_start", toolCall: { ...execTool } });
+
+  const execStartMs = Date.now();
+  try {
+    const outcome = await input.executePlan(input.plan, {
+      leaseOwnerId: input.leaseOwnerId,
+    });
+    const transitioned = deps.registry.markPlanExecuted(
+      input.plan.id,
+      input.leaseOwnerId,
+    );
+    if (!transitioned) {
+      throw new Error(`Plan "${input.plan.id}" was already executed or modified.`);
+    }
+    executionSummary = redactSecrets(outcome.summary);
+    execTool.status = "success";
+    execTool.output = { summary: executionSummary };
+    execTool.durationMs = Math.max(1, Date.now() - execStartMs);
+    execTool.completedAt = new Date().toISOString();
+    emit({ type: "tool_done", toolCall: { ...execTool } });
+    appendThought(`Execution succeeded: ${executionSummary}`);
+
+    finalPlan = deps.registry.getPlan(input.plan.id) ?? {
+      ...input.plan,
+      status: "executed",
+    };
+    deps.registry.recordAudit({
+      id: crypto.randomUUID(),
+      actor: "user",
+      action: "chat.plan_executed",
+      targetSlug: null,
+      summary: redactSecrets(`Executed plan ${input.plan.id}: ${executionSummary}`),
+      riskLevel: input.plan.requiresUserApproval ? "medium" : "low",
+      createdAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    deps.registry.releasePlanExecution(input.plan.id, input.leaseOwnerId);
+    executionError = redactSecrets(
+      err instanceof Error ? err.message : `Could not execute plan "${input.plan.id}".`,
+    );
+    execTool.status = "error";
+    execTool.error = executionError;
+    execTool.durationMs = Math.max(1, Date.now() - execStartMs);
+    execTool.completedAt = new Date().toISOString();
+    emit({ type: "tool_done", toolCall: { ...execTool } });
+    appendThought(`Execution failed: ${executionError}`);
+  }
+
+  // Verify live workloads after execution
+  const inspectTool: ChatToolCall = {
+    id: crypto.randomUUID(),
+    toolName: "inspect_apps",
+    label: "Verify live workloads & endpoints",
+    status: "running",
+    input: {},
+    output: undefined,
+    error: null,
+    durationMs: null,
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+  };
+  toolCalls.push(inspectTool);
+  emit({ type: "tool_start", toolCall: { ...inspectTool } });
+
+  const inspectStartMs = Date.now();
+  let appsSnapshot: Array<Record<string, unknown>> = [];
+  try {
+    const synced = await syncAppStatuses(deps.registry, deps.syncStatuses);
+    appsSnapshot = synced.map((app) => ({
+      slug: app.slug,
+      name: app.name,
+      kind: app.kind,
+      status: app.status,
+      domain: app.domain,
+      url: app.domain ? `https://${app.domain}` : null,
+      internalPort: app.internalPort,
+      folderPath: app.folderPath,
+    }));
+    inspectTool.status = "success";
+    inspectTool.output = { count: appsSnapshot.length, apps: appsSnapshot };
+  } catch (err) {
+    inspectTool.status = "error";
+    inspectTool.error = redactSecrets(
+      err instanceof Error ? err.message : "Failed to inspect workloads.",
+    );
+  }
+  inspectTool.durationMs = Math.max(1, Date.now() - inspectStartMs);
+  inspectTool.completedAt = new Date().toISOString();
+  emit({ type: "tool_done", toolCall: { ...inspectTool } });
+
+  execReasoning.durationMs = Math.max(1, Date.now() - execReasoningStarted);
+  execReasoning.status = "done";
+  emit({ type: "reasoning_done", block: { ...execReasoning } });
+
+  const dashboardUrl = onboarding.domain
+    ? `https://${onboarding.domain}`
+    : onboarding.publicIp
+      ? `http://${onboarding.publicIp}`
+      : null;
+
+  let assistantText = "";
+  if (providerCfg) {
+    const history = deps.registry.listChatMessages(input.threadId);
+    const contextPayload = JSON.stringify(
+      {
+        telemetry: {
+          hostname: deps.getMetrics().hostname,
+          publicIp: onboarding.publicIp,
+          dashboardDomain: onboarding.domain,
+          dashboardUrl,
+        },
+        executedPlan: {
+          id: finalPlan.id,
+          goal: finalPlan.goal,
+          status: executionError ? "error" : finalPlan.status,
+          summary: executionError ? executionError : executionSummary,
+          steps: finalPlan.steps.map((s) => ({
+            title: s.title,
+            description: s.description,
+            toolName: s.toolName,
+          })),
+        },
+        workloads: appsSnapshot,
+      },
+      null,
+      2,
+    );
+
+    const systemPrompt = buildSystemPrompt(
+      onboarding.persona,
+      "agent",
+      "medium",
+      contextPayload,
+    );
+    const prompt = executionError
+      ? `The approved plan "${finalPlan.goal}" failed to execute with error: ${executionError}. Explain clearly what failed and the safest next step.`
+      : `The approved plan "${finalPlan.goal}" just finished executing (${executionSummary}). Summarize concisely what was done, the live workload status, folder, port, and exact URL/domain (or explain clearly if internal-network-only).`;
+
+    const streamed = await streamLlmWithReasoning({
+      providerCfg,
+      threadId: input.threadId,
+      systemPrompt,
+      history,
+      userPrompt: prompt,
+      attachments: [],
+      fetchFn,
+      signal: input.signal,
+      reasoningBlocks,
+      emit,
+    });
+    assistantText = streamed.assistantText;
+  }
+
+  if (!assistantText.trim()) {
+    assistantText = executionError
+      ? `### Plan Execution Failed\n\n${executionError}`
+      : formatPlanExecutionMarkdown(finalPlan, executionSummary, deps.registry);
+    emit({ type: "text_delta", delta: assistantText });
+  }
+
+  const assistantMessage: ChatMessage = {
+    id: input.messageId ?? crypto.randomUUID(),
+    threadId: input.threadId,
+    role: "assistant",
+    content: redactSecrets(assistantText),
+    attachments: [],
+    reasoning: reasoningBlocks,
+    toolCalls,
+    planId: null,
+    provider: providerLabel,
+    model: modelLabel,
+    status: executionError ? "error" : "completed",
+    createdAt: new Date().toISOString(),
+  };
+
+  return {
+    ok: !executionError,
+    plan: finalPlan,
+    summary: executionError ? executionError : executionSummary,
+    ...(executionError ? { errorMessage: executionError } : {}),
+    assistantMessage,
     providerLabel,
     modelLabel,
   };

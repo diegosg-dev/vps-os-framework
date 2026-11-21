@@ -210,11 +210,22 @@ export function extractDeploySpecFromGoal(goal: string): DerivedDeploySpec | nul
   }
   const trimmed = goal.trim();
   if (
+    /^[-*]\s+\*\*[^*]+\*\*/m.test(trimmed) ||
     /^(?:what|whats|what's|how|why|when|where|which|who|should|do|does|is|are)\b/i.test(
       trimmed,
     ) ||
     (trimmed.endsWith("?") &&
-      !/\b(?:named|called|slug)\b/i.test(trimmed))
+      !/\b(?:named|called|slug)\b/i.test(trimmed)) ||
+    /\b(?:keep one plan|manual review|don't deploy|do not deploy)\b/i.test(trimmed)
+  ) {
+    return null;
+  }
+  // Ignore noun usages like "the landing deploy can run" where deploy/create/etc. isn't used as a command verb.
+  if (
+    !/\b(?:deploy|install|create|provision|launch|spin\s+up)\s+(?:a|an|the|new|my|isolated|[a-z0-9][a-z0-9-]*)\b/i.test(
+      trimmed,
+    ) ||
+    /\b(?:landing|auto|manual)\s+deploy\b/i.test(trimmed)
   ) {
     return null;
   }

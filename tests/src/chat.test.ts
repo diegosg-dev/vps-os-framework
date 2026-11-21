@@ -838,7 +838,69 @@ test("YOLO Sandbox mode auto-approves and executes safe deploys while blocking m
       ),
     );
 
-    // 3. Destructive manual_review goal still stays pending and never auto-executes
+    // 3. Q&A reply containing "deploy" does NOT misfire into a bogus deployment in YOLO mode
+    const qaRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        content:
+          "- **Split into two plans so the landing deploy can run automatically?** No — keep one plan and accept it needs manual review",
+        mode: "agent",
+        stream: false,
+      }),
+    });
+    assert.equal(qaRes.status, 200);
+    const qaJson = (await qaRes.json()) as { plan: unknown };
+    assert.equal(qaJson.plan, null);
+    assert.equal(executedCount, 1);
+
+    // 4. Streaming plan execution behaves like a full traced chat turn
+    const pendingRes = await app.request("/api/chat/plan", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ goal: "Deploy stream-app web app" }),
+    });
+    assert.ok(pendingRes.ok);
+    const { plan: streamPlan } = (await pendingRes.json()) as { plan: { id: string } };
+    registry.appendChatMessage({
+      id: "stream-origin-msg",
+      threadId: thread.id,
+      role: "assistant",
+      content: "Approve below.",
+      attachments: [],
+      reasoning: [],
+      toolCalls: [],
+      planId: streamPlan.id,
+      provider: "opencode",
+      model: "glm-5.3",
+      status: "completed",
+      createdAt: new Date().toISOString(),
+    });
+    await app.request("/api/chat/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ planId: streamPlan.id, approved: true, decidedBy: "admin" }),
+    });
+    const streamExecRes = await app.request("/api/chat/execute", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        ...authHeaders,
+      },
+      body: JSON.stringify({ planId: streamPlan.id, stream: true }),
+    });
+    assert.equal(streamExecRes.status, 200);
+    assert.match(streamExecRes.headers.get("content-type") ?? "", /text\/event-stream/);
+    const sseText = await streamExecRes.text();
+    assert.match(sseText, /event: message_start/);
+    assert.match(sseText, /event: reasoning_start/);
+    assert.match(sseText, /"toolName":"execute_plan"/);
+    assert.match(sseText, /"toolName":"inspect_apps"/);
+    assert.match(sseText, /event: message_done/);
+    assert.equal(executedCount, 2);
+
+    // 5. Destructive manual_review goal still stays pending and never auto-executes
     const wipeRes = await app.request(`/api/chat/threads/${thread.id}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders },
@@ -852,7 +914,7 @@ test("YOLO Sandbox mode auto-approves and executes safe deploys while blocking m
     const wipeJson = (await wipeRes.json()) as {
       plan: { status: string } | null;
     };
-    assert.equal(executedCount, 1);
+    assert.equal(executedCount, 2);
     assert.equal(wipeJson.plan?.status, "pending");
   } finally {
     registry.close();
