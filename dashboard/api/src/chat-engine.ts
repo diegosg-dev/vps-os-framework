@@ -875,61 +875,85 @@ export async function runAgentChatTurn(
     }
   }
 
-  // Tool 1: Inspect live host metrics
   const dashboardUrl = onboarding.domain
     ? `https://${onboarding.domain}`
     : onboarding.publicIp
       ? `http://${onboarding.publicIp}`
       : null;
-  const telemetry = await runTool(
-    "inspect_system_metrics",
-    "Inspect live host CPU, RAM & disk",
-    {},
-    () => {
-      const metrics = deps.getMetrics();
-      const disk = deps.getDisk();
-      return {
-        hostname: metrics.hostname,
-        publicIp: onboarding.publicIp,
-        dashboardDomain: onboarding.domain,
-        dashboardUrl,
-        cpuCount: metrics.cpuCount,
-        loadAverage1m: metrics.loadAverage1m,
-        memoryUsedMb: metrics.memoryUsedMb,
-        memoryTotalMb: metrics.memoryTotalMb,
-        memoryUsagePercent: metrics.memoryUsagePercent,
-        uptimeSeconds: metrics.uptimeSeconds,
-        ...(disk ? { disk } : {}),
-      };
-    },
-  );
+
+  const collectTelemetry = () => {
+    const metricsSnapshot = deps.getMetrics();
+    const diskSnapshot = deps.getDisk();
+    return {
+      hostname: metricsSnapshot.hostname,
+      publicIp: onboarding.publicIp,
+      dashboardDomain: onboarding.domain,
+      dashboardUrl,
+      cpuCount: metricsSnapshot.cpuCount,
+      loadAverage1m: metricsSnapshot.loadAverage1m,
+      memoryUsedMb: metricsSnapshot.memoryUsedMb,
+      memoryTotalMb: metricsSnapshot.memoryTotalMb,
+      memoryUsagePercent: metricsSnapshot.memoryUsagePercent,
+      uptimeSeconds: metricsSnapshot.uptimeSeconds,
+      ...(diskSnapshot ? { disk: diskSnapshot } : {}),
+    };
+  };
+
+  const collectAppsSummary = async () => {
+    const synced = await syncAppStatuses(deps.registry, deps.syncStatuses);
+    return {
+      count: synced.length,
+      apps: synced.map((app) => ({
+        slug: app.slug,
+        name: app.name,
+        kind: app.kind,
+        status: app.status,
+        domain: app.domain,
+        url: app.domain ? `https://${app.domain}` : null,
+        internalPort: app.internalPort,
+        folderPath: app.folderPath,
+        cpuLimit: app.cpuLimit,
+        memoryLimitMb: app.memoryLimitMb,
+      })),
+    };
+  };
+
+  const shouldTraceMetrics =
+    shouldProposePlan ||
+    input.mode === "plan" ||
+    mentionedSlugs.includes("host-metrics") ||
+    /\b(cpu|ram|memory|disk|load|uptime|metric|health|status|server|host|vps|link|url|domain|ip|port|headroom)\b/i.test(
+      sanitizedGoal,
+    );
+  const shouldTraceApps =
+    shouldProposePlan ||
+    input.mode === "plan" ||
+    mentionedSlugs.length > 0 ||
+    /\b(app|apps|container|workload|deploy|install|create|provision|restart|stop|start|link|url|domain|ip|port|error|log|crash|broken|remove|delete|status|health|list)\b/i.test(
+      sanitizedGoal,
+    );
+
+  // Tool 1: Inspect live host metrics (traced only when relevant, silent context otherwise)
+  const telemetry = shouldTraceMetrics
+    ? await runTool(
+        "inspect_system_metrics",
+        "Inspect live host CPU, RAM & disk",
+        {},
+        collectTelemetry,
+      )
+    : collectTelemetry();
   const metrics = deps.getMetrics();
   const disk = deps.getDisk();
 
-  // Tool 2: Inspect registered apps
-  const appsResult = await runTool(
-    "inspect_apps",
-    "Inspect isolated workloads & statuses",
-    {},
-    async () => {
-      const apps = await syncAppStatuses(deps.registry, deps.syncStatuses);
-      return {
-        count: apps.length,
-        apps: apps.map((app) => ({
-          slug: app.slug,
-          name: app.name,
-          kind: app.kind,
-          status: app.status,
-          domain: app.domain,
-          url: app.domain ? `https://${app.domain}` : null,
-          internalPort: app.internalPort,
-          folderPath: app.folderPath,
-          cpuLimit: app.cpuLimit,
-          memoryLimitMb: app.memoryLimitMb,
-        })),
-      };
-    },
-  );
+  // Tool 2: Inspect registered apps (traced only when relevant, silent context otherwise)
+  const appsResult = shouldTraceApps
+    ? await runTool(
+        "inspect_apps",
+        "Inspect isolated workloads & statuses",
+        {},
+        collectAppsSummary,
+      )
+    : await collectAppsSummary();
   const apps = deps.registry.listApps();
 
   // Surface @mentions that resolve neither to a registered app slug nor a

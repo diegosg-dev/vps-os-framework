@@ -93,6 +93,125 @@ function parseClarifyingQuestions(content: string): {
   }
 }
 
+/** Interactive multi-question form allowing multi-select pills, custom text, or skipped fields before sending. */
+function ClarifyingQuestionsCard({
+  questions,
+  disabled,
+  onSubmit,
+}: {
+  questions: ClarifyingQuestion[];
+  disabled: boolean;
+  onSubmit: (formattedReply: string) => void;
+}) {
+  const [selectedByIdx, setSelectedByIdx] = useState<Record<number, string[]>>({});
+  const [customByIdx, setCustomByIdx] = useState<Record<number, string>>({});
+  const [submitted, setSubmitted] = useState(false);
+
+  function toggleOption(qIdx: number, option: string) {
+    if (disabled || submitted) return;
+    setSelectedByIdx((prev) => {
+      const current = prev[qIdx] ?? [];
+      const exists = current.includes(option);
+      const next = exists
+        ? current.filter((item) => item !== option)
+        : [...current, option];
+      return { ...prev, [qIdx]: next };
+    });
+  }
+
+  const answeredEntries = questions
+    .map((q, idx) => {
+      const picks = selectedByIdx[idx] ?? [];
+      const custom = (customByIdx[idx] ?? "").trim();
+      const parts = [...picks, ...(custom ? [custom] : [])];
+      return { question: q.question, parts };
+    })
+    .filter((entry) => entry.parts.length > 0);
+
+  function handleSend() {
+    if (disabled || submitted || answeredEntries.length === 0) return;
+    const formatted =
+      answeredEntries.length === 1 && questions.length === 1
+        ? answeredEntries[0]!.parts.join(", ")
+        : answeredEntries
+            .map((entry) => `- **${entry.question}** ${entry.parts.join(", ")}`)
+            .join("\n");
+    setSubmitted(true);
+    onSubmit(formatted);
+  }
+
+  return (
+    <div className="vps-card space-y-3 rounded-2xl border-[var(--accent-border)] bg-[var(--bg-inset)] p-4">
+      {questions.map((q, idx) => {
+        const picks = selectedByIdx[idx] ?? [];
+        const customValue = customByIdx[idx] ?? "";
+        return (
+          <div key={q.question} className="space-y-1.5">
+            <p className="text-xs font-medium text-[var(--text-primary)]">
+              {q.question}
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {q.options.map((opt) => {
+                const isSelected = picks.includes(opt);
+                return (
+                  <button
+                    key={opt}
+                    type="button"
+                    disabled={disabled || submitted}
+                    onClick={() => toggleOption(idx, opt)}
+                    className={`rounded-xl border px-2.5 py-1 text-xs font-medium transition disabled:opacity-50 ${
+                      isSelected
+                        ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--text-inverse)]"
+                        : "border-[var(--border-default)] bg-[var(--bg-surface)] text-[var(--text-primary)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)]"
+                    }`}
+                  >
+                    {opt}
+                  </button>
+                );
+              })}
+            </div>
+            <input
+              type="text"
+              value={customValue}
+              disabled={disabled || submitted}
+              onChange={(e) =>
+                setCustomByIdx((prev) => ({ ...prev, [idx]: e.target.value }))
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSend();
+                }
+              }}
+              placeholder="Or type a custom answer (optional)..."
+              className="vps-input w-full rounded-xl px-2.5 py-1.5 text-xs"
+            />
+          </div>
+        );
+      })}
+
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--border-subtle)] pt-2.5">
+        <span className="text-[11px] text-[var(--text-muted)]">
+          {submitted
+            ? `Sent ${answeredEntries.length} answer${answeredEntries.length === 1 ? "" : "s"}`
+            : answeredEntries.length > 0
+              ? `${answeredEntries.length} of ${questions.length} answered (optional fields can stay blank)`
+              : "Pick one or more options, type a custom answer, or skip any question"}
+        </span>
+        <button
+          type="button"
+          disabled={disabled || submitted || answeredEntries.length === 0}
+          onClick={handleSend}
+          className="vps-btn-primary inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold disabled:opacity-40"
+        >
+          <CheckCircleIcon className="h-3.5 w-3.5" />
+          {submitted ? "Sent" : "Send Answers"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /** Loads an authenticated attachment image via Bearer headers and caches a blob URL. */
 function AuthAttachmentImage({
   attachment,
@@ -396,29 +515,46 @@ function InlinePlanCard({
         </ol>
 
         {plan.requiresUserApproval && status === "pending" && (
-          <div className="flex flex-wrap gap-2 pt-1">
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => onApprove(plan.id)}
-              className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
-            >
-              <CheckCircleIcon className="h-3.5 w-3.5" />
-              {busy ? "Approving & executing..." : "Approve & Execute"}
-            </button>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => onReject(plan.id)}
-              className="vps-btn-secondary inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium text-[var(--danger)]"
-            >
-              <XCircleIcon className="h-3.5 w-3.5" />
-              Reject
-            </button>
-          </div>
+          plan.steps.some((step) => step.toolName === "manual_review") ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--warning-border)] bg-[var(--warning-soft)] px-3 py-2">
+              <span className="text-[11.5px] text-[var(--warning)]">
+                Manual review required — automated execution is disabled for ambiguous or host-level steps.
+              </span>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => onReject(plan.id)}
+                className="vps-btn-secondary inline-flex items-center justify-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium text-[var(--danger)]"
+              >
+                <XCircleIcon className="h-3.5 w-3.5" />
+                Dismiss
+              </button>
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-2 pt-1">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => onApprove(plan.id)}
+                className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
+              >
+                <CheckCircleIcon className="h-3.5 w-3.5" />
+                {busy ? "Approving & executing..." : "Approve & Execute"}
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => onReject(plan.id)}
+                className="vps-btn-secondary inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium text-[var(--danger)]"
+              >
+                <XCircleIcon className="h-3.5 w-3.5" />
+                Reject
+              </button>
+            </div>
+          )
         )}
 
-        {status === "approved" && (
+        {status === "approved" && !plan.steps.some((step) => step.toolName === "manual_review") && (
           <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--accent-border)] bg-[var(--accent-soft)] p-3">
             <span className="text-[11.5px] text-[var(--text-primary)]">
               Approved and ready to execute via the host runtime bridge.
@@ -470,16 +606,16 @@ export function ChatTurnItem({
   const [copied, setCopied] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draftEdit, setDraftEdit] = useState(message.content);
-  const [timelineExpanded, setTimelineExpanded] = useState(true);
+  const [timelineExpanded, setTimelineExpanded] = useState(
+    message.status === "streaming",
+  );
   const { cleanContent, questions } = useMemo(
     () => parseClarifyingQuestions(message.content),
     [message.content],
   );
 
   useEffect(() => {
-    if (message.status === "streaming") {
-      setTimelineExpanded(true);
-    }
+    setTimelineExpanded(message.status === "streaming");
   }, [message.status]);
 
   function handleCopy() {
@@ -735,34 +871,17 @@ export function ChatTurnItem({
           </div>
         )}
 
-        {/* Interactive Clarifying Questions (clickable quick replies) */}
+        {/* Interactive Clarifying Questions (multi-select + custom answers form) */}
         {questions.length > 0 && !linkedPlan && (
-          <div className="vps-card space-y-2.5 rounded-2xl border-[var(--accent-border)] bg-[var(--bg-inset)] p-3.5">
-            {questions.map((q) => (
-              <div key={q.question} className="space-y-1.5">
-                <p className="text-xs font-medium text-[var(--text-primary)]">
-                  {q.question}
-                </p>
-                <div className="flex flex-wrap gap-1.5">
-                  {q.options.map((opt) => (
-                    <button
-                      key={opt}
-                      type="button"
-                      disabled={streaming || !onQuickReply}
-                      onClick={() => onQuickReply?.(opt)}
-                      className="rounded-xl border border-[var(--border-default)] bg-[var(--bg-surface)] px-2.5 py-1 text-xs font-medium text-[var(--text-primary)] transition hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)] disabled:opacity-40"
-                    >
-                      {opt}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
+          <ClarifyingQuestionsCard
+            questions={questions}
+            disabled={streaming || !onQuickReply}
+            onSubmit={(formatted) => onQuickReply?.(formatted)}
+          />
         )}
 
-        {/* Inline Execution Plan Card (always at the end of the turn) */}
-        {linkedPlan && (
+        {/* Inline Execution Plan Card (shown only after streaming/thinking finishes) */}
+        {linkedPlan && message.status !== "streaming" && (
           <InlinePlanCard
             plan={linkedPlan}
             busy={planBusyId === linkedPlan.id}
