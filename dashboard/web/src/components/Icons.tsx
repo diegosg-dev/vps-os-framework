@@ -542,3 +542,71 @@ export function SpinnerIcon(props: IconProps) {
     </BaseIcon>
   );
 }
+
+export function PinIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <path d="M12 17v5" />
+      <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
+    </BaseIcon>
+  );
+}
+
+export function ArchiveIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <rect x="2" y="4" width="20" height="5" rx="1" />
+      <path d="M4 9v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9" />
+      <path d="M10 13h4" />
+    </BaseIcon>
+  );
+}
+
+export function GitForkIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <circle cx="12" cy="18" r="3" />
+      <circle cx="6" cy="6" r="3" />
+      <circle cx="18" cy="6" r="3" />
+      <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9" />
+      <path d="M12 12v3" />
+    </BaseIcon>
+  );
+}
+
+export function AtSignIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8" />
+    </BaseIcon>
+  );
+}
+
+export function ArrowDownIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <path d="M12 5v14" />
+      <path d="m19 12-7 7-7-7" />
+    </BaseIcon>
+  );
+}
+
+export function CornerDownRightIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <polyline points="15 10 20 15 15 20" />
+      <path d="M4 4v7a4 4 0 0 0 4 4h12" />
+    </BaseIcon>
+  );
+}
+
+export function LayersIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <polygon points="12 2 2 7 12 12 22 7 12 2" />
+      <polyline points="2 17 12 22 22 17" />
+      <polyline points="2 12 12 17 22 12" />
+    </BaseIcon>
+  );
+}

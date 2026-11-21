@@ -137,7 +137,20 @@ export interface ProviderCatalogItem {
   setupHint?: string;
 }
 
-export type ChatMode = "agent" | "plan";
+export type ChatMode = "agent" | "plan" | "ask";
+
+export type ReasoningEffort = "low" | "medium" | "high" | "max";
+
+export interface QueuedChatMessage {
+  id: string;
+  threadId: string | null;
+  content: string;
+  mode: ChatMode;
+  effort: ReasoningEffort;
+  mentionedSlugs: string[];
+  attachments: ChatAttachmentView[];
+  createdAt: string;
+}
 
 export interface ChatAttachmentView {
   id: string;
@@ -193,6 +206,9 @@ export interface ChatThreadView {
   title: string;
   provider: string | null;
   model: string | null;
+  pinned?: boolean;
+  archived?: boolean;
+  parentThreadId?: string | null;
   messageCount: number;
   createdAt: string;
   updatedAt: string;

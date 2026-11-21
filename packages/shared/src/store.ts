@@ -77,6 +77,9 @@ interface ChatThreadRow {
   title: string;
   provider: string | null;
   model: string | null;
+  pinned?: number;
+  archived?: number;
+  parent_thread_id?: string | null;
   created_at: string;
   updated_at: string;
   message_count?: number;
@@ -259,6 +262,26 @@ export class SystemRegistryStore {
     }
     if (!colNames.has("execution_expires_at")) {
       this.db.exec("ALTER TABLE execution_plans ADD COLUMN execution_expires_at TEXT;");
+    }
+
+    const threadCols = this.db
+      .prepare("PRAGMA table_info(chat_threads)")
+      .all() as Array<{ name: string }>;
+    const threadColNames = new Set(threadCols.map((col) => col.name));
+    if (!threadColNames.has("pinned")) {
+      this.db.exec(
+        "ALTER TABLE chat_threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+      );
+    }
+    if (!threadColNames.has("archived")) {
+      this.db.exec(
+        "ALTER TABLE chat_threads ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;",
+      );
+    }
+    if (!threadColNames.has("parent_thread_id")) {
+      this.db.exec(
+        "ALTER TABLE chat_threads ADD COLUMN parent_thread_id TEXT;",
+      );
     }
   }
 
@@ -681,19 +704,28 @@ export class SystemRegistryStore {
     title: string;
     provider?: string | null;
     model?: string | null;
+    pinned?: boolean;
+    archived?: boolean;
+    parentThreadId?: string | null;
     createdAt?: string;
   }): ChatThread {
     const now = input.createdAt ?? new Date().toISOString();
     const cleanTitle = redactSecrets(input.title.trim() || "New Conversation").slice(0, 160);
+    const pinned = input.pinned ? 1 : 0;
+    const archived = input.archived ? 1 : 0;
+    const parentThreadId = input.parentThreadId ?? null;
     const stmt = this.db.prepare(`
-      INSERT INTO chat_threads (id, title, provider, model, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO chat_threads (id, title, provider, model, pinned, archived, parent_thread_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     stmt.run(
       input.id,
       cleanTitle,
       input.provider ?? null,
       input.model ?? null,
+      pinned,
+      archived,
+      parentThreadId,
       now,
       now,
     );
@@ -702,19 +734,28 @@ export class SystemRegistryStore {
       title: cleanTitle,
       provider: input.provider ?? null,
       model: input.model ?? null,
+      pinned: Boolean(pinned),
+      archived: Boolean(archived),
+      parentThreadId,
       messageCount: 0,
       createdAt: now,
       updatedAt: now,
     });
   }
 
-  /** Lists chat threads ordered by most recently updated. */
-  listChatThreads(limit = 50): ChatThread[] {
+  /** Lists chat threads ordered with pinned first, then most recently updated. */
+  listChatThreads(
+    limit = 50,
+    options?: { includeArchived?: boolean },
+  ): ChatThread[] {
     const bounded = Math.max(1, Math.min(limit, 200));
+    const includeArchived = options?.includeArchived ?? true;
+    const whereClause = includeArchived ? "" : "WHERE t.archived = 0";
     const stmt = this.db.prepare(`
       SELECT t.*, (SELECT COUNT(*) FROM chat_messages m WHERE m.thread_id = t.id) AS message_count
       FROM chat_threads t
-      ORDER BY t.updated_at DESC
+      ${whereClause}
+      ORDER BY t.pinned DESC, t.updated_at DESC
       LIMIT ?
     `);
     const rows = stmt.all(bounded) as unknown as ChatThreadRow[];
@@ -732,13 +773,15 @@ export class SystemRegistryStore {
     return row ? this.mapChatThreadRow(row) : null;
   }
 
-  /** Updates a chat thread's title, provider, model, or updatedAt timestamp. */
+  /** Updates a chat thread's title, provider, model, pin/archive flags, or updatedAt timestamp. */
   updateChatThread(
     threadId: string,
     patch: {
       title?: string;
       provider?: string | null;
       model?: string | null;
+      pinned?: boolean;
+      archived?: boolean;
       updatedAt?: string;
     },
   ): ChatThread | null {
@@ -751,15 +794,131 @@ export class SystemRegistryStore {
     const nextProvider =
       patch.provider !== undefined ? patch.provider : existing.provider;
     const nextModel = patch.model !== undefined ? patch.model : existing.model;
-    const updatedAt = patch.updatedAt ?? new Date().toISOString();
+    const nextPinned =
+      patch.pinned !== undefined ? (patch.pinned ? 1 : 0) : existing.pinned ? 1 : 0;
+    const nextArchived =
+      patch.archived !== undefined ? (patch.archived ? 1 : 0) : existing.archived ? 1 : 0;
+    const updatedAt = patch.updatedAt ?? existing.updatedAt;
 
     const stmt = this.db.prepare(`
       UPDATE chat_threads
-      SET title = ?, provider = ?, model = ?, updated_at = ?
+      SET title = ?, provider = ?, model = ?, pinned = ?, archived = ?, updated_at = ?
       WHERE id = ?
     `);
-    stmt.run(nextTitle, nextProvider, nextModel, updatedAt, threadId);
+    stmt.run(
+      nextTitle,
+      nextProvider,
+      nextModel,
+      nextPinned,
+      nextArchived,
+      updatedAt,
+      threadId,
+    );
     return this.getChatThread(threadId);
+  }
+
+  /**
+   * Forks an existing chat thread (either all messages or up to `upToMessageId` inclusive)
+   * into a new independent thread with `parentThreadId` linking back to the source.
+   */
+  forkChatThread(
+    sourceThreadId: string,
+    newThreadId: string,
+    options?: {
+      upToMessageId?: string | undefined;
+      title?: string | undefined;
+    },
+  ): { thread: ChatThread; messages: ChatMessage[] } | null {
+    const source = this.getChatThread(sourceThreadId);
+    if (!source) return null;
+
+    const allMessages = this.listChatMessages(sourceThreadId, 500);
+    let slice = allMessages;
+    if (options?.upToMessageId) {
+      const idx = allMessages.findIndex((m) => m.id === options.upToMessageId);
+      if (idx === -1) return null;
+      slice = allMessages.slice(0, idx + 1);
+    }
+
+    const derivedTitle =
+      options?.title?.trim() ||
+      (source.title.endsWith("(fork)") ? source.title : `${source.title} (fork)`);
+    const now = new Date().toISOString();
+
+    let forkedThread: ChatThread | null = null;
+    const clonedMessages: ChatMessage[] = [];
+    this.db.exec("BEGIN");
+    try {
+      forkedThread = this.createChatThread({
+        id: newThreadId,
+        title: derivedTitle,
+        provider: source.provider,
+        model: source.model,
+        parentThreadId: source.id,
+        createdAt: now,
+      });
+
+      for (let idx = 0; idx < slice.length; idx++) {
+        const msg = slice[idx]!;
+        const cloned = this.appendChatMessage({
+          ...msg,
+          id: `${newThreadId}-m${idx + 1}`,
+          threadId: newThreadId,
+        });
+        clonedMessages.push(cloned);
+      }
+
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+
+    const hydrated = this.getChatThread(newThreadId) ?? forkedThread;
+    if (!hydrated) {
+      throw new Error(`Forked chat thread "${newThreadId}" could not be read back.`);
+    }
+    return { thread: hydrated, messages: clonedMessages };
+  }
+
+  /**
+   * Removes `messageId` and all subsequent messages in a thread (used for Edit & Resend
+   * and Regenerate Last Response). Returns the number of removed messages.
+   */
+  truncateChatMessagesFrom(threadId: string, messageId: string): number {
+    const existing = this.listChatMessages(threadId, 500);
+    const cutIdx = existing.findIndex((m) => m.id === messageId);
+    if (cutIdx === -1) return 0;
+    const idsToDelete = existing.slice(cutIdx).map((m) => m.id);
+    const delStmt = this.db.prepare(
+      "DELETE FROM chat_messages WHERE thread_id = ? AND id = ?",
+    );
+    let removed = 0;
+    this.db.exec("BEGIN");
+    try {
+      for (const id of idsToDelete) {
+        removed += Number(delStmt.run(threadId, id).changes);
+      }
+      this.db
+        .prepare("UPDATE chat_threads SET updated_at = ? WHERE id = ?")
+        .run(new Date().toISOString(), threadId);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+    return removed;
+  }
+
+  /** Clears all messages in a thread while preserving the thread itself (`/clear`). */
+  clearChatMessages(threadId: string): number {
+    const result = this.db
+      .prepare("DELETE FROM chat_messages WHERE thread_id = ?")
+      .run(threadId);
+    this.db
+      .prepare("UPDATE chat_threads SET updated_at = ? WHERE id = ?")
+      .run(new Date().toISOString(), threadId);
+    return Number(result.changes);
   }
 
   /** Deletes a chat thread and cascades to its messages. */
@@ -945,6 +1104,9 @@ export class SystemRegistryStore {
       title: row.title,
       provider: row.provider,
       model: row.model,
+      pinned: row.pinned === 1,
+      archived: row.archived === 1,
+      parentThreadId: row.parent_thread_id ?? null,
       messageCount: Number(row.message_count ?? 0),
       createdAt: row.created_at,
       updatedAt: row.updated_at,

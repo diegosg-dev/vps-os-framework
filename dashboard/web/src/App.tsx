@@ -17,7 +17,6 @@ import {
   ServerIcon,
   SlidersIcon,
   SunIcon,
-  TerminalIcon,
   VpsOsLogo,
   XIcon,
 } from "./components/Icons";
@@ -28,11 +27,7 @@ import { CapacityBar } from "./components/TelemetryCharts";
 import { ToastStack } from "./components/ToastStack";
 import { WorkloadDrawer } from "./components/WorkloadDrawer";
 import { WorkloadsView } from "./components/WorkloadsView";
-import {
-  formatRelativeTime,
-  formatUptime,
-  providerDisplayName,
-} from "./lib/format";
+import { formatUptime, providerDisplayName } from "./lib/format";
 import type {
   AppCardView,
   AuditEventView,
@@ -1029,149 +1024,24 @@ export function App() {
               onOpenSetupWizard={() => setWizardManualOpen(true)}
             />
           ) : activeView === "chat" ? (
-            <div className="flex min-w-0">
-              <div className="min-w-0 flex-1">
-                <AgentChat
-                  authHeaders={authHeaders}
-                  onboardingPayload={onboardingPayload}
-                  metrics={metrics}
-                  apps={apps}
-                  initialPrompt={starterPrompt}
-                  onConsumeInitialPrompt={() => setStarterPrompt(null)}
-                  onOpenSetupWizard={() => setWizardManualOpen(true)}
-                  onRefreshDashboard={loadState}
-                  showInspector={showChatInspector}
-                  onToggleInspector={() => setShowChatInspector((prev) => !prev)}
-                  onNotify={notify}
-                />
-              </div>
-
-              {showChatInspector && (
-                <aside className="hidden h-[calc(100vh-56px)] w-80 shrink-0 flex-col gap-4 overflow-y-auto border-l border-[var(--border-subtle)] bg-[var(--bg-rail)] p-4 xl:flex">
-                  {/* Live Workloads Quick List */}
-                  <div className="vps-card rounded-2xl p-3.5">
-                    <div className="flex items-center justify-between">
-                      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                        Workloads ({apps.length})
-                      </h3>
-                      <button
-                        type="button"
-                        onClick={() => setActiveView("apps")}
-                        className="text-[11px] font-medium text-[var(--accent)] hover:underline"
-                      >
-                        Manage all
-                      </button>
-                    </div>
-
-                    {apps.length === 0 ? (
-                      <p className="mt-2.5 text-xs leading-relaxed text-[var(--text-muted)]">
-                        No isolated workloads yet. Ask the CTO Agent to deploy a web app or personal agent.
-                      </p>
-                    ) : (
-                      <div className="mt-2.5 space-y-2">
-                        {apps.map((app) => {
-                          const running = app.status === "running";
-                          return (
-                            <div
-                              key={app.slug}
-                              className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] p-2.5"
-                            >
-                              <div className="flex items-center justify-between gap-2">
-                                <span className="truncate text-xs font-semibold text-[var(--text-primary)]">
-                                  {app.name}
-                                </span>
-                                <span
-                                  className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium capitalize ${
-                                    running
-                                      ? "bg-[var(--success-soft)] text-[var(--success)]"
-                                      : "bg-[var(--bg-surface)] text-[var(--text-muted)]"
-                                  }`}
-                                >
-                                  <span
-                                    className={`h-1.5 w-1.5 rounded-full ${
-                                      running ? "bg-[var(--success)]" : "bg-[var(--text-muted)]"
-                                    }`}
-                                  />
-                                  {app.status}
-                                </span>
-                              </div>
-                              <p className="mt-0.5 truncate font-mono text-[10.5px] text-[var(--text-muted)]">
-                                {app.domain ?? "internal network"}
-                              </p>
-                              <div className="mt-2 flex items-center gap-1.5">
-                                <button
-                                  type="button"
-                                  disabled={busyAppSlug === app.slug}
-                                  onClick={() =>
-                                    handleLifecycleRequest(
-                                      app.slug,
-                                      running ? "restart" : "start",
-                                    )
-                                  }
-                                  className="vps-btn-secondary flex-1 rounded-lg px-2 py-1 text-[10.5px] font-medium"
-                                >
-                                  {running ? "Restart" : "Start"}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleInspectApp(app, "logs")}
-                                  className="vps-btn-secondary inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[10.5px] font-medium text-[var(--accent)]"
-                                >
-                                  <TerminalIcon className="h-3 w-3" />
-                                  Logs
-                                </button>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Recent Audit Mini-Feed */}
-                  <div className="vps-card rounded-2xl p-3.5">
-                    <div className="flex items-center justify-between">
-                      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                        Recent Audit
-                      </h3>
-                      <button
-                        type="button"
-                        onClick={() => setActiveView("activity")}
-                        className="text-[11px] font-medium text-[var(--accent)] hover:underline"
-                      >
-                        View all
-                      </button>
-                    </div>
-                    {auditEvents.length === 0 ? (
-                      <p className="mt-2 text-xs text-[var(--text-muted)]">
-                        No events yet.
-                      </p>
-                    ) : (
-                      <ul className="mt-2.5 space-y-2">
-                        {auditEvents.slice(0, 6).map((evt) => (
-                          <li
-                            key={evt.id}
-                            className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-inset)] px-2.5 py-2 text-[11px]"
-                          >
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="truncate font-mono font-medium text-[var(--text-primary)]">
-                                {evt.action}
-                              </span>
-                              <span className="tabular-nums shrink-0 text-[10px] text-[var(--text-muted)]">
-                                {formatRelativeTime(evt.createdAt)}
-                              </span>
-                            </div>
-                            <p className="mt-0.5 truncate text-[10.5px] text-[var(--text-secondary)]">
-                              {evt.summary}
-                            </p>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                </aside>
-              )}
-            </div>
+            <AgentChat
+              authHeaders={authHeaders}
+              onboardingPayload={onboardingPayload}
+              metrics={metrics}
+              apps={apps}
+              auditEvents={auditEvents}
+              busyAppSlug={busyAppSlug}
+              initialPrompt={starterPrompt}
+              onConsumeInitialPrompt={() => setStarterPrompt(null)}
+              onOpenSetupWizard={() => setWizardManualOpen(true)}
+              onRefreshDashboard={loadState}
+              onLifecycle={handleLifecycleRequest}
+              onInspectApp={handleInspectApp}
+              onNavigate={setActiveView}
+              showInspector={showChatInspector}
+              onToggleInspector={() => setShowChatInspector((prev) => !prev)}
+              onNotify={notify}
+            />
           ) : activeView === "apps" ? (
             <WorkloadsView
               apps={apps}

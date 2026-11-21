@@ -8,6 +8,7 @@ import {
   type ChatMessage,
   ChatModeSchema,
   LlmProviderSchema,
+  ReasoningEffortSchema,
   type StoredPlan,
   type SystemMetrics,
   type SystemRegistryStore,
@@ -50,11 +51,25 @@ const UpdateThreadRequestSchema = z.object({
   title: z.string().trim().min(1).max(160).optional(),
   provider: LlmProviderSchema.nullable().optional(),
   model: z.string().trim().min(1).max(120).nullable().optional(),
+  pinned: z.boolean().optional(),
+  archived: z.boolean().optional(),
+});
+
+const ForkThreadRequestSchema = z.object({
+  upToMessageId: z.string().trim().min(1).max(128).optional(),
+  title: z.string().trim().min(1).max(160).optional(),
 });
 
 const SendMessageRequestSchema = z.object({
   content: z.string().trim().min(1).max(8000),
   mode: ChatModeSchema.optional().default("agent"),
+  effort: ReasoningEffortSchema.optional().default("medium"),
+  mentionedSlugs: z
+    .array(z.string().trim().min(1).max(64))
+    .max(10)
+    .optional()
+    .default([]),
+  truncateFromMessageId: z.string().trim().min(1).max(128).optional(),
   attachmentIds: z
     .array(z.string().trim().min(1).max(128))
     .max(MAX_ATTACHMENTS_PER_MESSAGE)
@@ -253,9 +268,125 @@ export function registerChatRoutes(app: Hono, deps: ChatRouteDeps): void {
       ...(parsed.data.title !== undefined ? { title: parsed.data.title } : {}),
       ...(parsed.data.provider !== undefined ? { provider: parsed.data.provider } : {}),
       ...(parsed.data.model !== undefined ? { model: parsed.data.model } : {}),
+      ...(parsed.data.pinned !== undefined ? { pinned: parsed.data.pinned } : {}),
+      ...(parsed.data.archived !== undefined ? { archived: parsed.data.archived } : {}),
     });
 
     return c.json({ thread: updated });
+  });
+
+  app.post("/api/chat/threads/:id/fork", async (c) => {
+    const threadId = c.req.param("id").trim();
+    const existing = deps.registry.getChatThread(threadId);
+    if (!existing) {
+      return c.json({ error: `Chat thread "${threadId}" not found.` }, 404);
+    }
+
+    let body: unknown = {};
+    try {
+      body = (await readJsonBody(c, deps.maxBodyBytes, { allowEmpty: true })) ?? {};
+    } catch (err) {
+      return handleBodyReadError(c, err);
+    }
+
+    const parsed = ForkThreadRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        { error: "Validation failed.", issues: parsed.error.issues },
+        400,
+      );
+    }
+
+    const forked = deps.registry.forkChatThread(threadId, crypto.randomUUID(), {
+      upToMessageId: parsed.data.upToMessageId,
+      title: parsed.data.title,
+    });
+    if (!forked) {
+      return c.json(
+        { error: "Could not fork thread from the specified message." },
+        404,
+      );
+    }
+
+    const plansById: Record<string, StoredPlan> = {};
+    for (const msg of forked.messages) {
+      if (msg.planId && !plansById[msg.planId]) {
+        const plan = deps.registry.getPlan(msg.planId);
+        if (plan) {
+          plansById[plan.id] = plan;
+        }
+      }
+    }
+
+    return c.json(
+      { thread: forked.thread, messages: forked.messages, plansById },
+      201,
+    );
+  });
+
+  app.post("/api/chat/threads/:id/clear", (c) => {
+    const threadId = c.req.param("id").trim();
+    const existing = deps.registry.getChatThread(threadId);
+    if (!existing) {
+      return c.json({ error: `Chat thread "${threadId}" not found.` }, 404);
+    }
+    const cleared = deps.registry.clearChatMessages(threadId);
+    const updated = deps.registry.getChatThread(threadId);
+    return c.json({ ok: true, cleared, thread: updated });
+  });
+
+  app.get("/api/chat/threads/:id/export", (c) => {
+    const threadId = c.req.param("id").trim();
+    const thread = deps.registry.getChatThread(threadId);
+    if (!thread) {
+      return c.json({ error: `Chat thread "${threadId}" not found.` }, 404);
+    }
+    const messages = deps.registry.listChatMessages(threadId, 500);
+    const lines: string[] = [
+      `# ${thread.title}`,
+      "",
+      `- Thread ID: \`${thread.id}\``,
+      `- Provider: \`${thread.provider ?? "vps-os-cto"}\` · Model: \`${thread.model ?? "default"}\``,
+      `- Exported: ${new Date().toISOString()}`,
+      "",
+      "---",
+      "",
+    ];
+    for (const msg of messages) {
+      const heading =
+        msg.role === "user"
+          ? `## Owner (${msg.createdAt})`
+          : `## ${msg.provider ?? "CTO Agent"}${msg.model ? ` · ${msg.model}` : ""} (${msg.createdAt})`;
+      lines.push(heading, "");
+      if (msg.attachments.length > 0) {
+        lines.push(
+          `**Attachments:** ${msg.attachments.map((a) => `\`${a.name}\``).join(", ")}`,
+          "",
+        );
+      }
+      if (msg.toolCalls.length > 0) {
+        lines.push(
+          `**Tools executed:** ${msg.toolCalls.map((t) => `\`${t.toolName}\` (${t.status})`).join(", ")}`,
+          "",
+        );
+      }
+      lines.push(redactSecrets(msg.content), "", "---", "");
+    }
+
+    const safeSlug = thread.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48) || "cto-thread";
+
+    return new Response(lines.join("\n"), {
+      status: 200,
+      headers: {
+        "content-type": "text/markdown; charset=utf-8",
+        "content-disposition": `attachment; filename="${safeSlug}.md"`,
+        "x-content-type-options": "nosniff",
+      },
+    });
   });
 
   app.delete("/api/chat/threads/:id", (c) => {
@@ -438,6 +569,13 @@ export function registerChatRoutes(app: Hono, deps: ChatRouteDeps): void {
       );
     }
 
+    if (parsed.data.truncateFromMessageId) {
+      deps.registry.truncateChatMessagesFrom(
+        threadId,
+        parsed.data.truncateFromMessageId,
+      );
+    }
+
     const history = deps.registry.listChatMessages(threadId);
     const attachedRecords = deps.registry.getChatAttachmentsByIds(
       parsed.data.attachmentIds,
@@ -474,10 +612,13 @@ export function registerChatRoutes(app: Hono, deps: ChatRouteDeps): void {
         threadId,
         userText: parsed.data.content,
         mode: parsed.data.mode,
+        effort: parsed.data.effort,
+        mentionedSlugs: parsed.data.mentionedSlugs,
         attachments: attachedRecords,
         history,
         overrideProvider: parsed.data.provider,
         overrideModel: parsed.data.model,
+        signal: c.req.raw.signal,
       });
 
       const savedAssistant = deps.registry.appendChatMessage(result.assistantMessage);
@@ -511,6 +652,7 @@ export function registerChatRoutes(app: Hono, deps: ChatRouteDeps): void {
       createdAt: new Date().toISOString(),
     };
 
+    const requestSignal = c.req.raw.signal;
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const send = (event: ChatStreamEvent) => {
@@ -532,10 +674,13 @@ export function registerChatRoutes(app: Hono, deps: ChatRouteDeps): void {
             threadId,
             userText: parsed.data.content,
             mode: parsed.data.mode,
+            effort: parsed.data.effort,
+            mentionedSlugs: parsed.data.mentionedSlugs,
             attachments: attachedRecords,
             history,
             overrideProvider: parsed.data.provider,
             overrideModel: parsed.data.model,
+            signal: requestSignal,
             onEvent: send,
           });
 
@@ -558,6 +703,9 @@ export function registerChatRoutes(app: Hono, deps: ChatRouteDeps): void {
             threadTitle: nextTitle,
           });
         } catch (err) {
+          if (requestSignal.aborted || (err instanceof Error && err.name === "AbortError")) {
+            return;
+          }
           const safeMsg = redactSecrets(
             err instanceof Error ? err.message : "Agent turn failed.",
           );
