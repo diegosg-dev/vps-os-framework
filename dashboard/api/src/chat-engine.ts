@@ -271,12 +271,12 @@ function parseAndStripVpsPlanBlock(
   rawText: string,
   fallbackGoal: string,
 ): { cleanText: string; plan: ReturnType<typeof buildValidatedLlmPlan> } {
-  const blockRegex = /```vps-plan\s*\n([\s\S]*?)\n```/g;
+  const blockRegex = /```vps-plan[^\n\r]*(?:\r?\n|\s+)([\s\S]*?)```/g;
   let parsedPlan: ReturnType<typeof buildValidatedLlmPlan> = null;
   let match: RegExpExecArray | null = null;
 
   while ((match = blockRegex.exec(rawText)) !== null) {
-    const jsonBody = match[1]?.trim();
+    const jsonBody = match[1]?.trim().replace(/,\s*([}\]])/g, "$1");
     if (!jsonBody) continue;
     try {
       const candidate = JSON.parse(jsonBody) as unknown;
@@ -290,7 +290,7 @@ function parseAndStripVpsPlanBlock(
   }
 
   const cleanText = rawText
-    .replace(/```vps-plan\s*\n[\s\S]*?\n```\s*/g, "")
+    .replace(/```vps-plan[^\n\r]*(?:\r?\n|\s+)[\s\S]*?```\s*/g, "")
     .trimEnd();
 
   return { cleanText, plan: parsedPlan };
